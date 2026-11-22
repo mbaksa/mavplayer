@@ -1,5 +1,12 @@
 //! Rendering of the main window.
 
+#[path = "outline_vector.rs"]
+mod outline_vector;
+#[path = "subtitle_style.rs"]
+mod subtitle_style;
+
+use subtitle_style::{FONT_FAMILY, FONT_WEIGHT};
+
 use super::actions::*;
 use super::keymap;
 use super::menu::MenuItem as M;
@@ -640,7 +647,7 @@ impl PlayerView {
 
         // Text subtitles.
         if !texts.is_empty() {
-            root = root.child(self.text_subtitles(&texts, sub_rect, area));
+            root = root.child(self.text_subtitles(&texts, sub_rect, area, window.scale_factor()));
         }
 
         // Idle / audio-only / loading screens.
@@ -762,9 +769,15 @@ impl PlayerView {
         root.into_any_element()
     }
 
-    fn text_subtitles(&self, texts: &[String], rect: Bounds<Pixels>, area: Bounds<Pixels>) -> AnyElement {
+    fn text_subtitles(
+        &mut self,
+        texts: &[String],
+        rect: Bounds<Pixels>,
+        area: Bounds<Pixels>,
+        scale_factor: f32,
+    ) -> AnyElement {
         let h = f32::from(rect.size.height).max(100.0);
-        let font = (h * 0.052 * self.settings.sub_scale).clamp(12.0, 96.0);
+        let font = subtitle_style::font_size(h, self.settings.sub_scale);
         let margin = f32::from(area.size.height)
             - (f32::from(rect.origin.y - area.origin.y) + f32::from(rect.size.height))
             + h * self.settings.sub_margin;
@@ -776,7 +789,7 @@ impl PlayerView {
             .filter(|l| !l.trim().is_empty())
             .collect();
         let style = self.settings.sub_style;
-        let o = (font / 16.0).max(1.2);
+        let row_pad = font * subtitle_style::BOX_VERTICAL_PADDING_FACTOR;
         let mut col = div()
             .absolute()
             .left(px(left + width * 0.05))
@@ -785,35 +798,80 @@ impl PlayerView {
             .flex()
             .flex_col()
             .items_center()
+            .gap(px(font * subtitle_style::LINE_GAP_FACTOR))
             .text_size(px(font))
-            .line_height(px(font * 1.22))
-            .font_weight(gpui::FontWeight::SEMIBOLD);
+            .line_height(px(subtitle_style::line_height(font)))
+            .font_family(FONT_FAMILY)
+            .font_weight(FONT_WEIGHT);
         for line in lines {
             let line: SharedString = line.into();
             let el: AnyElement = match style {
                 SubStyle::Box => div()
-                    .px(px(font * 0.35))
+                    .px(px(font * subtitle_style::BOX_HORIZONTAL_PADDING_FACTOR))
+                    .py(px(font * subtitle_style::BOX_VERTICAL_PADDING_FACTOR))
                     .bg(rgba(0x000000b0))
                     .rounded(px(4.))
+                    .font_family(FONT_FAMILY)
+                    .font_weight(FONT_WEIGHT)
                     .text_color(gpui::white())
                     .text_center()
                     .child(line)
                     .into_any_element(),
                 SubStyle::Outline => {
-                    let mut d = div().relative().text_center();
-                    for (dx, dy) in [(-o, 0.0), (o, 0.0), (0.0, -o), (0.0, o), (-o, -o), (o, o), (-o, o), (o, -o)] {
+                    // mavplayer-hybrid-outline: Vello paints only black stroke;
+                    // native GPUI draws the white text on top at full sharpness.
+                    let line_text = line.to_string();
+                    let max_w = width * 0.9;
+                    let dpi = scale_factor;
+                    let key = outline_vector::cache_key(&line_text, font, max_w, dpi);
+                    let outline_image = if let Some((image, age)) = self.sub_images.get_mut(&key) {
+                        *age = 0;
+                        Some(image.clone())
+                    } else {
+                        outline_vector::stroke_image(&line_text, font, max_w, dpi).map(|image| {
+                            self.sub_images.insert(key, (image.clone(), 0));
+                            image
+                        })
+                    };
+                    let line_h = subtitle_style::line_height(font);
+                    // Match the transparent overscan in outline_vector.rs.
+                    let outline_pad = subtitle_style::outline_padding(font);
+
+                    // Match Box's line-height + top/bottom padding, so
+                    // bottom-aligned subtitles retain exactly the same baseline.
+                    let mut d = div()
+                        .relative()
+                        .w_full()
+                        .h(px(line_h + 2.0 * row_pad))
+                        .font_family(FONT_FAMILY)
+                        .font_weight(FONT_WEIGHT)
+                        .text_center();
+                    if let Some(outline_image) = outline_image {
                         d = d.child(
-                            div()
-                                .absolute()
-                                .left(px(dx))
-                                .top(px(dy))
-                                .w_full()
-                                .text_center()
-                                .text_color(rgba(0x000000e6))
-                                .child(line.clone()),
+                            canvas(
+                                |bounds, _, _| bounds,
+                                move |bounds, _, window, _| {
+                                    let _ =
+                                        window.paint_image(bounds, Corners::default(), outline_image.clone(), 0, false);
+                                },
+                            )
+                            .absolute()
+                            .top(px(row_pad - outline_pad))
+                            .h(px(line_h + 2.0 * outline_pad))
+                            .w_full(),
                         );
                     }
-                    d.child(div().relative().text_color(gpui::white()).child(line)).into_any_element()
+                    d.child(
+                        div()
+                            .absolute()
+                            .top(px(row_pad))
+                            .w_full()
+                            .font_family(FONT_FAMILY)
+                            .font_weight(FONT_WEIGHT)
+                            .text_color(gpui::white())
+                            .child(line),
+                    )
+                    .into_any_element()
                 }
             };
             col = col.child(el);

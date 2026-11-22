@@ -1000,6 +1000,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "color"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ec7c5eb7a16992b1904d76c517d170ab353b0e0b3d5a0c81a8a0cd1037893cf"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1825,6 +1834,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fearless_simd"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b97b65636e5b9ef369943878ac74335ba1c55c1cb6adbf1e2c293c624248d693"
+
+[[package]]
 name = "ffmpeg-sys-next"
 version = "9.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2213,6 +2228,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "glifo"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "282a26c1e23de04bdab3e34a21b6f877a479b96737792516b9b8b8f69b6661be"
+dependencies = [
+ "bytemuck",
+ "foldhash 0.2.0",
+ "hashbrown 0.17.1",
+ "log",
+ "peniko",
+ "png 0.18.1",
+ "skrifa",
+ "smallvec",
+ "vello_common",
+]
+
+[[package]]
 name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2551,6 +2583,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "12101ecc8225ea6d675bc70263074eab6169079621c2186fe0c66590b2df9681"
 
 [[package]]
+name = "guillotiere"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b17e70c989c36bad147b27a58d148c0741c51448aa5653436547323e524d0ab"
+dependencies = [
+ "euclid",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2601,6 +2642,9 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heck"
@@ -3167,6 +3211,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kurbo"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b60dfc32f652b926df6192e55525b16d186c69d47876c3ead4da5cc9f8450e2"
+dependencies = [
+ "arrayvec",
+ "euclid",
+ "polycool",
+ "smallvec",
+]
+
+[[package]]
 name = "kv-log-macro"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3272,6 +3328,12 @@ dependencies = [
  "cc",
  "system-deps",
 ]
+
+[[package]]
+name = "linebender_resource_handle"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4a5ff6bcca6c4867b1c4fd4ef63e4db7436ef363e0ad7531d1558856bae64f4"
 
 [[package]]
 name = "linux-raw-sys"
@@ -3403,6 +3465,7 @@ name = "mavplayer"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "cosmic-text",
  "cpal",
  "crossbeam-channel",
  "dirs 6.0.0",
@@ -3426,6 +3489,7 @@ dependencies = [
  "sys-locale",
  "tray-icon",
  "unicode-segmentation",
+ "vello_cpu",
  "winresource",
 ]
 
@@ -4221,6 +4285,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "peniko"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "839c8299360d2e998bdb106dc0a6cd71dcc5f4df51df1b620361bf50e283cca6"
+dependencies = [
+ "bytemuck",
+ "color",
+ "kurbo 0.13.1",
+ "linebender_resource_handle",
+ "smallvec",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4357,6 +4434,15 @@ name = "pollster"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e9b9cf600136f5b976fbc5727d58c26e1ecab8ee23088d44ef1c7af793550ab"
+
+[[package]]
+name = "polycool"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50596ddc09eb5ad5f75cacd40209568e66df71baf86e1499a0e99c4cff12a5a6"
+dependencies = [
+ "arrayvec",
+]
 
 [[package]]
 name = "postage"
@@ -5717,7 +5803,7 @@ version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68c7541fff44b35860c1a7a47a7cadf3e4a304c457b58f9870d9706ece028afc"
 dependencies = [
- "kurbo",
+ "kurbo 0.11.3",
  "siphasher",
 ]
 
@@ -6408,7 +6494,7 @@ dependencies = [
  "flate2",
  "fontdb 0.23.0",
  "imagesize",
- "kurbo",
+ "kurbo 0.11.3",
  "log",
  "pico-args",
  "roxmltree",
@@ -6510,6 +6596,35 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "vello_common"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb2141a2bca6e6d598e471fd4d1d7eed8e020aad6a28187edda07f091a325dd"
+dependencies = [
+ "bytemuck",
+ "fearless_simd",
+ "guillotiere",
+ "log",
+ "peniko",
+ "png 0.18.1",
+ "smallvec",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "vello_cpu"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ace506ca414548966fcf3c283be94eb1cad8254de488791ee698bf438b0890a9"
+dependencies = [
+ "bytemuck",
+ "glifo",
+ "hashbrown 0.17.1",
+ "png 0.18.1",
+ "vello_common",
+]
 
 [[package]]
 name = "version-compare"

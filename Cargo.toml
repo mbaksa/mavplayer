@@ -37,8 +37,10 @@ unicode-segmentation = "1"
 # Media keys and now-playing info: MPRIS (Linux), SMTC (Windows), Now Playing (macOS).
 souvlaki = { version = "0.9", default-features = false, features = ["use_zbus"] }
 sys-locale = "0.3"
+vello_cpu = "0.2.0"
 
 # Native PipeWire audio output (cpal's ALSA host is the fallback).
+cosmic-text = "=0.14.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 # v0_3_44: target.object (PipeWire 0.3.44+; CI builds on Ubuntu 22.04, which has 0.3.48).
 pipewire = { version = "0.10", features = ["v0_3_44"] }
