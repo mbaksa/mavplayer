@@ -1,6 +1,6 @@
 [package]
 name = "mavplayer"
-version = "0.3.0"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.90"
 description = "A fast, native media player for video, music, streams and DVDs"
@@ -81,6 +81,10 @@ ksni = { path = "third_party/ksni" }
 # blade-graphics 0.7.1 (GPUI's renderer) with ray tracing never enabled: on
 # NVIDIA it costs 50 MB in every process. See third_party/blade-graphics.
 blade-graphics = { path = "third_party/blade-graphics" }
+# gpui 0.2.2 plus `Window::set_window_visible`: "Play in the background"
+# hides the player window to the tray and shows it again, while it plays on.
+# See third_party/gpui/MAVPLAYER-PATCH.md.
+gpui = { path = "third_party/gpui" }
 # blade-util 0.3.0, whose staging belt (GPUI uploads every video frame
 # through it) frees big chunks it no longer uses. See third_party/blade-util.
 blade-util = { path = "third_party/blade-util" }

@@ -125,6 +125,7 @@ commands! {
         ToggleMenubar, "Show / hide menu bar", ["secondary-m"];
         ShowPreferences, "Preferences", ["secondary-,", "secondary-p"];
         ShowShortcuts, "Keyboard shortcuts", ["f1", "?"];
+        HideToTray, "Hide to the tray (keeps playing)", ["secondary-w"];
         Quit @global, "Quit", ["secondary-q"];
     ]
 }

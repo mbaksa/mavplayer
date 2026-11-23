@@ -6,10 +6,11 @@ use super::dialogs::Dialog;
 use super::menu::OpenMenu;
 use super::text_input::{InputEvent, TextInput};
 use super::theme::Theme;
+use super::tray::{TrayEvent, TrayState};
 use crate::engine::disc::{self, DvdTitle};
 use crate::engine::{
-    self, Deinterlace, DvdCommand, DvdMenu, HwDecode, LoadOptions, MediaSource, Player, PlayerEvent, Rotation, Status,
-    SubEvent, TrackId, TrackKind, VideoAdjust,
+    self, Deinterlace, DvdCommand, DvdDomain, DvdMenu, HwDecode, LoadOptions, MediaSource, Player, PlayerEvent,
+    Rotation, Status, SubEvent, TrackId, TrackKind, VideoAdjust,
 };
 use crate::icons;
 use crate::playlist::{self, Playlist};
@@ -217,6 +218,8 @@ pub struct PlayerView {
     /// Frames keep arriving but the window isn't drawn (minimised, on
     /// another desktop): the engine skips converting pictures for it.
     video_hidden: bool,
+    /// The window is hidden in the tray ("Play in the background").
+    pub hidden_to_tray: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -366,11 +369,19 @@ impl PlayerView {
             async {}
         }));
         // Closing from the window frame (the compositor's close button,
-        // Alt+F4) drops this view before the app quits: save first.
+        // Alt+F4) drops this view before the app quits: save first. With
+        // "Play in the background", a window with a file open hides instead.
         let me = cx.entity().downgrade();
-        window.on_window_should_close(cx, move |_, cx| {
-            let _ = me.update(cx, |v, _| v.save_state());
-            true
+        window.on_window_should_close(cx, move |window, cx| {
+            me.update(cx, |v, cx| {
+                if v.hide_on_close(cx) {
+                    v.hide_to_tray(window, cx);
+                    return false;
+                }
+                v.save_state();
+                true
+            })
+            .unwrap_or(true)
         });
 
         // Repaint once the desktop icon theme has been resolved.
@@ -464,6 +475,7 @@ impl PlayerView {
             frame_painted: false,
             last_render: Instant::now(),
             video_hidden: false,
+            hidden_to_tray: false,
             settings,
             _subs: subs,
         };
@@ -716,6 +728,7 @@ impl PlayerView {
             mk.update(self);
             self.media_keys = Some(mk);
         }
+        self.update_tray(cx);
         let status = self.player.with_state(|s| s.status.clone());
         if status != self.last_status {
             self.last_status = status.clone();
@@ -786,7 +799,7 @@ impl PlayerView {
 
     pub fn retire_textures(&mut self, window: &mut Window) {
         self.last_render = Instant::now();
-        if self.video_hidden {
+        if self.video_hidden && !self.hidden_to_tray {
             self.video_hidden = false;
             self.player.set_video_hidden(false);
         }
@@ -944,8 +957,11 @@ impl PlayerView {
         let Some(src) = st.source else { return };
         let pos = self.player.position();
         let paused = self.player.paused();
+        // A DVD played with its menus resumes its title, not the first-play program.
+        let dvd_title = st.dvd.as_ref().filter(|d| d.domain == DvdDomain::Title && d.title > 0).map(|d| d.title);
         self.player.set_config(self.engine_config());
-        self.player.load(src, LoadOptions { start_at: Some(pos), start_paused: paused, ..Default::default() });
+        self.player
+            .load(src, LoadOptions { start_at: Some(pos), dvd_title, start_paused: paused, ..Default::default() });
         cx.notify();
     }
 
@@ -967,7 +983,7 @@ impl PlayerView {
     /// Media sent by another launch while this window is open.
     pub fn open_remote(&mut self, req: crate::instance::Request, window: &mut Window, cx: &mut Context<Self>) {
         use crate::settings::RunningMode;
-        window.activate_window();
+        self.show_window(window, cx);
         if req.sources.is_empty() {
             return;
         }
@@ -1311,7 +1327,8 @@ impl PlayerView {
     }
 
     fn fit_window_if_needed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.fitted_for == Some(self.load_counter) {
+        // Hidden in the tray: fit once shown again (`show_window`).
+        if self.fitted_for == Some(self.load_counter) || self.hidden_to_tray {
             return;
         }
         self.fitted_for = Some(self.load_counter);
@@ -1892,6 +1909,97 @@ impl PlayerView {
         self.player.screenshot(self.settings.screenshot_dir().join(file));
     }
 
+    // ───────────────────────── tray ─────────────────────────
+
+    /// "Play in the background" is on and there is a tray icon to come back from.
+    pub fn can_hide_to_tray(&self, cx: &App) -> bool {
+        self.settings.tray_playback && super::shell::tray_up(cx)
+    }
+
+    /// Closing the window hides it instead: a file is open (playing or paused).
+    fn hide_on_close(&self, cx: &App) -> bool {
+        self.can_hide_to_tray(cx)
+            && self.player.is_active()
+            && self.player.with_state(|s| matches!(s.status, Status::Playing | Status::Paused | Status::Loading))
+    }
+
+    /// Hides the window to the tray. Playback, media keys and the playlist
+    /// carry on; the tray icon's menu controls them and brings it back.
+    pub fn hide_to_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.hidden_to_tray {
+            return;
+        }
+        if !self.can_hide_to_tray(cx) {
+            let msg = if self.settings.tray_playback {
+                "No system tray to hide in"
+            } else {
+                "Turn on “Play in the background” in Preferences → Playback first"
+            };
+            self.osd(msg, cx);
+            return;
+        }
+        // Saved now, in case the session ends while nothing can be seen.
+        self.save_state();
+        self.close_menu(cx);
+        if window.is_fullscreen() {
+            window.toggle_fullscreen();
+        }
+        window.set_window_visible(false);
+        self.hidden_to_tray = true;
+        // Nothing will be drawn: don't convert pictures meanwhile.
+        self.video_hidden = true;
+        self.player.set_video_hidden(true);
+        log::debug!("ui: window hidden to the tray");
+        self.update_tray(cx);
+    }
+
+    /// Brings the window back from the tray (if hidden) and to the front.
+    pub fn show_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.hidden_to_tray {
+            self.hidden_to_tray = false;
+            window.set_window_visible(true);
+            // The next render turns picture conversion back on.
+            log::debug!("ui: window shown from the tray");
+            self.update_tray(cx);
+            self.fit_window_if_needed(window, cx);
+            cx.notify();
+        }
+        window.activate_window();
+    }
+
+    /// A click on the tray icon or its menu.
+    pub fn on_tray(&mut self, ev: TrayEvent, window: &mut Window, cx: &mut Context<Self>) {
+        use souvlaki::MediaControlEvent as Event;
+        match ev {
+            // The icon toggles a window that is in front.
+            TrayEvent::Activate if !self.hidden_to_tray && window.is_window_active() && self.can_hide_to_tray(cx) => {
+                self.hide_to_tray(window, cx)
+            }
+            TrayEvent::Activate | TrayEvent::Show => self.show_window(window, cx),
+            TrayEvent::Hide => self.hide_to_tray(window, cx),
+            TrayEvent::PlayPause => self.on_media_event(Event::Toggle, window, cx),
+            TrayEvent::Previous => self.on_media_event(Event::Previous, window, cx),
+            TrayEvent::Next => self.on_media_event(Event::Next, window, cx),
+            // Handled by the shell.
+            TrayEvent::Quit => {}
+        }
+        self.update_tray(cx);
+        cx.notify();
+    }
+
+    /// Tells the tray icon's menu what is playing.
+    fn update_tray(&self, cx: &mut App) {
+        let (status, paused) = (self.player.with_state(|s| s.status.clone()), self.player.paused());
+        let state = TrayState {
+            controls: self.settings.tray_playback,
+            playing: self.player.is_active() && !paused && matches!(status, Status::Playing | Status::Loading),
+            has_media: !self.playlist.items.is_empty(),
+            title: self.playlist.current.and_then(|i| self.playlist.items.get(i)).map(|it| it.display_title()),
+            hidden: self.hidden_to_tray,
+        };
+        super::shell::set_tray_state(state, cx);
+    }
+
     // ───────────────────────── action handlers ─────────────────────────
 
     pub fn register_actions<E: gpui::InteractiveElement>(&self, el: E, cx: &mut Context<Self>) -> E {
@@ -2037,6 +2145,7 @@ impl PlayerView {
             ShowAbout => |this, w, cx| this.show_dialog(Dialog::About, w, cx),
             CloseOverlay => |this, w, cx| { this.close_menu(cx); this.close_dialog(w, cx) },
             Quit => |this, _w, cx| { this.save_state(); super::shell::quit(cx) },
+            HideToTray => |this, w, cx| this.hide_to_tray(w, cx),
             Seek0 => |this, _w, cx| this.seek_fraction(0.0, cx),
             Seek1 => |this, _w, cx| this.seek_fraction(0.1, cx),
             Seek2 => |this, _w, cx| this.seek_fraction(0.2, cx),

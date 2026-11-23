@@ -23,7 +23,7 @@ use super::av::{self, Dict, FormatCtx, IoSource, Packet, ff};
 use super::demux::{self, Component, stream_index};
 use super::spu::{Highlight, Overlay};
 use super::types::*;
-use super::{SeekRequest, SessionCtx};
+use super::{LoadOptions, SeekRequest, SessionCtx};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::os::raw::{c_char, c_int, c_void};
@@ -779,6 +779,16 @@ impl Nav {
         unsafe { sys::dvdnav_set_active_stream(self.st.lock().dvd, logical, sys::AUDIO_STREAM) };
     }
 
+    /// Starts title `n` (before the first segment, to resume a reload).
+    fn play_title(&self, n: u32) -> bool {
+        let g = self.st.lock();
+        let ok = unsafe { sys::dvdnav_title_play(g.dvd, n as i32) } == sys::OK;
+        if !ok {
+            log::debug!("DVD: can't resume title {n}: {}", err(g.dvd));
+        }
+        ok
+    }
+
     fn restart(&self) {
         let mut g = self.st.lock();
         unsafe { sys::dvdnav_reset(g.dvd) };
@@ -1108,7 +1118,7 @@ enum Phase {
 }
 
 /// Plays a DVD with its menus: the demux thread of such a session.
-pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, path: String) {
+pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, path: String, opts: &LoadOptions) {
     let cfg = ctx.controls.config.lock().clone();
     let nav = match Nav::open(&path, &cfg) {
         Ok(n) => Arc::new(n),
@@ -1123,6 +1133,9 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, path: String) {
     };
     *ctx.nav.lock() = Some(nav.clone());
     *ctx.spu_overlay.lock() = Some(nav.overlay.clone());
+    // A reload (hardware decoding toggled, …) goes back to the same title
+    // and time rather than through the first-play program and the menus.
+    let mut resume = opts.dvd_title.filter(|t| *t > 0 && nav.play_title(*t)).map(|t| (t, opts.start_at));
     let mut first = true;
     while ctx.alive() {
         let seg = match open_segment(&ctx, &nav, &source) {
@@ -1135,7 +1148,12 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, path: String) {
             }
         };
         let cfg = ctx.controls.config.lock().clone();
-        match play_segment(&ctx, &nav, seg, &cfg, first) {
+        // Only if the title's own program didn't go somewhere else first.
+        let start_at = resume
+            .take()
+            .filter(|(t, _)| seg.vm.domain == DvdDomain::Title && seg.vm.title == *t)
+            .and_then(|(_, at)| at);
+        match play_segment(&ctx, &nav, seg, &cfg, first, start_at) {
             Outcome::Next => first = false,
             Outcome::Aborted => break,
             Outcome::Ended => {
@@ -1308,7 +1326,14 @@ fn route_subs(
     }
 }
 
-fn play_segment(ctx: &Arc<SessionCtx>, nav: &Arc<Nav>, seg: Segment, cfg: &EngineConfig, first: bool) -> Outcome {
+fn play_segment(
+    ctx: &Arc<SessionCtx>,
+    nav: &Arc<Nav>,
+    seg: Segment,
+    cfg: &EngineConfig,
+    first: bool,
+    start_at: Option<f64>,
+) -> Outcome {
     // A clean slate for the new stream set.
     flush_all(ctx);
     ctx.frames.clear();
@@ -1367,6 +1392,9 @@ fn play_segment(ctx: &Arc<SessionCtx>, nav: &Arc<Nav>, seg: Segment, cfg: &Engin
         log::debug!("startup: DVD navigation ready at {:.0} ms", crate::ms_since_start());
     }
     ctx.emit(PlayerEvent::Loaded);
+    if let Some(t) = start_at.filter(|t| *t > 0.5 && info.seekable) {
+        ctx.request_seek(SeekRequest { target: t, relative: false, precise: true, direction: 0, origin: 0.0 });
+    }
 
     let mut phase = Phase::Reading;
     let pkt = Packet::new();
@@ -1408,7 +1436,13 @@ fn play_segment(ctx: &Arc<SessionCtx>, nav: &Arc<Nav>, seg: Segment, cfg: &Engin
             ctx.update_state(|st| st.selected = sel);
             ctx.emit(PlayerEvent::TracksChanged);
             if info.seekable {
-                ctx.request_seek(SeekRequest { target: pos, relative: false, precise: true });
+                ctx.request_seek(SeekRequest {
+                    target: pos,
+                    relative: false,
+                    precise: true,
+                    direction: 0,
+                    origin: 0.0,
+                });
             }
         }
 

@@ -2,7 +2,7 @@
 ; Built by scripts/package-windows.ps1, which passes /DAppVersion and /DSourceDir.
 
 #ifndef AppVersion
-  #define AppVersion "0.3.0"
+  #define AppVersion "0.3.3"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\dist\MavPlayer"

@@ -335,7 +335,13 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
                 #[cfg(not(has_dvdnav))]
                 let nav = false;
                 if !nav {
-                    ctx.request_seek(super::SeekRequest { target: ctx.position(), relative: false, precise: true });
+                    ctx.request_seek(super::SeekRequest {
+                        target: ctx.position(),
+                        relative: false,
+                        precise: true,
+                        direction: 0,
+                        origin: 0.0,
+                    });
                 }
                 graph = None;
                 continue;
@@ -347,8 +353,10 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
         let pts = av::ts_to_secs(ts, tb);
         unsafe { (*frame.0).pts = ts };
 
-        // Exact seek: skip frames before the target.
-        if let Some((target, s)) = *ctx.seek_target.lock()
+        // Exact seek: skip frames before the target (not cover art, which is
+        // the picture for the whole file).
+        if !info.attached_pic
+            && let Some((target, s)) = *ctx.seek_target.lock()
             && s == serial
             && pts.is_finite()
             && pts + frame_dur.max(0.001) * 0.5 < target
@@ -378,7 +386,7 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
             }
         }
         cfg_check = cfg_check.wrapping_add(1);
-        if cfg_check.is_multiple_of(30) {
+        if cfg_check.is_multiple_of(30) || info.attached_pic {
             cfg = ctx.controls.config.lock().clone();
         }
         saw_interlaced |= frame.raw().flags & ff::AV_FRAME_FLAG_INTERLACED as c_int != 0;
@@ -388,7 +396,8 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
         }
         // A graph (or the GPU resize) is rebuilt for a new size only once the
         // window has stopped changing size; meanwhile the presenter scales.
-        let rebuilds = graph.is_some() || source.is_some() || to_gpu.active;
+        // (Cover art is decoded again only once it has: see `redo_cover`.)
+        let rebuilds = (graph.is_some() || source.is_some() || to_gpu.active) && !info.attached_pic;
         if t != target && (!rebuilds || pending_target.1.elapsed() >= RESIZE_SETTLE || serial != target_serial) {
             target = t;
         }

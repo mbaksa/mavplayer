@@ -141,6 +141,12 @@ pub struct SeekRequest {
     pub target: f64,
     pub relative: bool,
     pub precise: bool,
+    /// Direction of a relative seek: -1 backward, 1 forward, 0 absolute.
+    /// Preserved when the request is converted to an absolute target.
+    pub direction: i8,
+    /// Playback position before the relative jump (seconds from media start).
+    /// Used only for non-precise, directional seeks.
+    pub origin: f64,
 }
 
 /// Everything shared by the threads of one opened file.
@@ -166,6 +172,11 @@ pub struct SessionCtx {
     pub audio_pending: AtomicU64,
     pub audio_tokens: AtomicU64,
     pub video_active: AtomicBool,
+    /// The video track is cover art: one picture, decoded once.
+    pub cover_art: AtomicBool,
+    /// Asks the demuxer to decode the cover art again (for a new window size
+    /// or new settings; see [`SessionCtx::redo_cover`]).
+    pub cover_redo: AtomicBool,
     pub audio_finished: AtomicI32,
     pub video_finished: AtomicI32,
     pub eof: AtomicBool,
@@ -204,6 +215,25 @@ pub struct SessionCtx {
 }
 
 impl SessionCtx {
+    /// Lets go of what an ended session holds (its demuxer has exited and
+    /// stopped the decoders). Something may keep the context itself alive
+    /// past that, such as an audio device open that never returns: it
+    /// shouldn't keep queued packets, pictures (a CUDA frame keeps the GPU
+    /// device open) or the disc's navigator with it.
+    fn release(&self) {
+        self.vq.flush();
+        self.aq.flush();
+        self.sq.flush();
+        self.frames.clear();
+        *self.last_frame.lock() = None;
+        self.subs.clear_embedded();
+        #[cfg(has_dvdnav)]
+        {
+            *self.nav.lock() = None;
+            *self.spu_overlay.lock() = None;
+        }
+    }
+
     pub fn alive(&self) -> bool {
         !self.abort.load(Ordering::Acquire)
     }
@@ -281,6 +311,20 @@ impl SessionCtx {
         self.demux_cv.notify_all();
     }
 
+    /// Cover art is decoded and filtered once, for the window size and
+    /// settings of the moment. Decodes it again for the current ones, so a
+    /// larger window gets it enlarged (by the upscaler chosen) from the
+    /// original rather than the old picture stretched. False when the video
+    /// isn't cover art.
+    pub fn redo_cover(&self) -> bool {
+        if !self.cover_art.load(Ordering::Acquire) {
+            return false;
+        }
+        self.cover_redo.store(true, Ordering::Release);
+        self.wake_demuxer();
+        true
+    }
+
     pub fn paused(&self) -> bool {
         self.controls.paused.load(Ordering::Acquire)
     }
@@ -330,14 +374,18 @@ impl SessionCtx {
     }
 
     pub fn request_seek(&self, req: SeekRequest) {
-        if !req.relative {
-            self.seek_display.set(req.target.max(0.0));
-        } else {
-            let base = if self.seeking.load(Ordering::Acquire) { self.seek_display.get() } else { self.position() };
-            self.seek_display.set((base + req.target).max(0.0));
-        }
-        // Coalesce: an absolute target replaces whatever was pending.
-        let abs = SeekRequest { target: self.seek_display.get(), relative: false, precise: req.precise };
+        let base = if self.seeking.load(Ordering::Acquire) { self.seek_display.get() } else { self.position() };
+        let target = if req.relative { (base + req.target).max(0.0) } else { req.target.max(0.0) };
+        self.seek_display.set(target);
+        // Preserve both the direction and the starting position when
+        // converting a relative seek into a coalesced absolute request.
+        let abs = SeekRequest {
+            target,
+            relative: false,
+            precise: req.precise,
+            direction: req.direction,
+            origin: if req.relative { base } else { target },
+        };
         *self.seek_req.lock() = Some(abs);
         self.seeking.store(true, Ordering::Release);
         self.wake_demuxer();
@@ -347,6 +395,10 @@ impl SessionCtx {
 #[derive(Default, Clone)]
 pub struct LoadOptions {
     pub start_at: Option<f64>,
+    /// A DVD played with its menus starts in this title (at `start_at`)
+    /// instead of at its first-play program: a reload keeps its place.
+    #[cfg_attr(not(has_dvdnav), allow(dead_code))]
+    pub dvd_title: Option<u32>,
     pub external_subs: Vec<PathBuf>,
     pub start_paused: bool,
 }
@@ -372,6 +424,7 @@ impl Session {
                 .name("session-reaper".into())
                 .spawn(move || {
                     let _ = h.join();
+                    ctx.release();
                 })
                 .ok();
         }
@@ -412,6 +465,8 @@ fn new_session(controls: &Arc<Controls>, shared: &Arc<Shared>, source: &MediaSou
         audio_pending: AtomicU64::new(0),
         audio_tokens: AtomicU64::new(0),
         video_active: AtomicBool::new(false),
+        cover_art: AtomicBool::new(false),
+        cover_redo: AtomicBool::new(false),
         audio_finished: AtomicI32::new(-1),
         video_finished: AtomicI32::new(-1),
         eof: AtomicBool::new(false),
@@ -649,7 +704,13 @@ impl Player {
             if was && !paused && ctx.stepped.swap(false, Ordering::AcqRel) {
                 // Frame stepping desynchronised audio; realign precisely.
                 let pos = ctx.position();
-                ctx.request_seek(SeekRequest { target: pos, relative: false, precise: true });
+                ctx.request_seek(SeekRequest {
+                    target: pos,
+                    relative: false,
+                    precise: true,
+                    direction: 0,
+                    origin: 0.0,
+                });
             }
             ctx.update_state(|st| {
                 if matches!(st.status, Status::Playing | Status::Paused) {
@@ -679,7 +740,18 @@ impl Player {
         }
         self.adopt();
         if let Some(s) = &self.session {
-            s.ctx.request_seek(SeekRequest { target, relative, precise });
+            let direction = if relative {
+                if target > 0.0 {
+                    1
+                } else if target < 0.0 {
+                    -1
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            s.ctx.request_seek(SeekRequest { target, relative, precise, direction, origin: 0.0 });
             s.ctx.update_state(|st| {
                 if st.status == Status::Ended {
                     st.status = if s.ctx.paused() { Status::Paused } else { Status::Playing };
@@ -704,7 +776,13 @@ impl Player {
             let fps = self.with_state(|st| st.video.as_ref().map(|v| v.fps).unwrap_or(25.0));
             let fd = if fps > 1.0 { 1.0 / fps } else { 0.04 };
             let pos = s.ctx.position();
-            s.ctx.request_seek(SeekRequest { target: (pos - fd * 1.5).max(0.0), relative: false, precise: true });
+            s.ctx.request_seek(SeekRequest {
+                target: (pos - fd * 1.5).max(0.0),
+                relative: false,
+                precise: true,
+                direction: 0,
+                origin: 0.0,
+            });
             s.ctx.stepped.store(true, Ordering::Release);
         }
         let _ = s;
@@ -774,12 +852,14 @@ impl Player {
             g.1 = adj;
         }
         drop(g);
-        // Re-show the current picture with the new filters when paused.
+        // Re-show the current picture with the new filters when paused (and
+        // cover art always: it isn't decoded again otherwise).
         if let Some(s) = &self.session
+            && !s.ctx.redo_cover()
             && self.paused()
         {
             let pos = s.ctx.position();
-            s.ctx.request_seek(SeekRequest { target: pos, relative: false, precise: true });
+            s.ctx.request_seek(SeekRequest { target: pos, relative: false, precise: true, direction: 0, origin: 0.0 });
         }
     }
 
@@ -788,7 +868,17 @@ impl Player {
         if self.session.as_ref().is_some_and(|s| s.ctx.video_active.load(Ordering::Acquire)) {
             upscale::prewarm(&cfg);
         }
-        *self.controls.config.lock() = cfg;
+        // (The presenter notices changes to its own scaling by itself.)
+        let shaders = upscale::ShaderSetKey::of(&cfg);
+        let changed = {
+            let mut c = self.controls.config.lock();
+            let changed = upscale::ShaderSetKey::of(&c) != shaders;
+            *c = cfg;
+            changed
+        };
+        if changed && let Some(s) = &self.session {
+            s.ctx.redo_cover();
+        }
     }
 
     /// Tells the engine how large the video is drawn, in physical pixels, so
@@ -866,7 +956,7 @@ impl Player {
         *s.ctx.screenshot_req.lock() = Some(path);
         if self.paused() || s.ctx.eof.load(Ordering::Acquire) {
             let pos = s.ctx.position();
-            s.ctx.request_seek(SeekRequest { target: pos, relative: false, precise: true });
+            s.ctx.request_seek(SeekRequest { target: pos, relative: false, precise: true, direction: 0, origin: 0.0 });
         }
     }
 

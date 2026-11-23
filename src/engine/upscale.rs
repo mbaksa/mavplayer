@@ -107,7 +107,7 @@ impl ShaderSet {
             parts.push(KRIG.as_bytes().into());
         }
         let main: Vec<&'static str> = match self.upscaler {
-            Upscaler::Bilinear | Upscaler::Nearest | Upscaler::EwaLanczos => vec![],
+            Upscaler::Bilinear | Upscaler::Nearest | Upscaler::Bicubic | Upscaler::EwaLanczos => vec![],
             Upscaler::Fsrcnnx => vec![FSRCNNX_16],
             Upscaler::FsrcnnxFast => vec![FSRCNNX_8],
             Upscaler::ArtCnn => vec![ARTCNN],

@@ -38,12 +38,17 @@ one click away.
 - Optionally keeps running in the system tray when you close the window
   (Preferences ▸ Playback, off by default), so the next file you open plays
   almost instantly. Click the tray icon to open the window; quit from its menu.
+- Optionally plays in the background (Preferences ▸ Playback, off by default):
+  closing the window while a file is open hides it in the tray and playback
+  goes on. The tray icon's menu has Play/Pause, Previous and Next; clicking
+  the icon shows or hides the window. Media ▸ Hide to Tray (Ctrl+W) does the
+  same.
 
 **Video**: aspect ratio override, crop, zoom, rotate and flip, brightness /
 contrast / saturation / gamma / hue, sharpen, denoise, grayscale, invert.
 
-**Upscaling** (Video ▸ Upscaling, or Settings ▸ Video): besides plain bilinear
-and nearest neighbour (for pixel art), GPU upscalers run through FFmpeg's
+**Upscaling** (Video ▸ Upscaling, or Settings ▸ Video): besides plain bilinear,
+bicubic and nearest neighbour (for pixel art), GPU upscalers run through FFmpeg's
 libplacebo filter (Vulkan) when FFmpeg is built with it, as in every Linux
 and Windows package (not yet on macOS):
 - **Anime4K** with its six presets (A, B, C, A+A, B+B, C+A) in HQ and Fast

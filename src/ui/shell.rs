@@ -22,9 +22,15 @@
 //!    away and brings up GPUI.
 //!
 //! On macOS the app simply stays running without windows.
+//!
+//! "Play in the background" is the other way to the tray: closing the window
+//! while a file is open hides it instead (`PlayerView::hide_to_tray`), and
+//! the process plays on with its window open but not shown. The tray icon's
+//! menu then has playback controls (`TrayState`), and its Show entry brings
+//! the same window back.
 
 use super::player::{Boot, PlayerView};
-use super::tray::{Tray, TrayEvent};
+use super::tray::{Tray, TrayEvent, TrayState};
 use crate::engine::MediaSource;
 use crate::settings::Settings;
 use futures::StreamExt;
@@ -77,8 +83,13 @@ struct Shell {
     primary: bool,
     tx: Sender,
     tray: Option<Tray>,
-    /// The setting asks for a tray icon.
+    /// The settings ask for a tray icon.
     want_tray: bool,
+    /// "Keep running in the system tray": once the window closes, a process
+    /// waits in the tray (not just "Play in the background").
+    wait_in_tray: bool,
+    /// What the tray icon's menu shows (for an icon set up later, too).
+    tray_state: TrayState,
     /// A tray icon is being set up.
     tray_starting: bool,
     /// Quitting for good (Quit chosen): don't wait in the tray.
@@ -89,13 +100,15 @@ impl Global for Shell {}
 
 /// Opens the first window (or the tray icon) and handles `rx`. Called from `app.run`.
 pub fn run(cx: &mut App, start: Start, primary: bool, tx: Sender, mut rx: UnboundedReceiver<Incoming>) {
-    let keep_in_tray = start.settings().keep_in_tray;
+    let settings = start.settings().clone();
     cx.set_global(Shell {
         window: None,
         primary,
         tx,
         tray: None,
         want_tray: false,
+        wait_in_tray: settings.keep_in_tray,
+        tray_state: TrayState::default(),
         tray_starting: false,
         quitting: false,
     });
@@ -105,8 +118,8 @@ pub fn run(cx: &mut App, start: Start, primary: bool, tx: Sender, mut rx: Unboun
                 cx.quit();
                 return;
             }
-            if keep_in_tray {
-                set_tray(true, false, cx);
+            if settings.wants_tray() {
+                set_tray(&settings, false, cx);
             }
         }
         Start::Background { tray, .. } => {
@@ -116,6 +129,7 @@ pub fn run(cx: &mut App, start: Start, primary: bool, tx: Sender, mut rx: Unboun
                     let shell = cx.global_mut::<Shell>();
                     shell.tray = Some(tray);
                     shell.want_tray = true;
+                    shell.wait_in_tray = true;
                 }
                 // Without a tray icon there would be no way to reach or quit this process.
                 None => start_tray(false, true, cx),
@@ -216,22 +230,34 @@ fn handle(msg: Incoming, cx: &mut App) {
             let sources: Vec<MediaSource> = urls.iter().map(|u| crate::playlist::source_for_arg(u)).collect();
             match open {
                 Some(w) => {
-                    let _ = w.update(cx, |v, window, cx| v.open_sources(sources, window, cx));
+                    let _ = w.update(cx, |v, window, cx| {
+                        v.show_window(window, cx);
+                        v.open_sources(sources, window, cx)
+                    });
                 }
                 None => reopen(sources, false, cx),
             }
         }
-        Incoming::Tray(TrayEvent::Show) | Incoming::Reopen => match open {
-            Some(w) => {
-                let _ = w.update(cx, |_, window, _| window.activate_window());
-            }
-            None => reopen(Vec::new(), false, cx),
-        },
         Incoming::Tray(TrayEvent::Quit) => {
             if let Some(w) = open {
                 let _ = w.update(cx, |v, _, _| v.save_state());
             }
             quit(cx);
+        }
+        // Waiting in the tray without a window: the menu only offers Open
+        // (and Quit), so anything else opens the window too.
+        Incoming::Tray(TrayEvent::Show | TrayEvent::Activate) | Incoming::Reopen if open.is_none() => {
+            reopen(Vec::new(), false, cx)
+        }
+        Incoming::Tray(ev) => {
+            if let Some(w) = open {
+                let _ = w.update(cx, |v, window, cx| v.on_tray(ev, window, cx));
+            }
+        }
+        Incoming::Reopen => {
+            if let Some(w) = open {
+                let _ = w.update(cx, |v, window, cx| v.show_window(window, cx));
+            }
         }
     }
 }
@@ -240,7 +266,7 @@ fn handle(msg: Incoming, cx: &mut App) {
 fn last_window_closed(cx: &mut App) {
     let shell = cx.global_mut::<Shell>();
     shell.window = None;
-    let stay = shell.tray.is_some() && shell.primary && !shell.quitting;
+    let stay = shell.tray.is_some() && shell.wait_in_tray && shell.primary && !shell.quitting;
     if !stay {
         quit(cx);
         return;
@@ -387,11 +413,13 @@ pub fn make_tray(tx: Sender) -> anyhow::Result<Tray> {
 }
 
 /// Shows or removes the tray icon, following the "Keep running in the system
-/// tray" setting. With `announce`, a desktop without a tray is reported in
-/// the window (when the setting has just been turned on).
-pub fn set_tray(on: bool, announce: bool, cx: &mut App) {
+/// tray" and "Play in the background" settings. With `announce`, a desktop
+/// without a tray is reported in the window (when one has just been turned on).
+pub fn set_tray(settings: &Settings, announce: bool, cx: &mut App) {
+    let on = settings.wants_tray();
     let shell = cx.global_mut::<Shell>();
     shell.want_tray = on;
+    shell.wait_in_tray = settings.keep_in_tray;
     if !on {
         shell.tray = None;
         return;
@@ -433,7 +461,12 @@ fn start_tray(announce: bool, required: bool, cx: &mut App) {
             let shell = cx.global_mut::<Shell>();
             shell.tray_starting = false;
             match tray {
-                Ok(tray) if shell.want_tray => shell.tray = Some(tray),
+                Ok(tray) if shell.want_tray => {
+                    if shell.tray_state != TrayState::default() {
+                        tray.set_state(shell.tray_state.clone());
+                    }
+                    shell.tray = Some(tray);
+                }
                 Ok(_) => {}
                 Err(e) => {
                     log::warn!("no system tray: {e:#}");
@@ -447,6 +480,25 @@ fn start_tray(announce: bool, required: bool, cx: &mut App) {
         });
     })
     .detach();
+}
+
+/// This process shows a tray icon, so a window hidden to the tray can be
+/// brought back.
+pub fn tray_up(cx: &App) -> bool {
+    cx.try_global::<Shell>().is_some_and(|s| s.tray.is_some() && s.primary)
+}
+
+/// Updates the tray icon's menu and tooltip, if `state` is new.
+pub fn set_tray_state(state: TrayState, cx: &mut App) {
+    let Some(shell) = cx.try_global::<Shell>() else { return };
+    if shell.tray_state == state {
+        return;
+    }
+    let shell = cx.global_mut::<Shell>();
+    if let Some(tray) = &shell.tray {
+        tray.set_state(state.clone());
+    }
+    shell.tray_state = state;
 }
 
 fn notify(msg: &'static str, cx: &mut App) {

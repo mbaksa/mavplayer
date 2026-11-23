@@ -450,7 +450,7 @@ impl PlayerView {
         let options: Vec<(String, Upscaler)> =
             Upscaler::ALL.into_iter().filter(|u| gpu || !u.needs_libplacebo()).map(|u| (u.label().into(), u)).collect();
         let desc = if gpu {
-            "For pictures smaller than the window. All but the first two run shaders on the GPU (Vulkan)"
+            "For pictures smaller than the window. All but the first three run on the GPU through libplacebo (Vulkan)"
         } else {
             "GPU upscalers and shaders need FFmpeg built with libplacebo"
         };
@@ -1250,6 +1250,14 @@ impl PlayerView {
                         |t, _| t.settings.double_click_fullscreen = !t.settings.double_click_fullscreen,
                         cx,
                     ))
+                    .child(self.toggle_row(
+                        "pldblclick",
+                        "Double-click to play playlist entries",
+                        Some("A single click then only selects them"),
+                        s.playlist_double_click,
+                        |t, _| t.settings.playlist_double_click = !t.settings.playlist_double_click,
+                        cx,
+                    ))
                     .child(self.row(
                         "Mouse wheel",
                         None,
@@ -1364,7 +1372,18 @@ impl PlayerView {
                         s.keep_in_tray,
                         |t, cx| {
                             t.settings.keep_in_tray = !t.settings.keep_in_tray;
-                            super::shell::set_tray(t.settings.keep_in_tray, true, cx);
+                            super::shell::set_tray(&t.settings, t.settings.keep_in_tray, cx);
+                        },
+                        cx,
+                    ))
+                    .child(self.toggle_row(
+                        "trayplay",
+                        "Play in the background",
+                        Some("Closing the window while a file is open hides it in the system tray, and playback goes on. The tray icon's menu then has Play/Pause, Previous and Next"),
+                        s.tray_playback,
+                        |t, cx| {
+                            t.settings.tray_playback = !t.settings.tray_playback;
+                            super::shell::set_tray(&t.settings, t.settings.tray_playback, cx);
                         },
                         cx,
                     ))

@@ -5,7 +5,7 @@
 # (For an AUR-style build from a release tag, set _from_git=1.)
 
 pkgname=mavplayer
-pkgver=0.3.0
+pkgver=0.3.3
 pkgrel=1
 pkgdesc="Fast, native media player for video, music, streams and DVDs"
 arch=('x86_64' 'aarch64')

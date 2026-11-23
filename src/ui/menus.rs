@@ -1,17 +1,21 @@
 //! Menu contents (menu bar, context menu, control-bar popups).
+//!
+//! The menus hold what you do to the media playing now (tracks, seeking,
+//! picture shape, delays) and how you get around (open, view, windows).
+//! How the player behaves in general (decoding, deinterlacing, tone mapping,
+//! channels, subtitle style and size, theme) belongs in Preferences, and is
+//! not repeated here. Upscaling and the audio device are the exceptions:
+//! people switch them while watching.
 
 use super::actions::*;
 use super::dialogs::Dialog;
 use super::menu::MenuItem as M;
 use super::player::{ASPECTS, PlayerView, SPEEDS};
 use super::widgets::format_time;
-use crate::engine::{
-    self, Anime4KMode, ChannelMode, Deinterlace, DvdCommand, DvdDomain, DvdMenu, HwDecode, MediaSource, Rotation,
-    TrackKind, Upscaler,
-};
+use crate::engine::{self, Anime4KMode, DvdCommand, DvdDomain, DvdMenu, MediaSource, Rotation, TrackKind, Upscaler};
 use crate::icons::Icon;
-use crate::settings::{RepeatMode, SubStyle, ThemeMode};
-use gpui::{Action, Context};
+use crate::settings::RepeatMode;
+use gpui::{Action, Context, Window};
 
 pub const MENUBAR: &[&str] = &["Media", "Playback", "Audio", "Video", "Subtitle", "View", "Help"];
 
@@ -37,7 +41,15 @@ impl PlayerView {
         }
     }
 
-    pub fn context_menu(&self, cx: &mut Context<Self>) -> Vec<M> {
+    /// The in-window menu bar shows (it never does on macOS, which has a
+    /// native one, nor in fullscreen).
+    pub fn menubar_visible(&self, window: &Window) -> bool {
+        self.settings.show_menubar && !window.is_fullscreen() && !cfg!(target_os = "macos")
+    }
+
+    /// The right-click menu. With the menu bar showing it only has what is
+    /// handy over the picture; without, it holds every menu.
+    pub fn context_menu(&self, menubar: bool, cx: &mut Context<Self>) -> Vec<M> {
         let playing = self.player.is_active();
         let paused = self.player.paused();
         let disc = self.disc_menu();
@@ -49,17 +61,35 @@ impl PlayerView {
             act("Previous", PlayPrevious).icon(Icon::Previous).enabled(!self.playlist.items.is_empty()),
             act("Next", PlayNext).icon(Icon::Next).enabled(!self.playlist.items.is_empty()),
             M::Separator,
+        ];
+        if menubar {
+            if let Some(d) = disc {
+                v.push(M::submenu("Disc", d).icon(Icon::Disc));
+            }
+            v.extend([
+                M::submenu("Audio Track", self.track_items(TrackKind::Audio, false)).icon(Icon::Audio).enabled(playing),
+                M::submenu("Subtitles", self.track_items(TrackKind::Subtitle, true))
+                    .icon(Icon::Subtitles)
+                    .enabled(playing),
+                M::Separator,
+                act("Fullscreen", ToggleFullscreen).icon(Icon::Fullscreen),
+                act("Media Information", ShowMediaInfo).icon(Icon::Info).enabled(playing),
+            ]);
+            return v;
+        }
+        v.extend([
             M::submenu("Media", self.menu_media(cx)),
             M::submenu("Playback", self.menu_playback()),
             M::submenu("Audio", self.menu_audio()),
             M::submenu("Video", self.menu_video()),
             M::submenu("Subtitle", self.menu_subtitle()),
             M::submenu("View", self.menu_view()),
+            M::submenu("Help", self.menu_help()),
             M::Separator,
             act("Fullscreen", ToggleFullscreen).icon(Icon::Fullscreen),
             act("Media Information", ShowMediaInfo).icon(Icon::Info).enabled(playing),
             act("Preferences…", ShowPreferences).icon(Icon::Settings),
-        ];
+        ]);
         if let Some(d) = disc {
             v.insert(5, M::submenu("Disc", d).icon(Icon::Disc));
         }
@@ -101,7 +131,7 @@ impl PlayerView {
         Some(v)
     }
 
-    fn menu_media(&self, _cx: &mut Context<Self>) -> Vec<M> {
+    fn menu_media(&self, cx: &mut Context<Self>) -> Vec<M> {
         let mut recent: Vec<M> = self
             .settings
             .recent
@@ -125,26 +155,12 @@ impl PlayerView {
             act("Open URL…", OpenUrl).icon(Icon::Url),
             M::submenu("Recent Media", recent).icon(Icon::Recent),
             M::Separator,
-            act("Load Subtitle File…", OpenSubtitle).icon(Icon::Subtitles).enabled(self.player.is_active()),
             act("Save Playlist…", SavePlaylist).icon(Icon::Save).enabled(!self.playlist.items.is_empty()),
+            M::Separator,
         ];
-        #[cfg(target_os = "linux")]
-        if crate::integration::is_appimage() {
-            v.push(M::Separator);
-            if crate::integration::is_integrated() {
-                v.push(M::action("Remove Desktop Integration", |this, _, cx| {
-                    match crate::integration::unintegrate() {
-                        Ok(()) => this.osd("Removed from the application menu", cx),
-                        Err(e) => this.osd(format!("Could not remove integration: {e}"), cx),
-                    }
-                }));
-            } else {
-                v.push(M::action("Integrate into Desktop…", |this, w, cx| {
-                    this.show_dialog(Dialog::Integrate, w, cx)
-                }));
-            }
+        if self.can_hide_to_tray(cx) {
+            v.push(act("Hide to Tray", HideToTray));
         }
-        v.push(M::Separator);
         v.push(act("Quit", Quit));
         v
     }
@@ -153,12 +169,18 @@ impl PlayerView {
         let active = self.player.is_active();
         let st = self.player.state();
         let speed = self.player.speed();
-        let speeds: Vec<M> = SPEEDS
+        let mut speeds: Vec<M> = SPEEDS
             .iter()
             .map(|&s| {
                 M::action(format!("{s}×"), move |this, _, cx| this.set_speed(s, cx)).selected((speed - s).abs() < 1e-3)
             })
             .collect();
+        speeds.extend([
+            M::Separator,
+            act("Faster", SpeedUp),
+            act("Slower", SpeedDown),
+            act("Normal Speed", SpeedReset),
+        ]);
         let chapters: Vec<M> = st
             .media
             .as_ref()
@@ -186,8 +208,10 @@ impl PlayerView {
             act("Jump Forward", SeekForward).enabled(active),
             act("Jump Backward", SeekBackward).enabled(active),
             act("Jump to Time…", JumpToTime).enabled(active),
-            M::submenu("Chapters", chapters),
         ];
+        if !chapters.is_empty() {
+            v.push(M::submenu("Chapters", chapters));
+        }
         if let Some(d) = self.disc_menu() {
             v.push(M::submenu("Disc", d).icon(Icon::Disc));
         } else if matches!(st.source, Some(MediaSource::Dvd { .. })) && engine::dvd_menus_available() {
@@ -215,9 +239,6 @@ impl PlayerView {
         v.extend([
             M::Separator,
             M::submenu("Speed", speeds).icon(Icon::Speed),
-            act("Faster", SpeedUp),
-            act("Slower", SpeedDown),
-            act("Normal Speed", SpeedReset),
             M::Separator,
             act("A-B Loop", ToggleAbLoop).checked(self.ab_loop.0.is_some()).enabled(active),
             act("Loop File", ToggleLoopFile).checked(self.loop_file),
@@ -266,7 +287,6 @@ impl PlayerView {
     }
 
     fn menu_audio(&self) -> Vec<M> {
-        let fx = self.settings.audio_fx.clone();
         let dev = self.settings.audio_device.clone();
         let mut devices = vec![
             M::action("System Default", |this, _, cx| {
@@ -288,28 +308,9 @@ impl PlayerView {
                 .selected(sel),
             );
         }
-        let ch = self.settings.channels;
-        let chan = |label: &str, m: ChannelMode| {
-            M::action(label.to_string(), move |this, _, cx| {
-                this.settings.channels = m;
-                this.apply_settings(cx);
-                this.reload_current(cx);
-            })
-            .selected(ch == m)
-        };
         vec![
             M::submenu("Audio Track", self.track_items(TrackKind::Audio, true)).icon(Icon::Audio),
             M::submenu("Audio Device", devices).icon(Icon::Speakers),
-            M::submenu(
-                "Channels",
-                vec![
-                    chan("Auto (match media)", ChannelMode::Auto),
-                    chan("Stereo", ChannelMode::Stereo),
-                    chan("Mono", ChannelMode::Mono),
-                    chan("5.1 Surround", ChannelMode::Surround51),
-                    chan("7.1 Surround", ChannelMode::Surround71),
-                ],
-            ),
             M::Separator,
             act("Volume Up", VolumeUp),
             act("Volume Down", VolumeDown),
@@ -322,20 +323,6 @@ impl PlayerView {
                 this.osd("Audio delay 0 ms", cx)
             }),
             M::Separator,
-            M::action("Normalize Volume", move |this, _, cx| {
-                this.settings.audio_fx.normalize = !this.settings.audio_fx.normalize;
-                let fx = this.settings.audio_fx.clone();
-                this.player.set_audio_fx(fx);
-                this.apply_settings(cx);
-            })
-            .checked(fx.normalize),
-            M::action("Night Mode (compress dynamics)", move |this, _, cx| {
-                this.settings.audio_fx.night_mode = !this.settings.audio_fx.night_mode;
-                let fx = this.settings.audio_fx.clone();
-                this.player.set_audio_fx(fx);
-                this.apply_settings(cx);
-            })
-            .checked(fx.night_mode),
             act("Equalizer & Effects…", ShowEffects),
         ]
     }
@@ -397,27 +384,8 @@ impl PlayerView {
             })
             .selected(sel)
         };
-        let di = self.settings.deinterlace;
-        let deint = |label: &str, d: Deinterlace| {
-            M::action(label.to_string(), move |this, _, cx| {
-                this.settings.deinterlace = d;
-                this.apply_settings(cx)
-            })
-            .selected(di == d)
-        };
-        let hw = self.settings.hwdec;
-        let hwm = |label: &str, h: HwDecode| {
-            M::action(label.to_string(), move |this, _, cx| {
-                this.settings.hwdec = h;
-                this.apply_settings(cx);
-                this.reload_current(cx)
-            })
-            .selected(hw == h)
-        };
         vec![
             M::submenu("Video Track", self.track_items(TrackKind::Video, true)).icon(Icon::Video),
-            act("Fullscreen", ToggleFullscreen).icon(Icon::Fullscreen),
-            act("Fit Window to Video", FitWindow),
             M::Separator,
             M::submenu("Aspect Ratio", aspects),
             M::submenu(
@@ -463,27 +431,6 @@ impl PlayerView {
             })
             .checked(adj.vflip),
             M::Separator,
-            M::submenu(
-                "Deinterlace",
-                vec![
-                    deint("Automatic", Deinterlace::Auto),
-                    deint("Always", Deinterlace::On),
-                    deint("Off", Deinterlace::Off),
-                ],
-            ),
-            M::submenu(
-                "Hardware Decoding",
-                vec![
-                    hwm("Automatic (high resolutions)", HwDecode::Auto),
-                    hwm("Always", HwDecode::Always),
-                    hwm("Off", HwDecode::Off),
-                ],
-            ),
-            M::action("HDR Tone Mapping", |this, _, cx| {
-                this.settings.tone_map_hdr = !this.settings.tone_map_hdr;
-                this.apply_settings(cx)
-            })
-            .checked(self.settings.tone_map_hdr),
             M::submenu("Upscaling", self.upscaling_items()),
             M::Separator,
             act("Take Screenshot", Screenshot).icon(Icon::Screenshot).enabled(self.player.has_frame()),
@@ -492,7 +439,7 @@ impl PlayerView {
     }
 
     /// Upscaler choices, with Anime4K's modes inline (as people switch
-    /// between them while watching).
+    /// between them while watching). Chroma and sharpening are in Preferences.
     fn upscaling_items(&self) -> Vec<M> {
         let gpu = engine::gpu_upscaling_available();
         let (cur, mode) = (self.settings.upscaler, self.settings.anime4k_mode);
@@ -525,23 +472,6 @@ impl PlayerView {
             if self.settings.custom_shader.is_some() {
                 items.push(pick("Custom shader".into(), Upscaler::CustomShader, None, cur == Upscaler::CustomShader));
             }
-            items.push(M::Separator);
-            items.push(
-                M::action("Better Chroma (KrigBilateral)", |this, _, cx| {
-                    this.settings.shader_chroma = !this.settings.shader_chroma;
-                    this.apply_settings(cx)
-                })
-                .checked(self.settings.shader_chroma)
-                .enabled(cur.needs_libplacebo()),
-            );
-            items.push(
-                M::action("Sharpen (AMD CAS)", |this, _, cx| {
-                    this.settings.shader_sharpen = !this.settings.shader_sharpen;
-                    this.apply_settings(cx)
-                })
-                .checked(self.settings.shader_sharpen)
-                .enabled(cur.needs_libplacebo()),
-            );
         }
         items.push(M::Separator);
         items.push(M::action("Upscaling Settings…", |this, w, cx| this.show_dialog(Dialog::Settings(2), w, cx)));
@@ -549,7 +479,6 @@ impl PlayerView {
     }
 
     fn menu_subtitle(&self) -> Vec<M> {
-        let style = self.settings.sub_style;
         vec![
             M::submenu("Subtitle Track", self.track_items(TrackKind::Subtitle, true)).icon(Icon::Subtitles),
             act("Load Subtitle File…", OpenSubtitle).enabled(self.player.is_active()),
@@ -563,47 +492,18 @@ impl PlayerView {
                 this.sub_delay = 0.0;
                 this.osd("Subtitle delay 0 ms", cx)
             }),
-            M::Separator,
-            act("Larger", SubScaleUp),
-            act("Smaller", SubScaleDown),
-            M::submenu(
-                "Style",
-                vec![
-                    M::action("Outlined text", |this, _, _| this.settings.sub_style = SubStyle::Outline)
-                        .selected(style == SubStyle::Outline),
-                    M::action("Text on dark box", |this, _, _| this.settings.sub_style = SubStyle::Box)
-                        .selected(style == SubStyle::Box),
-                ],
-            ),
         ]
     }
 
     fn menu_view(&self) -> Vec<M> {
-        let t = self.settings.theme;
-        let theme = |label: &str, m: ThemeMode| {
-            M::action(label.to_string(), move |this, w, cx| {
-                this.settings.theme = m;
-                this.theme = super::theme::Theme::resolve(m, w);
-                this.apply_settings(cx)
-            })
-            .selected(t == m)
-        };
         vec![
             act("Playlist", TogglePlaylist).checked(self.playlist_shown()).icon(Icon::Playlist),
             act("Menu Bar", ToggleMenubar).checked(self.settings.show_menubar),
-            act("Fullscreen", ToggleFullscreen),
             M::Separator,
-            M::submenu(
-                "Theme",
-                vec![
-                    theme("Follow System", ThemeMode::System),
-                    theme("Dark", ThemeMode::Dark),
-                    theme("Light", ThemeMode::Light),
-                ],
-            ),
+            act("Fullscreen", ToggleFullscreen).icon(Icon::Fullscreen),
+            act("Fit Window to Video", FitWindow),
             M::Separator,
             act("Media Information", ShowMediaInfo).icon(Icon::Info),
-            act("Equalizer & Effects…", ShowEffects),
             act("Preferences…", ShowPreferences).icon(Icon::Settings),
         ]
     }

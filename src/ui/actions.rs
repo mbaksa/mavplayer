@@ -78,6 +78,7 @@ actions!(
         ShowAbout,
         CloseOverlay,
         Quit,
+        HideToTray,
         Seek0,
         Seek1,
         Seek2,
@@ -178,8 +179,6 @@ pub fn set_native_menus(cx: &mut App) {
                 MenuItem::action("Zoom Out", ZoomOut),
                 MenuItem::action("Reset Zoom", ZoomReset),
                 MenuItem::separator(),
-                MenuItem::action("Cycle Deinterlacing", CycleDeinterlace),
-                MenuItem::action("Toggle Hardware Decoding", ToggleHwdec),
                 MenuItem::action("Take Screenshot", Screenshot),
             ],
         },
@@ -193,11 +192,15 @@ pub fn set_native_menus(cx: &mut App) {
                 MenuItem::separator(),
                 MenuItem::action("Increase Delay", SubDelayIncrease),
                 MenuItem::action("Decrease Delay", SubDelayDecrease),
-                MenuItem::action("Larger", SubScaleUp),
-                MenuItem::action("Smaller", SubScaleDown),
             ],
         },
-        Menu { name: "Window".into(), items: vec![MenuItem::action("Show / Hide Playlist", TogglePlaylist)] },
+        Menu {
+            name: "Window".into(),
+            items: vec![
+                MenuItem::action("Show / Hide Playlist", TogglePlaylist),
+                MenuItem::action("Hide to Menu Bar (keeps playing)", HideToTray),
+            ],
+        },
         Menu {
             name: "Help".into(),
             items: vec![

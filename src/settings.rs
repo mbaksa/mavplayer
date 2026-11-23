@@ -157,6 +157,9 @@ pub struct Settings {
     pub single_click_pause: bool,
     pub drag_video_to_move_window: bool,
     pub double_click_fullscreen: bool,
+    /// Playlist entries play on a double click (a single click only selects
+    /// them) rather than on a single click.
+    pub playlist_double_click: bool,
     pub scroll_action: ScrollAction,
     pub show_playlist: bool,
     /// Going fullscreen starts with the playlist hidden, whatever the window
@@ -178,6 +181,10 @@ pub struct Settings {
     /// Closing the window leaves MavPlayer running with a system tray icon,
     /// so media opened later plays without a cold start.
     pub keep_in_tray: bool,
+    /// "Play in the background": closing the window while a file is open
+    /// hides it to the tray and playback goes on; the tray icon's menu has
+    /// playback controls.
+    pub tray_playback: bool,
     pub start_fullscreen: bool,
     pub seek_step: f64,
     pub seek_step_large: f64,
@@ -248,6 +255,7 @@ impl Default for Settings {
             single_click_pause: false,
             drag_video_to_move_window: false,
             double_click_fullscreen: true,
+            playlist_double_click: false,
             scroll_action: ScrollAction::Volume,
             show_playlist: false,
             hide_playlist_in_fullscreen: true,
@@ -259,6 +267,7 @@ impl Default for Settings {
             open_mode: OpenMode::Replace,
             when_running: RunningMode::NewWindow,
             keep_in_tray: false,
+            tray_playback: false,
             start_fullscreen: false,
             seek_step: 5.0,
             seek_step_large: 60.0,
@@ -322,6 +331,11 @@ fn sub_lang_prefs(own: &str) -> Vec<String> {
 }
 
 impl Settings {
+    /// Either setting that needs a tray icon is on.
+    pub fn wants_tray(&self) -> bool {
+        self.keep_in_tray || self.tray_playback
+    }
+
     pub fn engine_config(&self) -> EngineConfig {
         EngineConfig {
             hwdec: self.hwdec,

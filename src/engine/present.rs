@@ -653,15 +653,15 @@ struct Prepared {
     image: PresentedFrame,
 }
 
-/// Output size request, scaling filters (downscaling, and whether enlarging
-/// is done here with nearest neighbour) a picture was converted with, and
-/// whether the window was out of sight (nothing converted at all).
-type Look = ((u32, u32), (ScaleQuality, bool), bool);
+/// Output size request, scaling filters (downscaling, and the one enlarging
+/// is done with here, if any) a picture was converted with, and whether the
+/// window was out of sight (nothing converted at all).
+type Look = ((u32, u32), (ScaleQuality, Option<ScaleQuality>), bool);
 
 fn current_look(ctx: &SessionCtx) -> Look {
     let hidden = ctx.controls.video_hidden.load(Ordering::Relaxed);
     let cfg = ctx.controls.config.lock();
-    (ctx.controls.target_size(), (cfg.scale_quality, cfg.upscaler == Upscaler::Nearest), hidden)
+    (ctx.controls.target_size(), (cfg.scale_quality, cfg.upscaler.presenter_filter()), hidden)
 }
 
 /// How often a paused picture is redrawn while the window is being resized.
@@ -685,6 +685,10 @@ pub fn run(ctx: Arc<SessionCtx>, stop: Arc<AtomicBool>) {
     // picture was last decoded again for.
     let mut paused_look: (Option<Look>, std::time::Instant) = (None, std::time::Instant::now());
     let mut refreshed: Option<Look> = None;
+    // Cover art: the look last seen since the picture was shown and since
+    // when, and the look it was last decoded again for.
+    let mut cover_look: (Option<Look>, std::time::Instant) = (None, std::time::Instant::now());
+    let mut cover_redone: Option<Look> = None;
 
     while ctx.alive() && !stop.load(Ordering::Acquire) {
         stats.report(&ctx);
@@ -699,6 +703,23 @@ pub fn run(ctx: Arc<SessionCtx>, stop: Arc<AtomicBool>) {
         // Discard frames from before the latest seek.
         let head = ctx.frames.with_front(|a, b| a.map(|a| (a.pts, a.duration, a.serial, b.map(|b| (b.pts, b.serial)))));
         let Some((pts, dur, fserial, next)) = head else {
+            // Cover art on screen for another window size or other scaling:
+            // once that settles, have it decoded (and upscaled) again.
+            if ctx.cover_art.load(Ordering::Acquire) && !ctx.is_standby() && shown_look.is_some() {
+                let look = current_look(&ctx);
+                if cover_look.0 != Some(look) {
+                    cover_look = (Some(look), std::time::Instant::now());
+                }
+                if Some(look) != shown_look
+                    && !look.2
+                    && cover_redone != Some(look)
+                    && cover_look.1.elapsed() >= REFRESH_SETTLE
+                {
+                    cover_redone = Some(look);
+                    log::debug!("video: decoding the cover art again for a {}x{} window", look.0.0, look.0.1);
+                    ctx.redo_cover();
+                }
+            }
             ctx.frames.wait(Duration::from_millis(10));
             continue;
         };
@@ -755,7 +776,13 @@ pub fn run(ctx: Arc<SessionCtx>, stop: Arc<AtomicBool>) {
             {
                 refreshed = Some(look);
                 log::debug!("video: redoing the paused picture for a {}x{} window", look.0.0, look.0.1);
-                ctx.request_seek(SeekRequest { target: ctx.position(), relative: false, precise: true });
+                ctx.request_seek(SeekRequest {
+                    target: ctx.position(),
+                    relative: false,
+                    precise: true,
+                    direction: 0,
+                    origin: 0.0,
+                });
             }
             // Keep the next picture converted so un-pausing is instant.
             ensure_prepared(&ctx, &mut conv, &mut prepared, serial, &mut stats);
@@ -927,13 +954,17 @@ fn prepare(ctx: &SessionCtx, conv: &mut Converter, vf: &VideoFrame, stats: &mut 
         let c = ctx.controls.config.lock();
         (c.scale_quality, c.upscaler)
     };
-    // The GPU enlarges with bilinear filtering, which would blur away the
-    // hard edges nearest-neighbour is chosen for; enlarge here instead.
-    // (Shader upscalers already made the picture display-sized.)
-    let nearest = upscaler == Upscaler::Nearest;
-    let (dw, dh) = output_size(w, h, vf.sar, target, nearest);
+    // The GPU enlarges with bilinear filtering when it draws the picture,
+    // which would blur away nearest neighbour's hard edges and is softer
+    // than bicubic: those enlarge here instead. (Shader upscalers already
+    // made the picture display-sized.)
+    let up = upscaler.presenter_filter();
+    let (dw, dh) = output_size(w, h, vf.sar, target, up.is_some());
     let enlarging = dw > w as u32 || dh > h as u32;
-    let quality = if nearest && enlarging { ScaleQuality::Nearest } else { quality };
+    let quality = match up {
+        Some(q) if enlarging => q,
+        _ => quality,
+    };
     let t0 = std::time::Instant::now();
     let bgra = conv.convert(&vf.frame, dw, dh, PRESENT_PAD, quality);
     stats.converted += 1;

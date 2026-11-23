@@ -315,6 +315,7 @@ pub(super) fn start_component(
                 })
             });
             ctx.video_active.store(!info.attached_pic, Ordering::Release);
+            ctx.cover_art.store(info.attached_pic, Ordering::Release);
             let (c, s) = (ctx.clone(), stop.clone());
             threads.push(spawn("video-dec", move || video::run_decoder(c, dec, info, s)));
             let (c, s) = (ctx.clone(), stop.clone());
@@ -423,7 +424,7 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
     #[cfg(has_dvdnav)]
     if let MediaSource::Dvd { path, title: 0, .. } = &source {
         let path = path.clone();
-        return super::nav::run(ctx, source, path);
+        return super::nav::run(ctx, source, path, &opts);
     }
     let ic = match open_input(&source, &cfg, Some(&ctx)) {
         Ok(ic) => ic,
@@ -512,7 +513,7 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
     }
 
     if let Some(t) = opts.start_at.filter(|t| *t > 0.5) {
-        ctx.request_seek(super::SeekRequest { target: t, relative: false, precise: true });
+        ctx.request_seek(super::SeekRequest { target: t, relative: false, precise: true, direction: 0, origin: 0.0 });
     }
 
     let mut pkt = Packet::new();
@@ -557,6 +558,7 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
                         }
                         TrackKind::Video => {
                             ctx.video_active.store(false, Ordering::Release);
+                            ctx.cover_art.store(false, Ordering::Release);
                             ctx.vq.flush();
                             ctx.frames.clear();
                         }
@@ -580,7 +582,13 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
             }
             ctx.emit(PlayerEvent::TracksChanged);
             if info.seekable {
-                ctx.request_seek(super::SeekRequest { target: pos, relative: false, precise: true });
+                ctx.request_seek(super::SeekRequest {
+                    target: pos,
+                    relative: false,
+                    precise: true,
+                    direction: 0,
+                    origin: 0.0,
+                });
             }
         }
 
@@ -593,16 +601,25 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
                 target = target.min((dur - 0.05).max(0.0));
             }
             let ts = ((start + target) * ff::AV_TIME_BASE as f64) as i64;
-            let r = unsafe {
-                if req.precise {
-                    ff::avformat_seek_file(ic.0, -1, i64::MIN, ts, ts, 0)
-                } else {
-                    ff::avformat_seek_file(ic.0, -1, i64::MIN, ts, i64::MAX, 0)
-                }
+            // Approximate relative seeks choose a keyframe nearest the target,
+            // but never on the opposite side of the original playback position.
+            // Exact and absolute seeks retain their previous ranges.
+            let origin_ts = ((start + req.origin.max(0.0)) * ff::AV_TIME_BASE as f64) as i64;
+            let (min_ts, max_ts) = if req.precise {
+                (i64::MIN, ts)
+            } else if req.direction > 0 {
+                (origin_ts.saturating_add(1).min(ts), i64::MAX)
+            } else if req.direction < 0 {
+                (i64::MIN, origin_ts.saturating_sub(1).max(ts))
+            } else {
+                (i64::MIN, i64::MAX)
             };
+            let r = unsafe { ff::avformat_seek_file(ic.0, -1, min_ts, ts, max_ts, 0) };
             let r = if r < 0 {
-                // Some demuxers only support seeking backwards to a keyframe.
-                unsafe { ff::av_seek_frame(ic.0, -1, ts, ff::AVSEEK_FLAG_BACKWARD as c_int) }
+                // Old demuxers may not support avformat_seek_file. Preserve
+                // direction in the fallback instead of always seeking backward.
+                let flags = if !req.precise && req.direction > 0 { 0 } else { ff::AVSEEK_FLAG_BACKWARD as c_int };
+                unsafe { ff::av_seek_frame(ic.0, -1, ts, flags) }
             } else {
                 r
             };
@@ -633,6 +650,11 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
                 });
             }
             ctx.wake();
+        }
+
+        // Cover art to decode again (`SessionCtx::redo_cover`).
+        if ctx.cover_redo.swap(false, Ordering::AcqRel) {
+            queue_attached_pic(&ctx, &ic, &video_c, true);
         }
 
         // Back-pressure: stop reading when every queue has enough.
@@ -720,7 +742,7 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
             pkt.unref();
         }
         // Cover art is delivered once via `attached_pic`, not by the demuxer.
-        queue_attached_pic(&ctx, &ic, &video_c);
+        queue_attached_pic(&ctx, &ic, &video_c, false);
     }
 
     ctx.vq.abort();
@@ -737,7 +759,9 @@ thread_local! {
     static ATTACHED_SERIAL: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
 }
 
-fn queue_attached_pic(ctx: &SessionCtx, ic: &FormatCtx, video_c: &Option<Component>) {
+/// Queues the cover art picture for decoding: once per serial (after each
+/// seek), or again with `again` (the picture shows at once even if paused).
+fn queue_attached_pic(ctx: &SessionCtx, ic: &FormatCtx, video_c: &Option<Component>, again: bool) {
     let Some(c) = video_c else { return };
     let st = ic.stream(c.stream);
     unsafe {
@@ -745,12 +769,15 @@ fn queue_attached_pic(ctx: &SessionCtx, ic: &FormatCtx, video_c: &Option<Compone
             return;
         }
         let serial = ctx.vq.serial();
-        if ATTACHED_SERIAL.with(|s| s.get()) == serial {
+        if ATTACHED_SERIAL.with(|s| s.get()) == serial && !again {
             return;
         }
         ATTACHED_SERIAL.with(|s| s.set(serial));
         let ap = Packet(ff::av_packet_clone(&(*st).attached_pic));
         if !ap.0.is_null() {
+            if again && ctx.paused() {
+                ctx.show_one.store(true, Ordering::Release);
+            }
             ctx.vq.put(ap);
             ctx.vq.put_drain();
         }

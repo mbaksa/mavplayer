@@ -47,6 +47,13 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.3.3" date="2026-11-22">
+      <description>
+        <p>Play in the background: closing the window while a file is open hides it in the tray and playback goes on, with Play/Pause, Previous and Next in the tray icon's menu.</p>
+        <p>A Bicubic upscaler that needs no libplacebo, cover art upscaled from the original picture, tidier menus, an option to play playlist entries on a double click, and dragging the window by its video.</p>
+        <p>Seeking to nearby keyframes respects the direction, fullscreen controls hide when the cursor leaves the window, and memory leaks found by profiling are fixed: playlist cycling and long DVD or PGS subtitle playback no longer grow.</p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-11-21">
       <description>
         <p>With NVIDIA GPUs, video is resized and converted on the GPU and copied out once at window size: playing 1080p60 in a window takes a fraction of the CPU it did, including AV1 and 10-bit H.264 that the GPU can't decode.</p>

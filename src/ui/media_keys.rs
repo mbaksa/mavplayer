@@ -182,7 +182,7 @@ impl PlayerView {
             Event::SetPosition(MediaPosition(d)) => self.player.seek(secs(d), false, true),
             Event::SetVolume(v) => self.set_volume(v, cx),
             Event::OpenUri(u) => self.open_sources(vec![crate::playlist::source_for_arg(&u)], window, cx),
-            Event::Raise => window.activate_window(),
+            Event::Raise => self.show_window(window, cx),
             Event::Quit => super::shell::quit(cx),
             _ => {}
         }

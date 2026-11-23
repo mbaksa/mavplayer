@@ -494,6 +494,9 @@ pub enum Upscaler {
     Bilinear,
     /// Nearest neighbour on the CPU: hard pixel edges, for pixel art.
     Nearest,
+    /// Bicubic, by swscale (or `scale_cuda` for pictures on the GPU) in the
+    /// presenter: sharper than bilinear, and needs no libplacebo.
+    Bicubic,
     /// libplacebo's EWA Lanczos (sharp), as in mpv's high-quality profile.
     EwaLanczos,
     /// FSRCNNX x2 16-0-4-1: neural luma doubler, good for live action.
@@ -519,13 +522,24 @@ pub enum Upscaler {
 impl Upscaler {
     /// Whether this runs on the GPU through FFmpeg's libplacebo filter.
     pub fn needs_libplacebo(self) -> bool {
-        !matches!(self, Upscaler::Bilinear | Upscaler::Nearest)
+        !matches!(self, Upscaler::Bilinear | Upscaler::Nearest | Upscaler::Bicubic)
+    }
+
+    /// The filter the presenter enlarges with for this upscaler, or `None`
+    /// when it leaves that to the GPU's drawing (bilinear) or to libplacebo.
+    pub fn presenter_filter(self) -> Option<ScaleQuality> {
+        match self {
+            Upscaler::Nearest => Some(ScaleQuality::Nearest),
+            Upscaler::Bicubic => Some(ScaleQuality::Good),
+            _ => None,
+        }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Upscaler::Bilinear => "Bilinear (fastest)",
             Upscaler::Nearest => "Nearest neighbor (pixel art)",
+            Upscaler::Bicubic => "Bicubic (sharper)",
             Upscaler::EwaLanczos => "EWA Lanczos (high quality)",
             Upscaler::Fsrcnnx => "FSRCNNX (live action)",
             Upscaler::FsrcnnxFast => "FSRCNNX fast",
@@ -539,8 +553,9 @@ impl Upscaler {
         }
     }
 
-    pub const ALL: [Upscaler; 12] = [
+    pub const ALL: [Upscaler; 13] = [
         Upscaler::Bilinear,
+        Upscaler::Bicubic,
         Upscaler::Nearest,
         Upscaler::EwaLanczos,
         Upscaler::Fsrcnnx,

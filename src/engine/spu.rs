@@ -403,6 +403,7 @@ pub fn run_decoder(
             ctx.subs.end_bitmaps_at(start);
             continue;
         }
+        ctx.subs.prune_bitmaps(ctx.position() + ctx.start_time.get());
         overlay.show(spu, start, end, &ctx.subs);
     }
 }

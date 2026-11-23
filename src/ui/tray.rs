@@ -1,5 +1,7 @@
-//! The system tray icon shown while "Keep running in the system tray" is on.
-//! Clicking it opens the window; its menu opens the window or quits.
+//! The system tray icon shown while "Keep running in the system tray" or
+//! "Play in the background" is on. Clicking it opens the window; its menu
+//! opens the window or quits, and with "Play in the background" also has
+//! Play/Pause, Previous and Next and hides the window to the tray.
 //!
 //! Linux uses StatusNotifierItem over D-Bus (`ksni`), which KDE, Cinnamon,
 //! Xfce, LXQt, Budgie, Sway bars and GNOME's AppIndicator extension show.
@@ -9,17 +11,63 @@ use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayEvent {
+    /// The icon itself was clicked: show the window, or hide it to the tray
+    /// when it is in front and playing in the background is on.
+    Activate,
     /// Open the window (or bring it to the front).
     Show,
+    /// Hide the window to the tray; playback goes on.
+    Hide,
+    PlayPause,
+    Previous,
+    Next,
     /// Quit MavPlayer completely.
     Quit,
+}
+
+/// What the tray's menu and tooltip show.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrayState {
+    /// Playback controls and "Hide to Tray" ("Play in the background").
+    pub controls: bool,
+    pub playing: bool,
+    /// The playlist isn't empty: there is something to play or skip.
+    pub has_media: bool,
+    /// The current item's title.
+    pub title: Option<String>,
+    /// The window is hidden in the tray.
+    pub hidden: bool,
+}
+
+impl TrayState {
+    fn tooltip(&self) -> String {
+        match (&self.title, self.controls) {
+            (Some(t), true) => format!("{t} ({})", if self.playing { "playing" } else { "paused" }),
+            _ => TOOLTIP.into(),
+        }
+    }
+
+    /// The title as a (disabled) menu entry, kept short.
+    fn title_label(&self) -> Option<String> {
+        let t = self.title.as_ref().filter(|_| self.controls)?;
+        const MAX: usize = 48;
+        Some(if t.chars().count() > MAX {
+            format!("{}…", t.chars().take(MAX - 1).collect::<String>())
+        } else {
+            t.clone()
+        })
+    }
+
+    fn play_label(&self) -> &'static str {
+        if self.playing { "Pause" } else { "Play" }
+    }
 }
 
 type Handler = Arc<dyn Fn(TrayEvent) + Send + Sync>;
 
 /// Removes the icon when dropped.
 pub struct Tray {
-    _inner: imp::Tray,
+    inner: imp::Tray,
 }
 
 impl Tray {
@@ -27,12 +75,20 @@ impl Tray {
     /// without an extension, say), so closing the window must quit instead.
     /// `on_event` runs on whatever thread the platform delivers clicks on.
     pub fn new(on_event: impl Fn(TrayEvent) + Send + Sync + 'static) -> anyhow::Result<Self> {
-        imp::Tray::new(Arc::new(on_event)).map(|inner| Self { _inner: inner })
+        imp::Tray::new(Arc::new(on_event)).map(|inner| Self { inner })
+    }
+
+    /// Updates the menu and tooltip. Doesn't wait for the desktop to catch up.
+    pub fn set_state(&self, state: TrayState) {
+        self.inner.set_state(state);
     }
 }
 
 const TOOLTIP: &str = "MavPlayer";
 const SHOW_LABEL: &str = "Open MavPlayer";
+const HIDE_LABEL: &str = "Hide to Tray";
+const PREV_LABEL: &str = "Previous";
+const NEXT_LABEL: &str = "Next";
 const QUIT_LABEL: &str = "Quit MavPlayer";
 
 /// The app icon as RGBA pixels at about `size` pixels.
@@ -52,12 +108,13 @@ fn icon_rgba(size: u32) -> anyhow::Result<(Vec<u8>, u32, u32)> {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::{Handler, TrayEvent};
+    use super::{Handler, TrayEvent, TrayState};
     use ksni::blocking::TrayMethods;
 
     struct Item {
         on_event: Handler,
         icons: Vec<ksni::Icon>,
+        state: TrayState,
     }
 
     impl ksni::Tray for Item {
@@ -76,32 +133,48 @@ mod imp {
         }
 
         fn tool_tip(&self) -> ksni::ToolTip {
-            ksni::ToolTip { title: super::TOOLTIP.into(), ..Default::default() }
+            let description = if self.state.controls { self.state.tooltip() } else { String::new() };
+            ksni::ToolTip { title: super::TOOLTIP.into(), description, ..Default::default() }
         }
 
         fn activate(&mut self, _x: i32, _y: i32) {
-            (self.on_event)(TrayEvent::Show);
+            (self.on_event)(TrayEvent::Activate);
         }
 
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
             use ksni::menu::StandardItem;
-            vec![
+            fn item(label: &str, icon: &str, enabled: bool, ev: TrayEvent) -> ksni::MenuItem<Item> {
                 StandardItem {
-                    label: super::SHOW_LABEL.into(),
-                    icon_name: crate::integration::APP_ID.into(),
-                    activate: Box::new(|t: &mut Self| (t.on_event)(TrayEvent::Show)),
+                    label: label.into(),
+                    icon_name: icon.into(),
+                    enabled,
+                    activate: Box::new(move |t: &mut Item| (t.on_event)(ev)),
                     ..Default::default()
                 }
-                .into(),
-                ksni::MenuItem::Separator,
-                StandardItem {
-                    label: super::QUIT_LABEL.into(),
-                    icon_name: "application-exit".into(),
-                    activate: Box::new(|t: &mut Self| (t.on_event)(TrayEvent::Quit)),
-                    ..Default::default()
+                .into()
+            }
+            let st = &self.state;
+            let mut v = Vec::new();
+            if st.controls {
+                if let Some(title) = st.title_label() {
+                    // An underscore marks the access key in a dbusmenu label.
+                    let label = title.replace('_', "__");
+                    v.push(StandardItem { label, enabled: false, ..Default::default() }.into());
                 }
-                .into(),
-            ]
+                let icon = if st.playing { "media-playback-pause" } else { "media-playback-start" };
+                v.push(item(st.play_label(), icon, st.has_media, TrayEvent::PlayPause));
+                v.push(item(super::PREV_LABEL, "media-skip-backward", st.has_media, TrayEvent::Previous));
+                v.push(item(super::NEXT_LABEL, "media-skip-forward", st.has_media, TrayEvent::Next));
+                v.push(ksni::MenuItem::Separator);
+            }
+            if st.controls && !st.hidden {
+                v.push(item(super::HIDE_LABEL, "window-minimize", true, TrayEvent::Hide));
+            } else {
+                v.push(item(super::SHOW_LABEL, crate::integration::APP_ID, true, TrayEvent::Show));
+            }
+            v.push(ksni::MenuItem::Separator);
+            v.push(item(super::QUIT_LABEL, "application-exit", true, TrayEvent::Quit));
+            v
         }
 
         // The panel went away (restarted, or its tray widget removed). Keep
@@ -142,7 +215,12 @@ mod imp {
         Some(ksni::Icon { width: w as i32, height: h as i32, data: px })
     }
 
-    pub struct Tray(ksni::blocking::Handle<Item>);
+    pub struct Tray {
+        handle: ksni::blocking::Handle<Item>,
+        /// To the thread that applies new states: `update` waits until the
+        /// change has gone out over D-Bus.
+        updates: std::sync::mpsc::Sender<TrayState>,
+    }
 
     impl Tray {
         pub fn new(on_event: Handler) -> anyhow::Result<Self> {
@@ -150,51 +228,96 @@ mod imp {
             // A Flatpak sandbox may not own the item's usual bus name (it
             // can own `bus_name`, which is under the app ID).
             let sandboxed = std::env::var_os("FLATPAK_ID").is_some() || std::path::Path::new("/.flatpak-info").exists();
-            let handle = Item { on_event, icons }
+            let handle = Item { on_event, icons, state: TrayState::default() }
                 .disable_dbus_name(sandboxed)
                 .dbus_name(Some(bus_name()))
                 .spawn()
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            Ok(Self(handle))
+            let (updates, rx) = std::sync::mpsc::channel::<TrayState>();
+            let h = handle.clone();
+            std::thread::Builder::new().name("tray".into()).spawn(move || {
+                while let Ok(mut st) = rx.recv() {
+                    // Only the latest of a burst matters.
+                    while let Ok(newer) = rx.try_recv() {
+                        st = newer;
+                    }
+                    if h.update(|item| item.state = st).is_none() {
+                        break;
+                    }
+                }
+            })?;
+            Ok(Self { handle, updates })
+        }
+
+        pub fn set_state(&self, state: TrayState) {
+            let _ = self.updates.send(state);
         }
     }
 
     impl Drop for Tray {
         fn drop(&mut self) {
-            self.0.shutdown().wait();
+            self.handle.shutdown().wait();
         }
     }
 }
 
 #[cfg(any(windows, target_os = "macos"))]
 mod imp {
-    use super::{Handler, TrayEvent};
+    use super::{Handler, TrayEvent, TrayState};
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
     pub struct Tray {
-        _icon: TrayIcon,
+        icon: TrayIcon,
+    }
+
+    const EVENTS: [(&str, TrayEvent); 6] = [
+        ("show", TrayEvent::Show),
+        ("hide", TrayEvent::Hide),
+        ("playpause", TrayEvent::PlayPause),
+        ("previous", TrayEvent::Previous),
+        ("next", TrayEvent::Next),
+        ("quit", TrayEvent::Quit),
+    ];
+
+    /// The menu for `st`; its items' IDs are `EVENTS`' names.
+    fn build_menu(st: &TrayState) -> anyhow::Result<Menu> {
+        let menu = Menu::new();
+        let item = |id: &str, label: &str, enabled: bool| MenuItem::with_id(id, label, enabled, None);
+        if st.controls {
+            if let Some(title) = st.title_label() {
+                // `&` marks the access key on Windows.
+                let label = if cfg!(windows) { title.replace('&', "&&") } else { title };
+                menu.append(&MenuItem::new(label, false, None))?;
+            }
+            menu.append(&item("playpause", st.play_label(), st.has_media))?;
+            menu.append(&item("previous", super::PREV_LABEL, st.has_media))?;
+            menu.append(&item("next", super::NEXT_LABEL, st.has_media))?;
+            menu.append(&PredefinedMenuItem::separator())?;
+        }
+        if st.controls && !st.hidden {
+            menu.append(&item("hide", super::HIDE_LABEL, true))?;
+        } else {
+            menu.append(&item("show", super::SHOW_LABEL, true))?;
+        }
+        menu.append(&PredefinedMenuItem::separator())?;
+        menu.append(&item("quit", super::QUIT_LABEL, true))?;
+        Ok(menu)
     }
 
     impl Tray {
         /// Must run on the main thread (it owns the platform's event loop).
         pub fn new(on_event: Handler) -> anyhow::Result<Self> {
-            let show = MenuItem::new(super::SHOW_LABEL, true, None);
-            let quit = MenuItem::new(super::QUIT_LABEL, true, None);
-            let menu = Menu::new();
-            menu.append_items(&[&show, &PredefinedMenuItem::separator(), &quit])?;
-            let (show_id, quit_id) = (show.id().clone(), quit.id().clone());
+            let menu = build_menu(&TrayState::default())?;
             let on_menu = on_event.clone();
             MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
-                if e.id == show_id {
-                    on_menu(TrayEvent::Show);
-                } else if e.id == quit_id {
-                    on_menu(TrayEvent::Quit);
+                if let Some((_, ev)) = EVENTS.iter().find(|(id, _)| e.id.0 == *id) {
+                    on_menu(*ev);
                 }
             }));
             TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
                 if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
-                    on_event(TrayEvent::Show);
+                    on_event(TrayEvent::Activate);
                 }
             }));
             // Retina menu bars draw the icon at 2x.
@@ -206,7 +329,16 @@ mod imp {
                 // Left click opens the window; the menu is on the right button.
                 .with_menu_on_left_click(false)
                 .build()?;
-            Ok(Self { _icon: icon })
+            Ok(Self { icon })
+        }
+
+        /// Main thread only, like `new`.
+        pub fn set_state(&self, state: TrayState) {
+            match build_menu(&state) {
+                Ok(menu) => self.icon.set_menu(Some(Box::new(menu))),
+                Err(e) => log::warn!("tray menu: {e:#}"),
+            }
+            let _ = self.icon.set_tooltip(Some(state.tooltip()));
         }
     }
 
@@ -220,7 +352,7 @@ mod imp {
 
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 mod imp {
-    use super::Handler;
+    use super::{Handler, TrayState};
 
     pub struct Tray;
 
@@ -228,5 +360,7 @@ mod imp {
         pub fn new(_: Handler) -> anyhow::Result<Self> {
             anyhow::bail!("no system tray support on this platform")
         }
+
+        pub fn set_state(&self, _: TrayState) {}
     }
 }

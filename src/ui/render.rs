@@ -535,19 +535,19 @@ impl PlayerView {
             .when(active && !show_controls && self.menu.is_none(), |d| d.cursor(CursorStyle::None))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 this.note_activity(cx);
-                if this.settings.drag_video_to_move_window {
-                    if let Some(start) = this.window_move_origin {
-                        if ev.pressed_button != Some(MouseButton::Left) {
+                if this.settings.drag_video_to_move_window
+                    && let Some(start) = this.window_move_origin
+                {
+                    if ev.pressed_button != Some(MouseButton::Left) {
+                        this.window_move_origin = None;
+                    } else if !window.is_fullscreen() && this.drag.is_none() && this.scrub.is_none() {
+                        let dx = f32::from(ev.position.x - start.x);
+                        let dy = f32::from(ev.position.y - start.y);
+                        if dx * dx + dy * dy >= 25.0 {
                             this.window_move_origin = None;
-                        } else if !window.is_fullscreen() && this.drag.is_none() && this.scrub.is_none() {
-                            let dx = f32::from(ev.position.x - start.x);
-                            let dy = f32::from(ev.position.y - start.y);
-                            if dx * dx + dy * dy >= 25.0 {
-                                this.window_move_origin = None;
-                                this.window_move_started = true;
-                                window.start_window_move();
-                                return;
-                            }
+                            this.window_move_started = true;
+                            window.start_window_move();
+                            return;
                         }
                     }
                 }
@@ -622,8 +622,8 @@ impl PlayerView {
             }))
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                    let items = this.context_menu(cx);
+                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                    let items = this.context_menu(this.menubar_visible(window), cx);
                     this.open_menu(items, ev.position, None, cx);
                 }),
             )
@@ -1645,7 +1645,10 @@ impl PlayerView {
                             })
                             .on_click(cx.listener(move |this, ev: &ClickEvent, w, cx| {
                                 this.playlist_selected = Some(i);
-                                if ev.click_count() >= 2 {
+                                // One click plays (the second of a double
+                                // click mustn't start it again), or two.
+                                let clicks = if this.settings.playlist_double_click { 2 } else { 1 };
+                                if ev.click_count() == clicks {
                                     this.play_index(i, w, cx);
                                 }
                                 cx.notify();
@@ -1833,7 +1836,7 @@ impl PlayerView {
         let t = self.theme;
         let fullscreen = window.is_fullscreen();
         let client_decor = matches!(window.window_decorations(), Decorations::Client { .. }) && !fullscreen;
-        let show_menubar = self.settings.show_menubar && !fullscreen && !cfg!(target_os = "macos");
+        let show_menubar = self.menubar_visible(window);
         let overlay_open = self.dialog.is_some() || self.menu.is_some() || self.editing_volume;
 
         let main = div()

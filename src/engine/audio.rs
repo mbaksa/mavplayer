@@ -16,7 +16,7 @@ use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
 use std::os::raw::c_int;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -536,10 +536,17 @@ fn ramp(out: &mut [f32], channels: usize, from: f32, to: f32) {
     }
 }
 
-/// Opens the audio device on its own thread (cpal streams may not be `Send`).
 /// How long playback waits for a device before continuing without sound.
 const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Device opens that timed out and still wait for the driver. A new open
+/// would most likely hang the same way (ALSA holds a global lock while its
+/// PipeWire plugin waits for a server that never answers), and each would
+/// leave one more thread behind and hold playback 3 s: while one is stuck,
+/// play silently at once instead.
+static STUCK_OPENS: AtomicIsize = AtomicIsize::new(0);
+
+/// Opens the audio device on its own thread (cpal streams may not be `Send`).
 pub fn open_output(
     ctx: Arc<SessionCtx>,
     stop: Arc<AtomicBool>,
@@ -550,16 +557,35 @@ pub fn open_output(
     let device_name = cfg.audio_device.clone();
     let mode = cfg.channels;
     let link = OutputLink::new(Feed { ctx: ctx.clone(), stop, token: 0 }, cfg, media_channels);
+    if STUCK_OPENS.load(Ordering::Acquire) > 0 {
+        log::warn!("an earlier audio device open still hangs; playing without sound");
+        ctx.emit(PlayerEvent::Warning("The audio device isn't responding — playing without sound".into()));
+        let fmt = silent_format(mode, media_channels);
+        let (f2, l2) = (fmt.clone(), link.clone());
+        let sink = std::thread::Builder::new().name("audio-null".into()).spawn(move || null_sink(&l2, f2))?;
+        *link.fmt.lock() = Some(fmt.clone());
+        *ctx.controls.output.lock() = Arc::downgrade(&link);
+        return Ok((sink, fmt, link));
+    }
     // Whoever sets this first owns the output: the device thread when it
     // opens in time, or the fallback below when it doesn't.
     let claimed = Arc::new(AtomicBool::new(false));
     let (l, cl) = (link.clone(), claimed.clone());
     let handle = std::thread::Builder::new().name("audio-out".into()).spawn(move || {
         let link = l;
+        // Called once the open returns: whether it came too late (the
+        // fallback took over and counted this open as stuck).
+        let late = || {
+            let late = cl.swap(true, Ordering::AcqRel);
+            if late {
+                STUCK_OPENS.fetch_sub(1, Ordering::AcqRel);
+            }
+            late
+        };
         #[cfg(target_os = "linux")]
         {
             let ready = |fmt: &OutFormat| {
-                if cl.swap(true, Ordering::AcqRel) {
+                if late() {
                     log::warn!("audio device opened after the timeout; not using it for this file");
                     return false;
                 }
@@ -581,7 +607,7 @@ pub fn open_output(
             }
         }
         let started = start_device(&link, device_name.as_deref(), mode, media_channels);
-        if cl.swap(true, Ordering::AcqRel) {
+        if late() {
             // Took too long; playback already continued without this device.
             log::warn!("audio device opened after the timeout; not using it for this file");
             return;
@@ -627,6 +653,7 @@ pub fn open_output(
         Err(_) if !claimed.swap(true, Ordering::AcqRel) => {
             // The device is hanging. Leave its thread behind (it exits on its
             // own if the device ever answers) and play silently instead.
+            STUCK_OPENS.fetch_add(1, Ordering::AcqRel);
             log::warn!("audio device did not open within {DEVICE_OPEN_TIMEOUT:?}; playing without sound");
             ctx.emit(PlayerEvent::Warning("The audio device isn't responding — playing without sound".into()));
             let fmt = silent_format(mode, media_channels);

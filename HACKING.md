@@ -103,7 +103,7 @@ Without a Vulkan driver the upscalers simply fail to start and MavPlayer falls
 back to bilinear. FFmpeg's newer Vulkan headers come from libplacebo's
 `3rdparty/Vulkan-Headers` submodule and are copied into the prefix. macOS builds
 skip libplacebo, since it would need MoltenVK bundled in the app, so they offer
-only Bilinear and Nearest.
+only Bilinear, Bicubic and Nearest.
 
 ### AppImage, .deb and .rpm
 
@@ -419,6 +419,19 @@ Any later launch, with files or not, is handed to it (`background_only`
 requests), and it opens a window in a few tens of milliseconds. On macOS the
 app stays running without windows instead. Without a working tray (GNOME
 without an AppIndicator extension, say) closing the window quits as usual.
+
+**Playing in the background.** "Play in the background" can't use the
+hand-over: the player lives in the window. Instead, closing the window while
+a file is open (`on_window_should_close`) hides it (`PlayerView::hide_to_tray`):
+the window stays open, so GPUI's loop, the engine, media keys and gapless
+playback carry on, and showing it is instant. GPUI has no way to hide a
+window on Linux, so it is patched (`third_party/gpui`, `Window::set_window_visible`):
+on Wayland, attaching no buffer unmaps the toplevel, and showing it maps it
+again like a new window; X11 unmaps, Windows and macOS hide. The tray menu
+follows the player through `shell::set_tray_state` (from the 200 ms tick),
+and its clicks reach `PlayerView::on_tray`. Picture conversion stops while
+hidden (`set_video_hidden`). With nothing open, closing the window works as
+before (hand-over or quit).
 
 **Memory.** Measured on Linux with an NVIDIA GPU:
 
