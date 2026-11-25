@@ -281,10 +281,10 @@ mod tests {
             let peaks = vec![[-1234, 2345]; BINS];
             save(&file, &key, &peaks, &AtomicBool::new(false))?;
             assert_eq!(load(&file, &key)?, peaks);
-            assert!(cached(&path, 0, &root));
+            assert_eq!(load_cached(&path, 0, &root)?, peaks);
             fs::write(&path, b"changed audio")?;
             assert!(load(&file, &Key::new(&path, 0)?).is_err());
-            assert!(!cached(&path, 0, &root));
+            assert!(load_cached(&path, 0, &root).is_err());
             Ok(())
         })();
         let _ = fs::remove_dir_all(root);
