@@ -595,7 +595,9 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
         }
 
         // Seeks.
-        if let Some(req) = ctx.seek_req.lock().take() {
+        // Release the request lock before performing potentially slow seeks.
+        let request = ctx.seek_req.lock().take();
+        if let Some(req) = request {
             let start = ctx.start_time.get();
             let dur = ctx.duration.get();
             let mut target = req.target.max(0.0);

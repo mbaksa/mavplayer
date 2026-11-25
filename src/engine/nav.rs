@@ -1231,7 +1231,9 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, path: String, opts: &LoadO
                 // Play (a seek to the start) or a menu/title command starts
                 // again (a single title from its start).
                 while ctx.alive() {
-                    if let Some(req) = ctx.seek_req.lock().take() {
+                    // Release the request lock before performing potentially slow seeks.
+                    let request = ctx.seek_req.lock().take();
+                    if let Some(req) = request {
                         ctx.seeking.store(false, Ordering::Release);
                         nav.restart();
                         // A single title goes to the time asked for.
@@ -1521,7 +1523,9 @@ fn play_segment(
         }
 
         // Seeks (titles only).
-        if let Some(req) = ctx.seek_req.lock().take() {
+        // Release the request lock before performing potentially slow seeks.
+        let request = ctx.seek_req.lock().take();
+        if let Some(req) = request {
             let dur = ctx.duration.get();
             let target = req.target.clamp(0.0, (dur - 0.5).max(0.0));
             if info.seekable && nav.seek(target) {
