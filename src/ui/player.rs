@@ -13,7 +13,7 @@ use crate::engine::{
     Rotation, Status, SubEvent, TrackId, TrackKind, VideoAdjust,
 };
 use crate::icons;
-use crate::playlist::{self, Playlist};
+use crate::playlist::{self, Playlist, session::{Library as PlaylistLibrary, Snapshot as PlaylistSnapshot}};
 use crate::settings::{RepeatMode, ResumeStore, Settings};
 use futures::StreamExt;
 use gpui::{
@@ -116,6 +116,8 @@ pub struct PlayerView {
     pub settings: Settings,
     pub resume: ResumeStore,
     pub playlist: Playlist,
+    pub(super) playlist_library: PlaylistLibrary,
+    playlist_save_at: Instant,
     pub theme: Theme,
     pub focus: FocusHandle,
     wake_pending: Arc<AtomicBool>,
@@ -174,6 +176,8 @@ pub struct PlayerView {
     pub modal_bounds: Rc<Cell<Bounds<Pixels>>>,
     pub drag: Option<Drag>,
     pub seek_hover: Option<f32>,
+    pub(super) thumbnails: super::thumbnails::TimelineThumbnails,
+    pub(super) playlist_previews: super::playlist_thumbnails::PlaylistPreviews,
     pub scrub: Option<Scrub>,
     /// The playlist beside the video in a window (saved in settings).
     pub show_playlist: bool,
@@ -265,12 +269,15 @@ pub struct Boot {
     primary: bool,
     resume: ResumeStore,
     sources: Vec<MediaSource>,
-    /// `sources[0]` is already loading.
+    playlist_library: PlaylistLibrary,
+    start_index: Option<usize>,
+    restored_position: Option<Option<f64>>,
+    /// The selected startup item is already loading.
     started: bool,
 }
 
 impl Boot {
-    pub fn start(settings: Settings, sources: Vec<MediaSource>, primary: bool) -> Self {
+    pub fn start(settings: Settings, mut sources: Vec<MediaSource>, primary: bool) -> Self {
         icons::set_use_system_theme(settings.icon_theme == crate::settings::IconTheme::System);
         // Icons from the desktop theme are resolved off the UI thread, once per process.
         static ICONS: std::sync::Once = std::sync::Once::new();
@@ -296,13 +303,22 @@ impl Boot {
         player.set_muted(settings.muted);
         player.set_audio_fx(settings.audio_fx.clone());
         let resume = ResumeStore::load();
+        let mut playlist_library = PlaylistLibrary::load(primary);
+        let (start_index, restored_position) = if sources.is_empty() {
+            let snapshot = playlist_library.snapshot();
+            sources = snapshot.sources.clone();
+            (snapshot.current, Some(snapshot.position))
+        } else {
+            playlist_library.start_launch_playlist();
+            (Some(0), None)
+        };
         // A whole DVD (title 0) needs its titles probed first; that runs in the view.
         let dvd_menus = engine::dvd_menus_available();
-        let started = match sources.first() {
+        let started = match start_index.and_then(|i| sources.get(i)) {
             Some(MediaSource::Dvd { title: 0, .. }) if !dvd_menus => false,
             Some(MediaSource::Cd { track: 0, .. }) | None => false,
             Some(src) => {
-                let start_at = if settings.resume_playback { resume.get(&src.key()) } else { None };
+                let start_at = restored_position.unwrap_or_else(|| if settings.resume_playback { resume.get(&src.key()) } else { None });
                 // Paused until the window exists, so sound doesn't start
                 // before there is anything to see.
                 player.load(src.clone(), LoadOptions { start_at, start_paused: true, ..Default::default() });
@@ -310,13 +326,13 @@ impl Boot {
                 true
             }
         };
-        Self { settings, player, wake_pending, wake_rx, icons_rx, primary, resume, sources, started }
+        Self { settings, player, wake_pending, wake_rx, icons_rx, primary, resume, sources, playlist_library, start_index, restored_position, started }
     }
 }
 
 impl PlayerView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, boot: Boot) -> Self {
-        let Boot { settings, player, wake_pending, wake_rx: mut rx, icons_rx, primary, resume, sources, started } =
+        let Boot { settings, player, wake_pending, wake_rx: mut rx, icons_rx, primary, resume, sources, playlist_library, start_index, restored_position, started } =
             boot;
         log::debug!("startup: creating player view at {:.0} ms", crate::ms_since_start());
         // Engine → UI wake-ups. The engine sends one only after the previous
@@ -433,6 +449,8 @@ impl PlayerView {
         });
         let mut v = Self {
             playlist: Playlist::new(settings.repeat, settings.shuffle),
+            playlist_library,
+            playlist_save_at: Instant::now(),
             show_playlist: settings.show_playlist,
             fs_playlist: false,
             in_fullscreen: window.is_fullscreen(),
@@ -470,6 +488,8 @@ impl PlayerView {
             modal_bounds: Rc::new(Cell::new(Bounds::default())),
             drag: None,
             seek_hover: None,
+            thumbnails: Default::default(),
+            playlist_previews: Default::default(),
             scrub: None,
             playlist_selected: None,
             ab_loop: (None, None),
@@ -514,10 +534,10 @@ impl PlayerView {
         if !sources.is_empty() {
             v.playlist.add(sources);
             v.probe_playlist(cx);
-            let paused = v.settings.start_paused;
-            v.start_item(0, !started, paused, window, cx);
-            if started && !paused {
-                v.player.set_paused(false);
+            if let Some(index) = start_index {
+                let paused = restored_position.is_some() || v.settings.start_paused;
+                v.start_item_at(index, !started, paused, restored_position, window, cx);
+                if started && !paused { v.player.set_paused(false); }
             }
         }
         if v.settings.start_fullscreen && !window.is_fullscreen() {
@@ -607,6 +627,7 @@ impl PlayerView {
             }
         }
         if chrome {
+            self.update_thumbnails();
             cx.notify();
         }
     }
@@ -614,12 +635,17 @@ impl PlayerView {
     fn on_loaded(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let st = self.player.state();
         let Some(media) = st.media.clone() else { return };
+        if let Some(MediaSource::File(path)) = &st.source { self.playlist_previews.invalidate(path); }
         let title = media.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| media.source_name.clone());
         window.set_window_title(&format!("{title} — MavPlayer"));
         if let Some(i) = self.playlist.current
             && let Some(it) = self.playlist.items.get_mut(i)
         {
             it.duration = Some(media.duration).filter(|d| *d > 0.0);
+            it.video_stream = match st.selected.video {
+                Some(TrackId::Stream(i)) if media.seekable && media.tracks.iter().any(|t| t.id == TrackId::Stream(i) && !t.is_cover_art) => Some(i),
+                _ => None,
+            };
             if it.title.is_none() {
                 it.title = media.title.clone();
                 it.artist = media.artist.clone();
@@ -702,6 +728,17 @@ impl PlayerView {
             _ => self.playlist.items.iter().position(|it| it.source == src),
         };
         self.playlist.current = idx;
+        if let Some(i) = idx && let Some(it) = self.playlist.items.get_mut(i) {
+            let st = self.player.state();
+            if let Some(media) = st.media.as_ref() {
+                it.duration = Some(media.duration).filter(|d| *d > 0.0);
+                it.video_stream = match st.selected.video {
+                    Some(TrackId::Stream(i)) if media.seekable && media.tracks.iter().any(|t| t.id == TrackId::Stream(i) && !t.is_cover_art) => Some(i),
+                    _ => None,
+                };
+            }
+        }
+        if let MediaSource::File(path) = &src { self.playlist_previews.invalidate(path); }
         if idx != prev {
             self.playlist_selected = idx;
             self.ab_loop = (None, None);
@@ -723,7 +760,30 @@ impl PlayerView {
     }
 
     pub fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut changed = false;
+        let mut changed = self.update_thumbnails();
+        let current = self.player.state();
+        let playlist_shown = self.playlist_shown();
+        let (playlist_changed, retired) = self.playlist_previews.update(&self.settings, playlist_shown, &self.thumbnails, &current);
+        self.retired.extend(retired.into_iter().map(|id| (id, RETIRE_AFTER)));
+        changed |= playlist_changed;
+        if let Some(message) = self.playlist_previews.take_message() { self.osd(message, cx); }
+        if self.playlist_previews.take_maintenance() { self.thumbnails.refresh_cache_stats(); }
+        if let Some((key, duration)) = self.playlist_previews.take_completed() {
+            for (index, it) in self.playlist.items.iter_mut().enumerate() {
+                if matches!(&it.source, MediaSource::File(path) if path == &key.path) {
+                    it.duration = Some(duration);
+                    if self.playlist.current != Some(index) || current.selected.video == Some(TrackId::Stream(key.stream)) {
+                        it.video_stream = Some(key.stream);
+                    }
+                }
+            }
+            if matches!(&current.source, Some(MediaSource::File(path)) if path == &key.path)
+                && current.selected.video == Some(TrackId::Stream(key.stream)) {
+                self.reset_thumbnails();
+                self.update_thumbnails();
+            }
+            changed = true;
+        }
         // `video_bounds` is updated during GPUI layout, after subtitle elements
         // have been built. A fullscreen/resize frame may therefore use the
         // *previous* video size. Request one more render when the measured
@@ -741,6 +801,10 @@ impl PlayerView {
             changed = true;
         }
         self.save_volume_soon();
+        if self.playlist_save_at.elapsed() >= Duration::from_secs(1) {
+            self.playlist_save_at = Instant::now();
+            if self.playlist_library.autosave() { self.save_playlist_session(false, false); }
+        }
         if self.scrub.is_none() {
             self.player.set_hushed(false);
         }
@@ -809,6 +873,49 @@ impl PlayerView {
         if changed {
             cx.notify();
         }
+    }
+
+    fn update_thumbnails(&mut self) -> bool {
+        if self.settings.timeline_thumbnails && self.player.with_state(|st| {
+            let Some(MediaSource::File(path)) = &st.source else { return false; };
+            let stream = match st.selected.video { Some(TrackId::Stream(stream)) => Some(stream), _ => None };
+            self.playlist_previews.generating_for(path, stream)
+        }) { return false; }
+        let (changed, retired) = self.thumbnails.update(&self.player, &self.settings);
+        self.retired.extend(retired.into_iter().map(|id| (id, RETIRE_AFTER)));
+        if let Some((path, generated)) = self.thumbnails.take_completed_path() {
+            if generated { self.playlist_previews.invalidate(&path); }
+            let st = self.player.state();
+            if let Some(index) = self.playlist.current
+                && let Some(it) = self.playlist.items.get_mut(index)
+                && matches!(&it.source, MediaSource::File(p) if p == &path)
+                && let Some(TrackId::Stream(stream)) = st.selected.video
+            {
+                it.video_stream = Some(stream);
+            }
+        }
+        changed
+    }
+
+    pub(super) fn regenerate_playlist_thumbnails(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let stream = self.player.with_state(|st| {
+            if matches!(&st.source, Some(MediaSource::File(p)) if p == &path)
+                && let Some(TrackId::Stream(stream)) = st.selected.video { return Some(stream); }
+            None
+        });
+        self.playlist_previews.regenerate(path, stream);
+        cx.notify();
+    }
+
+    pub(super) fn regenerate_thumbnails(&mut self, cx: &mut Context<Self>) {
+        if let Some(MediaSource::File(path)) = self.player.with_state(|st| st.source.clone()) {
+            self.regenerate_playlist_thumbnails(path, cx);
+        }
+    }
+
+    fn reset_thumbnails(&mut self) {
+        self.retired.extend(self.thumbnails.reset().into_iter().map(|id| (id, RETIRE_AFTER)));
+        self.seek_hover = None;
     }
 
     /// Keeps KWin from scanning the fullscreen window out directly.
@@ -938,8 +1045,96 @@ impl PlayerView {
         }
     }
 
+    fn playlist_snapshot(&self) -> PlaylistSnapshot {
+        let sources: Vec<_> = self.playlist.items.iter().map(|it| match &it.source {
+            MediaSource::File(path) if path.is_relative() => MediaSource::File(std::path::absolute(path).unwrap_or_else(|_| path.clone())),
+            source => source.clone(),
+        }).collect();
+        let current = self.playlist.current.filter(|&i| i < sources.len());
+        let previous = self.playlist_library.snapshot();
+        let position = current.and_then(|i| {
+            let st = self.player.state();
+            if st.source.as_ref() == Some(&self.playlist.items[i].source) {
+                if matches!(st.status, Status::Playing | Status::Paused)
+                    && st.media.as_ref().is_some_and(|m| m.seekable && !m.is_live) && st.dvd.is_none() {
+                    return Some(self.player.position().max(0.0));
+                }
+                if st.status == Status::Ended { return None; }
+            }
+            if previous.current.and_then(|j| previous.sources.get(j)) == sources.get(i) { previous.position } else { None }
+        });
+        PlaylistSnapshot { sources, current, position }
+    }
+
+    fn save_playlist_session(&mut self, exact: bool, manual: bool) {
+        let snapshot = self.playlist_snapshot();
+        self.playlist_library.capture(snapshot, exact, manual);
+        if let Err(err) = self.playlist_library.flush() { log::warn!("could not save playlist state: {err}"); }
+    }
+
+    pub(super) fn toggle_playlist_autosave(&mut self, cx: &mut Context<Self>) {
+        let enabled = !self.playlist_library.autosave();
+        self.playlist_library.set_autosave(enabled);
+        self.save_playlist_session(true, false);
+        cx.notify();
+    }
+
+    pub(super) fn save_playlist_workspace(&mut self, cx: &mut Context<Self>) {
+        if !self.playlist_library.writable { self.osd("Playlist state is not writable in this window", cx); return; }
+        let snapshot = self.playlist_snapshot();
+        self.playlist_library.capture(snapshot, true, true);
+        match self.playlist_library.flush() {
+            Ok(()) => self.osd("Playlist state saved", cx),
+            Err(err) => self.osd(format!("Could not save playlist state: {err}"), cx),
+        }
+    }
+
+    pub(super) fn switch_playlist_workspace(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index == self.playlist_library.active || index >= self.playlist_library.slots.len() { return; }
+        self.stop(window, cx);
+        self.playlist_library.switch(index);
+        self.restore_playlist_workspace(window, cx);
+    }
+
+    pub(super) fn close_playlist_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.playlist_library.can_close() { return; }
+        self.stop(window, cx);
+        self.playlist_library.close_active();
+        self.restore_playlist_workspace(window, cx);
+    }
+
+    pub(super) fn name_playlist_workspace(&mut self, name: String, rename: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.playlist_library.valid_name(&name, rename) { self.osd("Choose a unique playlist name", cx); return; }
+        self.close_dialog(window, cx);
+        if rename {
+            self.playlist_library.rename(name);
+            self.save_playlist_session(true, false);
+        } else {
+            self.stop(window, cx);
+            self.playlist_library.create(name);
+            self.restore_playlist_workspace(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn restore_playlist_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let snapshot = self.playlist_library.snapshot().clone();
+        self.playlist.clear(); // Keep the monotonic item IDs used by asynchronous probes.
+        self.playlist_selected = None;
+        self.playlist_previews.hover = None;
+        self.armed = None;
+        self.playlist.add(snapshot.sources);
+        self.probe_playlist(cx);
+        if let Some(index) = snapshot.current {
+            self.start_item_at(index, true, true, Some(snapshot.position), window, cx);
+        }
+        if let Err(err) = self.playlist_library.flush() { self.osd(format!("Could not save playlists: {err}"), cx); }
+        cx.notify();
+    }
+
     pub fn save_state(&mut self) {
         self.save_current_position();
+        self.save_playlist_session(true, false);
         self.settings.volume = self.player.volume();
         self.settings.muted = self.player.muted();
         self.settings.repeat = self.playlist.repeat;
@@ -965,7 +1160,12 @@ impl PlayerView {
     /// Makes `idx` the current item. With `load` false the engine is
     /// already playing it (started early by [`Boot`]).
     fn start_item(&mut self, idx: usize, load: bool, paused: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_item_at(idx, load, paused, None, window, cx);
+    }
+
+    fn start_item_at(&mut self, idx: usize, load: bool, paused: bool, restored_position: Option<Option<f64>>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.playlist.items.get(idx).cloned() else { return };
+        self.reset_thumbnails();
         self.save_current_position();
         self.playlist.current = Some(idx);
         self.playlist_selected = Some(idx);
@@ -988,7 +1188,7 @@ impl PlayerView {
         // A new load drops whatever was queued in the engine.
         self.armed = None;
         if load {
-            let start_at = if self.settings.resume_playback { self.resume.get(&item.source.key()) } else { None };
+            let start_at = restored_position.unwrap_or_else(|| if self.settings.resume_playback { self.resume.get(&item.source.key()) } else { None });
             self.player.load(item.source.clone(), LoadOptions { start_at, start_paused: paused, ..Default::default() });
         }
         match &item.source {
@@ -1015,6 +1215,7 @@ impl PlayerView {
     pub fn reload_current(&mut self, cx: &mut Context<Self>) {
         let st = self.player.state();
         let Some(src) = st.source else { return };
+        self.reset_thumbnails();
         let pos = self.player.position();
         let paused = self.player.paused();
         // A DVD played with its menus resumes its title, not the first-play program.
@@ -1155,6 +1356,7 @@ impl PlayerView {
                     for (id, r) in batch {
                         if let (Some(it), Some(r)) = (v.playlist.items.iter_mut().find(|i| i.id == id), r) {
                             it.duration = Some(r.duration).filter(|d| *d > 0.0);
+                            if it.video_stream.is_none() { it.video_stream = r.video_stream; }
                             it.title = it.title.take().or(r.title);
                             it.artist = it.artist.take().or(r.artist);
                         }
@@ -1167,6 +1369,32 @@ impl PlayerView {
             }
         })
         .detach();
+    }
+
+    pub(super) fn enqueue_paths_at(&mut self, at: usize, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(d) = paths.first().and_then(|p| p.parent()) {
+            self.settings.last_dir = Some(d.to_path_buf());
+        }
+        let sources = playlist::expand_playlist_paths(&paths);
+        if sources.is_empty() {
+            if !paths.is_empty() { self.osd("No supported media files", cx); }
+            return;
+        }
+        self.enqueue_at(at, sources, window, cx);
+    }
+
+    pub(super) fn prompt_playlist_add(&mut self, dirs_mode: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: !dirs_mode, directories: dirs_mode, multiple: true,
+            prompt: Some(if dirs_mode { "Add folder" } else { "Add files" }.into()),
+        });
+        cx.spawn_in(window, async move |this, cx| match rx.await {
+            Ok(Ok(Some(paths))) => {
+                let _ = this.update_in(cx, |v, window, cx| v.enqueue_paths_at(v.playlist.items.len(), paths, window, cx));
+            }
+            Ok(Err(e)) => { let _ = this.update(cx, |v, cx| v.osd(format!("File dialog failed: {e}"), cx)); }
+            _ => {}
+        }).detach();
     }
 
     pub fn prompt_open(&mut self, dirs_mode: bool, subtitle: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1459,6 +1687,7 @@ impl PlayerView {
     }
 
     pub fn toggle_playlist(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.playlist_previews.hover = None;
         if self.fs_playlist_separate(window.is_fullscreen()) {
             self.fs_playlist = !self.fs_playlist;
         } else {
@@ -1560,6 +1789,7 @@ impl PlayerView {
     }
 
     pub fn apply_settings(&mut self, cx: &mut Context<Self>) {
+        self.update_thumbnails();
         self.player.set_config(self.engine_config());
         icons::set_use_system_theme(self.settings.icon_theme == crate::settings::IconTheme::System);
         self.settings.save();
@@ -1905,6 +2135,8 @@ impl PlayerView {
     }
 
     pub fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_playlist_session(true, false);
+        self.reset_thumbnails();
         self.save_current_position();
         self.player.stop();
         let old = self.frame.take();

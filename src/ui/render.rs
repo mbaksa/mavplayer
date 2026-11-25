@@ -17,12 +17,12 @@ use super::theme::{Theme, overlay_theme};
 use super::widgets::{format_speed, format_time, frac_to_speed, icon, speed_to_frac, tooltip};
 use crate::engine::{MediaSource, Status, SubContent, TrackKind};
 use crate::icons::Icon;
-use crate::settings::{BarControl, RepeatMode, ScrollAction, SubStyle};
+use crate::settings::{BarControl, PlaylistThumbnails, RepeatMode, ScrollAction, SubStyle, TimelineVisualization};
 use gpui::{
-    AnyElement, AnyView, Bounds, ClickEvent, Context, Corners, CursorStyle, Decorations, Div, DragMoveEvent, ElementId,
+    AnyElement, AnyView, Bounds, ClickEvent, Context, Corner, Corners, CursorStyle, Decorations, Div, DragMoveEvent, ElementId,
     ExternalPaths, Hsla, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, RenderImage,
     ResizeEdge, Resource, ScrollDelta, ScrollWheelEvent, SharedString, Stateful, StyleRefinement, Window,
-    WindowControlArea, canvas, div, img, point, prelude::*, px, relative, rgba, size,
+    WindowControlArea, anchored, canvas, deferred, div, img, point, prelude::*, px, relative, rgba, size,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -779,34 +779,6 @@ impl PlayerView {
             );
         }
 
-        // In fullscreen the controls float over the picture.
-        if fullscreen && show_controls {
-            let ot = overlay_theme(&self.theme);
-            root = root.child(
-                div()
-                    .id("overlay-controls")
-                    .absolute()
-                    .bottom_0()
-                    .left_0()
-                    .right_0()
-                    .pt(px(40.))
-                    .bg(gpui::linear_gradient(
-                        0.,
-                        gpui::linear_color_stop(rgba(0x000000d0), 0.),
-                        gpui::linear_color_stop(rgba(0x00000000), 1.),
-                    ))
-                    .on_hover(cx.listener(|this, h: &bool, _, cx| {
-                        this.pointer_over_controls = *h;
-                        cx.notify();
-                    }))
-                    // Clicks, right-clicks and the wheel over the controls
-                    // are theirs, not the video's.
-                    .occlude()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(|_, _, cx| cx.stop_propagation())
-                    .child(self.control_bar(ot, true, window, cx)),
-            );
-        }
         if self.dropping {
             root = root.child(
                 div()
@@ -907,7 +879,11 @@ impl PlayerView {
         let margin = subtitle_style::margin_above_controls(
             margin,
             distance,
-            if fullscreen_controls_visible { FULLSCREEN_CONTROL_BAR_H } else { 0.0 },
+            if fullscreen_controls_visible {
+                FULLSCREEN_CONTROL_BAR_H + if self.player.with_state(|st| self.thumbnails.has_previews(st, &self.settings, true)) {
+                    self.settings.visualization_height(true) as f32 + 2.0
+                } else { 0.0 }
+            } else { 0.0 },
         );
         // The outline texture extends below the layout row by its stroke padding.
         // Reserve that space too, especially above fullscreen controls.
@@ -1150,7 +1126,7 @@ impl PlayerView {
 
     // ───────────────────────── control bar ─────────────────────────
 
-    fn seek_bar(&self, t: Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn seek_bar(&self, t: Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let dur = self.player.duration();
         let pos = self.player.position();
         let st = self.player.state();
@@ -1206,32 +1182,54 @@ impl PlayerView {
                 },
             )
         });
+        let hover_preview = self.seek_hover.filter(|_| seekable).and_then(|f| {
+            self.thumbnails.nearest(&st, &self.settings, f64::from(f) * dur, window.is_fullscreen()).map(|preview| (f, preview))
+        });
+        let mode = self.settings.timeline_visualization(window.is_fullscreen());
+        let filmstrip = seekable && self.thumbnails.has_previews(&st, &self.settings, window.is_fullscreen());
+        let height = super::thumbnails::filmstrip_height(&self.settings, window, cx);
+        let extra = if filmstrip { height + 2.0 } else { 0.0 };
         div()
             .id("seek")
             .group("seek")
-            .h(px(18.))
+            .h(px(18. + extra))
             .flex_1()
             .relative()
             .flex()
             .items_center()
             .when(seekable, |d| d.cursor_pointer())
             .child(canvas(move |b, _, _| b1.set(b), |_, _, _, _| {}).absolute().size_full())
-            .child(track)
+            .when(filmstrip, |d| d.child(self.thumbnails.visualization(mode, dur, height, self.settings.visualization_opacity(window.is_fullscreen()) as f32 / 100.0)))
             .child(
                 div()
                     .absolute()
-                    .left(relative(frac))
-                    .ml(px(-7.))
-                    .size(px(14.))
-                    .rounded_full()
-                    .bg(gpui::white())
-                    .shadow_md()
-                    .opacity(if self.scrub.is_some() { 1.0 } else { 0.0 })
-                    .group_hover("seek", |s| s.opacity(1.0)),
+                    .bottom_0()
+                    .left_0()
+                    .w_full()
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .child(track)
+                    .child(
+                        div()
+                            .absolute()
+                            .left(relative(frac))
+                            .ml(px(-7.))
+                            .size(px(14.))
+                            .rounded_full()
+                            .bg(gpui::white())
+                            .shadow_md()
+                            .opacity(if self.scrub.is_some() { 1.0 } else { 0.0 })
+                            .group_hover("seek", |s| s.opacity(1.0)),
+                    ),
             )
-            .when_some(hover_label, |d, (f, label)| {
+            .when_some(hover_preview, |d, (f, preview)| {
+                d.child(super::thumbnails::hover_preview(f, preview, Hsla { a: 1.0, ..t.osd_bg }, extra,
+                    hover_label.as_ref().map(|(_, label)| label.clone()).unwrap_or_default()))
+            })
+            .when_some(hover_label.filter(|_| hover_preview.is_none()), |d, (f, label)| {
                 d.child(
-                    div().absolute().bottom(px(22.)).left(relative(f)).child(
+                    div().absolute().bottom(px(22. + extra)).left(relative(f)).child(
                         div()
                             .ml(px(-40.))
                             .px_2()
@@ -1245,6 +1243,46 @@ impl PlayerView {
                     ),
                 )
             })
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                let enabled = this.player.with_state(|st| this.thumbnails.can_regenerate(st, &this.settings));
+                let fullscreen = window.is_fullscreen();
+                let mode = this.settings.timeline_visualization(fullscreen);
+                let mut visualization: Vec<_> = TimelineVisualization::ALL.into_iter().map(|choice| {
+                    M::action(choice.label(), move |this, _, cx| {
+                        this.settings.set_timeline_visualization(fullscreen, choice);
+                        this.apply_settings(cx);
+                    }).selected(choice == mode && (!fullscreen || this.settings.timeline_fullscreen_visualization.is_some()))
+                }).collect();
+                let mut hover: Vec<_> = [true, false].into_iter().map(|on| M::action(if on { "On" } else { "Off" }, move |this, _, cx| { this.settings.set_timeline_hover(fullscreen, on); this.apply_settings(cx); }).selected(if fullscreen { this.settings.timeline_fullscreen_hover == Some(on) } else { this.settings.timeline_hover == on })).collect();
+                let mut opacity: Vec<_> = (50..=100).step_by(10).map(|n| M::action(format!("{n}%"), move |this, _, cx| { if fullscreen { this.settings.timeline_fullscreen_opacity = Some(n); } else { this.settings.timeline_opacity = n; } this.apply_settings(cx); }).selected(if fullscreen { this.settings.timeline_fullscreen_opacity == Some(n) } else { this.settings.timeline_opacity == n })).collect();
+                let mut heights: Vec<_> = (12..=96).step_by(4).map(|n| M::action(format!("{n} px"), move |this, _, cx| { if fullscreen { this.settings.timeline_fullscreen_height = Some(n); } else { this.settings.timeline_filmstrip_height = n; this.settings.timeline_filmstrip_min_height = this.settings.timeline_filmstrip_min_height.min(n); } this.apply_settings(cx); }).selected(if fullscreen { this.settings.timeline_fullscreen_height == Some(n) } else { this.settings.timeline_filmstrip_height == n })).collect();
+                if fullscreen {
+                    visualization.insert(0, M::action("Same as in windowed mode", |this, _, cx| { this.settings.timeline_fullscreen_visualization = None; this.apply_settings(cx); }).selected(this.settings.timeline_fullscreen_visualization.is_none()));
+                    hover.insert(0, M::action("Same as in windowed mode", |this, _, cx| { this.settings.timeline_fullscreen_hover = None; this.apply_settings(cx); }).selected(this.settings.timeline_fullscreen_hover.is_none()));
+                    opacity.insert(0, M::action("Same as in windowed mode", |this, _, cx| { this.settings.timeline_fullscreen_opacity = None; this.apply_settings(cx); }).selected(this.settings.timeline_fullscreen_opacity.is_none()));
+                    heights.insert(0, M::action("Same as in windowed mode", |this, _, cx| { this.settings.timeline_fullscreen_height = None; this.apply_settings(cx); }).selected(this.settings.timeline_fullscreen_height.is_none()));
+                }
+                let active = this.settings.timeline_thumbnails;
+                let mut items = vec![
+                    M::submenu("Thumbnail preview on hover", hover).enabled(active),
+                    M::submenu("Timeline visualization", visualization).enabled(active),
+                    M::submenu("Visualization opacity", opacity).enabled(active && mode != TimelineVisualization::None),
+                    M::submenu("Visualization height", heights).enabled(active && mode != TimelineVisualization::None),
+                ];
+                if !fullscreen {
+                    items.push(M::action("Adapt visualization size to window width", |this, _, cx| { this.settings.timeline_adaptive = !this.settings.timeline_adaptive; this.apply_settings(cx); }).checked(this.settings.timeline_adaptive).enabled(active && mode != TimelineVisualization::None));
+                    let min = (12..=this.settings.visualization_height(false)).step_by(4).map(|n| M::action(format!("{n} px"), move |this, _, cx| { this.settings.timeline_filmstrip_min_height = n; this.apply_settings(cx); }).selected(this.settings.timeline_filmstrip_min_height == n)).collect();
+                    items.push(M::submenu("Minimum visualization height", min).enabled(active && mode != TimelineVisualization::None && this.settings.timeline_adaptive));
+                }
+                items.extend([
+                    M::Separator,
+                    M::action("Regenerate video thumbnails", |this, _, cx| {
+                        this.regenerate_thumbnails(cx);
+                    }).enabled(enabled),
+                ]);
+                this.open_menu(items, ev.position, None, cx);
+                cx.stop_propagation();
+            }))
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
                 if this.scrub.is_some() {
                     return; // the drag keeps the label under the pointer
@@ -1282,6 +1320,14 @@ impl PlayerView {
                 )
             })
             .into_any_element()
+    }
+
+    fn background_activity(&self, t: Theme) -> AnyElement {
+        let Some(progress) = self.thumbnails.progress() else { return div().into_any_element(); };
+        super::activity::indicator("thumbnail-progress", t, move || {
+            let (count, percent, extracted) = progress.snapshot();
+            format!("Generating up to {count} thumbnails ({percent}% done, {extracted} generated)")
+        }, None)
     }
 
     pub fn control_bar(&self, t: Theme, overlay: bool, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1327,7 +1373,7 @@ impl PlayerView {
         let dim = t.text_dim;
         let time = |s: String| div().text_size(px(12.)).text_color(dim).min_w(px(52.)).flex().justify_center().child(s);
 
-        let seek_row = div().flex().items_center().gap_2().child(time(time_left)).child(self.seek_bar(t, cx)).child(
+        let seek_row = div().flex().items_center().gap_2().child(time(time_left)).child(self.seek_bar(t, window, cx)).child(
             div()
                 .id("time-right")
                 .cursor_pointer()
@@ -1400,6 +1446,12 @@ impl PlayerView {
 
         let mut left = div().flex().items_center().gap_1().child(play);
         let mut right = div().flex().items_center().gap_1();
+        if self.thumbnails.generating() {
+            right = right.child(self.background_activity(t));
+        }
+        if let Some(activity) = self.playlist_previews.progress() {
+            right = right.child(super::activity::indicator("playlist-thumbnail-progress", t, move || activity.label(), None));
+        }
         for c in shown {
             let el: AnyElement = match c {
                 BarControl::Stop => self
@@ -1622,8 +1674,15 @@ impl PlayerView {
 
     // ───────────────────────── playlist panel ─────────────────────────
 
-    fn playlist_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn playlist_row_height(&self) -> f32 {
+        if super::playlist_thumbnails::PlaylistPreviews::mode(&self.settings).inline() { 52.0 } else { ROW_H }
+    }
+
+    fn playlist_panel(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
+        let viewport = window.viewport_size();
+        let max_width = (f32::from(viewport.width) - 120.).max(120.);
+        let width = self.settings.playlist_width.clamp(120., max_width);
         let count = self.playlist.items.len();
         let total: f64 = self.playlist.items.iter().filter_map(|i| i.duration).sum();
         let header = div()
@@ -1639,7 +1698,7 @@ impl PlayerView {
                     .flex_1()
                     .flex()
                     .flex_col()
-                    .child(div().text_size(px(13.)).font_weight(gpui::FontWeight::SEMIBOLD).child("Playlist"))
+                    .child(div().text_size(px(13.)).font_weight(gpui::FontWeight::SEMIBOLD).truncate().child(self.playlist_library.name().to_owned()))
                     .child(div().text_size(px(11.)).text_color(t.text_dim).child(format!(
                         "{count} item{}{}",
                         if count == 1 { "" } else { "s" },
@@ -1652,10 +1711,7 @@ impl PlayerView {
                 "Add files",
                 t,
                 |this, _, w, cx| {
-                    let mode = this.settings.open_mode;
-                    this.settings.open_mode = crate::settings::OpenMode::Append;
-                    this.prompt_open(false, false, w, cx);
-                    this.settings.open_mode = mode;
+                    this.prompt_playlist_add(false, w, cx);
                 },
                 cx,
             ))
@@ -1665,10 +1721,7 @@ impl PlayerView {
                 "Add folder",
                 t,
                 |this, _, w, cx| {
-                    let mode = this.settings.open_mode;
-                    this.settings.open_mode = crate::settings::OpenMode::Append;
-                    this.prompt_open(true, false, w, cx);
-                    this.settings.open_mode = mode;
+                    this.prompt_playlist_add(true, w, cx);
                 },
                 cx,
             ))
@@ -1701,12 +1754,19 @@ impl PlayerView {
             count,
             cx.processor(move |this, range: std::ops::Range<usize>, _w, cx| {
                 let t = this.theme;
+                if super::playlist_thumbnails::PlaylistPreviews::mode(&this.settings).inline() {
+                    let visible: Vec<_> = range.clone().filter_map(|i| this.playlist.items.get(i).and_then(|it| super::playlist_thumbnails::Key::new(it, &this.settings))).collect();
+                    this.playlist_previews.retain_visible(&visible);
+                }
                 range
                     .map(|i| {
                         let it = &this.playlist.items[i];
                         let is_cur = current == Some(i);
                         let title = it.display_title();
-                        let dur = it.duration.map(format_time).unwrap_or_default();
+                        let dur = if super::playlist_thumbnails::PlaylistPreviews::mode(&this.settings) == PlaylistThumbnails::Inline {
+                            this.playlist_previews.hover.as_ref().filter(|h| h.id == it.id).map(|h| format_time(h.duration * f64::from(h.fraction)))
+                                .or_else(|| it.duration.map(format_time)).unwrap_or_default()
+                        } else { it.duration.map(format_time).unwrap_or_default() };
                         let dragging = cx.has_active_drag();
                         let marker = |top: bool| {
                             div()
@@ -1720,10 +1780,27 @@ impl PlayerView {
                                 .when(!top, |d| d.bottom(px(-1.)))
                         };
                         let drag_value = PlaylistDrag { index: i, title: title.clone().into() };
+                        let item_id = it.id;
+                        let failed = it.failed;
+                        let duration = it.duration.unwrap_or(0.0);
+                        let mode = super::playlist_thumbnails::PlaylistPreviews::mode(&this.settings);
+                        let key = super::playlist_thumbnails::Key::new(it, &this.settings);
+                        let bounds = Rc::new(Cell::new(Bounds::default()));
+                        let measured = bounds.clone();
+                        let image = if mode.inline() {
+                            key.as_ref().and_then(|key| {
+                                let representative = key.representative_time(&this.settings, duration);
+                                let scrub = mode == PlaylistThumbnails::Inline && this.playlist_previews.hover.as_ref().is_some_and(|h| h.id == item_id);
+                                let time = if scrub { this.playlist_previews.hover.as_ref().map_or(representative, |h| duration * f64::from(h.fraction)) } else { representative };
+                                this.thumbnails.for_playlist(&key.path, key.stream, key.count, time).cloned()
+                                    .or_else(|| if scrub { this.playlist_previews.scrub(key, time).cloned() } else { None })
+                                    .or_else(|| this.playlist_previews.inline_pair(key, representative, duration * 0.05))
+                            })
+                        } else { None };
                         div()
                             .id(("pl-row", i))
                             .relative()
-                            .h(px(ROW_H))
+                            .h(px(this.playlist_row_height()))
                             .w_full()
                             .px_2()
                             .flex()
@@ -1734,6 +1811,23 @@ impl PlayerView {
                             .when(selected == Some(i) && !is_cur, |d| d.bg(t.hover))
                             .when(is_cur, |d| d.bg(t.accent_soft))
                             .hover(|s| s.bg(t.hover))
+                            .when(mode != PlaylistThumbnails::None, |d| {
+                                d.child(canvas(move |b, _, _| measured.set(b), |_, _, _, _| {}).absolute().size_full())
+                                    .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
+                                        if cx.has_active_drag() || this.menu.is_some() || this.dialog.is_some() { return; }
+                                        let Some(key) = key.clone() else { return; };
+                                        let b = bounds.get();
+                                        let fraction = frac_in(b, ev.position, false);
+                                        this.playlist_previews.hover = Some(super::playlist_thumbnails::Hover { id: item_id, key, duration, fraction, bounds: b });
+                                        cx.notify();
+                                    }))
+                                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                        if !*hovered && this.menu.is_none() && this.playlist_previews.hover.as_ref().is_some_and(|h| h.id == item_id) {
+                                            this.playlist_previews.hover = None;
+                                            cx.notify();
+                                        }
+                                    }))
+                            })
                             .child(
                                 div()
                                     .w(px(22.))
@@ -1747,13 +1841,17 @@ impl PlayerView {
                                         div().child(format!("{}", i + 1)).into_any_element()
                                     }),
                             )
+                            .when(mode.inline(), |d| d.child(
+                                div().w(px(72.)).h(px(44.)).flex_none().flex().items_center().justify_center()
+                                    .when_some(image, |d, p| d.child(p.element(72., 44.)))
+                            ))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
                                     .text_size(px(13.))
-                                    .text_color(if it.failed {
+                                    .text_color(if failed {
                                         t.text_disabled
                                     } else if is_cur {
                                         t.accent
@@ -1783,6 +1881,10 @@ impl PlayerView {
                                 MouseButton::Right,
                                 cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                                     this.playlist_selected = Some(i);
+                                    this.playlist_previews.pointer = Some(ev.position);
+                                    if this.playlist_previews.hover.as_ref().is_some_and(|h| h.id != item_id) {
+                                        this.playlist_previews.hover = None;
+                                    }
                                     let items = this.playlist_item_menu(i);
                                     this.open_menu(items, ev.position, None, cx);
                                     cx.stop_propagation();
@@ -1805,11 +1907,8 @@ impl PlayerView {
             let at = this.pl_drop.take().unwrap_or(this.playlist.items.len());
             this.dropping = false;
             let paths = paths.paths().to_vec();
-            if let Some(d) = paths.first().and_then(|p| p.parent()) {
-                this.settings.last_dir = Some(d.to_path_buf());
-            }
-            let sources = crate::playlist::expand_paths(&paths);
-            this.enqueue_at(at, sources, window, cx);
+            this.enqueue_paths_at(at, paths, window, cx);
+            cx.stop_propagation();
             cx.notify();
         }))
         .on_drop(cx.listener(|this, d: &PlaylistDrag, _, cx| {
@@ -1824,6 +1923,7 @@ impl PlayerView {
 
         let body: AnyElement = if count == 0 {
             div()
+                .id("empty-playlist-drop")
                 .flex_1()
                 .flex()
                 .flex_col()
@@ -1835,6 +1935,14 @@ impl PlayerView {
                 .child(icon(Icon::Playlist, px(32.), t.text_disabled))
                 .child("The playlist is empty")
                 .child(div().text_size(px(12.)).child("Drop files here to add them"))
+                .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                    this.dropping = false;
+                    this.pl_drop = None;
+                    this.enqueue_paths_at(0, paths.paths().to_vec(), window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }))
+                .drag_over::<ExternalPaths>(|s, _, _, _| s)
                 .into_any_element()
         } else {
             let bar = self.pl_scroll.0.borrow().base_handle.clone();
@@ -1851,8 +1959,10 @@ impl PlayerView {
 
         div()
             .id("playlist-panel")
-            .w(px(320.))
-            .flex_none()
+            .relative()
+            .w(px(width))
+            .flex_1()
+            .min_h_0()
             .flex()
             .flex_col()
             .bg(t.surface)
@@ -1860,6 +1970,27 @@ impl PlayerView {
             .border_color(t.chrome_border)
             .child(header)
             .child(body)
+            .child(div().id("playlist-resize").absolute().left_0().top_0().bottom_0().w(px(5.)).cursor(CursorStyle::ResizeLeftRight)
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let start_x = f32::from(ev.position.x);
+                    let bounds = Rc::new(Cell::new(Bounds::new(point(px(0.), px(0.)), viewport)));
+                    this.drag = Some(Drag {
+                        bounds, vertical: false, last: 0.,
+                        on_change: Rc::new(move |this, fraction, _, _| {
+                            this.settings.playlist_width = (width + start_x - fraction * f32::from(viewport.width)).clamp(120., max_width);
+                        }),
+                        on_release: Some(Rc::new(|this, _, _, _| this.settings.save())),
+                    });
+                    cx.stop_propagation();
+                })))
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                let items = this.playlist_panel_menu();
+                this.open_menu(items, ev.position, None, cx);
+                cx.stop_propagation();
+            }))
+            .on_scroll_wheel(cx.listener(|this, _: &ScrollWheelEvent, _, cx| {
+                if this.menu.is_none() && this.playlist_previews.hover.take().is_some() { cx.notify(); }
+            }))
             .into_any_element()
     }
 
@@ -1869,7 +2000,7 @@ impl PlayerView {
         let at = if bounds.contains(&pos) {
             let scroll = self.pl_scroll.0.borrow().base_handle.offset().y;
             let y = f32::from(pos.y - bounds.top() - scroll) - LIST_PAD;
-            Some(((y / ROW_H).round().max(0.0) as usize).min(self.playlist.items.len()))
+            Some(((y / self.playlist_row_height()).round().max(0.0) as usize).min(self.playlist.items.len()))
         } else {
             None
         };
@@ -1877,6 +2008,39 @@ impl PlayerView {
             self.pl_drop = at;
             cx.notify();
         }
+    }
+
+    fn playlist_panel_menu(&self) -> Vec<M> {
+        let modes = PlaylistThumbnails::ALL.into_iter().map(|mode| M::action(mode.label(), move |this, _, cx| {
+            this.settings.playlist_thumbnails = mode;
+            this.apply_settings(cx);
+        }).selected(self.settings.playlist_thumbnails == mode)).collect();
+        let playlists = self.playlist_library.slots.iter().enumerate().filter(|(_, slot)| slot.open).map(|(index, slot)| {
+            M::action(slot.name.clone(), move |this, w, cx| this.switch_playlist_workspace(index, w, cx)).selected(index == self.playlist_library.active)
+        }).collect();
+        let closed = self.playlist_library.slots.iter().enumerate().filter(|(_, slot)| !slot.open).map(|(index, slot)| {
+            M::action(slot.name.clone(), move |this, w, cx| this.switch_playlist_workspace(index, w, cx))
+        }).collect();
+        vec![
+            M::submenu("Switch playlist", playlists),
+            M::submenu("Open saved playlist", closed),
+            M::action("Close playlist", |this, w, cx| this.close_playlist_workspace(w, cx)).enabled(self.playlist_library.can_close()),
+            M::action("New playlist…", |this, w, cx| this.show_dialog(super::dialogs::Dialog::NamePlaylist(false), w, cx)),
+            M::action("Rename playlist…", |this, w, cx| this.show_dialog(super::dialogs::Dialog::NamePlaylist(true), w, cx)),
+            M::action("Auto save playlist", |this, _, cx| this.toggle_playlist_autosave(cx)).checked(self.playlist_library.autosave()).enabled(self.playlist_library.writable),
+            M::action("Save playlist state", |this, _, cx| this.save_playlist_workspace(cx)).enabled(self.playlist_library.writable),
+            M::Separator,
+            M::action("Add files", |this, w, cx| {
+                this.prompt_playlist_add(false, w, cx);
+            }).icon(Icon::Add),
+            M::action("Add folder", |this, w, cx| {
+                this.prompt_playlist_add(true, w, cx);
+            }).icon(Icon::OpenFolder),
+            M::action("Export playlist (M3U)", |this, w, cx| this.save_playlist(w, cx)).icon(Icon::Save),
+            M::action("Clear playlist", |this, w, cx| { this.stop(w, cx); this.playlist.clear(); cx.notify(); }).icon(Icon::Clear),
+            M::Separator,
+            M::submenu("Thumbnails", modes).enabled(self.settings.timeline_thumbnails),
+        ]
     }
 
     fn playlist_item_menu(&self, i: usize) -> Vec<M> {
@@ -1905,7 +2069,35 @@ impl PlayerView {
         ];
         if let Some(MediaSource::File(p)) = self.playlist.items.get(i).map(|it| it.source.clone()) {
             v.push(M::Separator);
+            let media_path = p.clone();
             v.push(M::action("Show in File Manager", move |_, _, cx| cx.reveal_path(&p)).icon(Icon::OpenFolder));
+            v.push(M::action("Regenerate video thumbnails", move |this, _, cx| this.regenerate_playlist_thumbnails(media_path.clone(), cx))
+                .enabled(self.settings.timeline_thumbnails && self.playlist.items.get(i).is_some_and(|it| it.video_stream.is_some() || !it.probed || it.duration.is_none())));
+            if let Some(key) = self.playlist.items.get(i).and_then(|it| super::playlist_thumbnails::Key::new(it, &self.settings)) {
+                let time = self.playlist_previews.hover.as_ref().filter(|h| h.key == key && self.playlist.items.get(i).is_some_and(|it| it.id == h.id)).and_then(|h| {
+                    let time = h.duration * f64::from(h.fraction);
+                    self.thumbnails.for_playlist(&key.path, key.stream, key.count, time).or_else(|| self.playlist_previews.scrub(&key, time)).map(|p| p.time)
+                });
+                let selection = key.selection_key();
+                let selected_key = key.clone();
+                v.push(M::action("Set current thumbnail as video thumbnail", move |this, _, cx| {
+                    if let Some(time) = time {
+                        this.settings.playlist_thumbnail_times.insert(selection.clone(), time);
+                        if let Some(preview) = this.playlist_previews.scrub(&selected_key, time).cloned() {
+                            this.playlist_previews.remember_selection(selected_key.clone(), time, preview);
+                        }
+                        this.settings.save();
+                        cx.notify();
+                    }
+                }).enabled(self.settings.timeline_thumbnails && time.is_some()));
+                if self.settings.playlist_thumbnail_times.contains_key(&key.selection_key()) {
+                    v.push(M::action("Reset video thumbnail", move |this, _, cx| {
+                        this.settings.playlist_thumbnail_times.remove(&key.selection_key());
+                        this.settings.save();
+                        cx.notify();
+                    }));
+                }
+            }
         }
         v
     }
@@ -1970,7 +2162,12 @@ impl PlayerView {
             .min_h_0()
             .flex()
             .child(self.video_area(window, cx))
-            .when(self.playlist_shown(), |d| d.child(self.playlist_panel(cx)));
+            .when(self.playlist_shown(), |d| {
+                let reserve = if fullscreen && self.controls_visible() {
+                    FULLSCREEN_CONTROL_BAR_H + if self.player.with_state(|st| self.thumbnails.has_previews(st, &self.settings, true)) { self.settings.visualization_height(true) as f32 + 2. } else { 0. }
+                } else { 0. };
+                d.child(div().flex_none().flex().flex_col().pb(px(reserve)).child(self.playlist_panel(window, cx)))
+            });
 
         let mut root = div()
             .id("root")
@@ -1991,6 +2188,7 @@ impl PlayerView {
             .text_size(px(13.))
             .font_family(".SystemUIFont")
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+                this.playlist_previews.pointer = Some(ev.position);
                 this.handle_drag_move(ev, window, cx);
             }))
             .on_mouse_up(
@@ -2011,7 +2209,9 @@ impl PlayerView {
                     // When the pointer leaves the window over the fullscreen
                     // control bar, its hover-exit event may not be delivered.
                     // Clear the stale state so the autohide timer can work.
-                    let had_hover = this.pointer_over_controls;
+                    this.playlist_previews.pointer = None;
+                    let had_playlist_hover = this.menu.is_none() && this.playlist_previews.hover.take().is_some();
+                    let had_hover = this.pointer_over_controls || had_playlist_hover;
                     let was_dropping = this.dropping;
                     this.pointer_over_controls = false;
                     this.dropping = false;
@@ -2026,8 +2226,50 @@ impl PlayerView {
             .when(show_menubar, |d| d.child(self.menubar(cx)))
             .child(main)
             .when(!fullscreen, |d| d.child(self.control_bar(t, false, window, cx)));
+        // In fullscreen the controls float over the picture.
+        if fullscreen && self.controls_visible() {
+            let ot = overlay_theme(&self.theme);
+            root = root.child(
+                div()
+                    .id("overlay-controls")
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .pt(px(40.))
+                    .bg(gpui::linear_gradient(
+                        0.,
+                        gpui::linear_color_stop(rgba(0x000000d0), 0.),
+                        gpui::linear_color_stop(rgba(0x00000000), 1.),
+                    ))
+                    .on_hover(cx.listener(|this, h: &bool, _, cx| {
+                        this.pointer_over_controls = *h;
+                        cx.notify();
+                    }))
+                    // Clicks, right-clicks and the wheel over the controls
+                    // are theirs, not the video's.
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(self.control_bar(ot, true, window, cx)),
+            );
+        }
         if client_decor && !window.is_maximized() {
             root = root.child(self.resize_handles());
+        }
+        if self.playlist_shown() && self.dialog.is_none() && !self.editing_volume && !cx.has_active_drag()
+            && super::playlist_thumbnails::PlaylistPreviews::mode(&self.settings).side()
+            && let Some(h) = &self.playlist_previews.hover
+            && self.playlist.items.iter().any(|it| it.id == h.id)
+        {
+            let time = h.duration * f64::from(h.fraction);
+            if let Some(preview) = self.thumbnails.for_playlist(&h.key.path, h.key.stream, h.key.count, time).or_else(|| self.playlist_previews.scrub(&h.key, time)) {
+                let label = format_time(time);
+                let preview = div().p(px(3.)).rounded(px(5.)).bg(Hsla { a: 1.0, ..t.popup }).shadow_md()
+                    .child(preview.element(240., 135.))
+                    .child(div().text_center().text_size(px(12.)).text_color(t.text).child(label));
+                root = root.child(deferred(anchored().position(point(h.bounds.left() - px(6.), h.bounds.top())).anchor(Corner::TopRight).snap_to_window_with_margin(px(4.)).child(preview)).with_priority(5));
+            }
         }
         if let Some(m) = self.render_menu(window, cx) {
             root = root.child(m);

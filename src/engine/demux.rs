@@ -254,7 +254,7 @@ fn pick_by_lang<'a>(tracks: impl Iterator<Item = &'a Track>, langs: &[String]) -
     None
 }
 
-fn choose_tracks(ic: &FormatCtx, info: &MediaInfo, cfg: &EngineConfig) -> Selected {
+pub(super) fn choose_tracks(ic: &FormatCtx, info: &MediaInfo, cfg: &EngineConfig) -> Selected {
     let best = |ty: ff::AVMediaType, related: c_int| unsafe {
         let r = ff::av_find_best_stream(ic.0, ty, -1, related, ptr::null_mut(), 0);
         if r >= 0 { Some(r as usize) } else { None }

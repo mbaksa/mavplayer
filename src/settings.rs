@@ -97,6 +97,40 @@ pub enum RunningMode {
     Replace,
 }
 
+/// Visual representations of the cached video samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimelineVisualization {
+    None,
+    Filmstrip,
+    BarcodeAverage,
+    BarcodeCompressed,
+}
+
+impl TimelineVisualization {
+    pub const ALL: [Self; 4] = [Self::None, Self::Filmstrip, Self::BarcodeAverage, Self::BarcodeCompressed];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None (classic seekbar)",
+            Self::Filmstrip => "Filmstrip",
+            Self::BarcodeAverage => "Barcode – average color",
+            Self::BarcodeCompressed => "Barcode – compressed frames",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlaylistThumbnails { None, Hover, Inline, InlineSide }
+
+impl PlaylistThumbnails {
+    pub const ALL: [Self; 4] = [Self::None, Self::Inline, Self::InlineSide, Self::Hover];
+    pub fn label(self) -> &'static str {
+        match self { Self::None => "None", Self::Inline => "Inline", Self::InlineSide => "Inline + side on hover", Self::Hover => "Hover" }
+    }
+    pub fn inline(self) -> bool { matches!(self, Self::Inline | Self::InlineSide) }
+    pub fn side(self) -> bool { matches!(self, Self::Hover | Self::InlineSide) }
+}
+
 /// A control the bottom bar can show. Play/Pause is always there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BarControl {
@@ -186,6 +220,7 @@ pub struct Settings {
     pub playlist_double_click: bool,
     pub scroll_action: ScrollAction,
     pub show_playlist: bool,
+    pub playlist_width: f32,
     /// Going fullscreen starts with the playlist hidden, whatever the window
     /// showed (it can still be opened there; leaving restores the window's).
     pub hide_playlist_in_fullscreen: bool,
@@ -217,6 +252,24 @@ pub struct Settings {
     pub exact_seeks: bool,
     pub seek_drag: SeekDragMode,
     pub screenshot_dir: Option<PathBuf>,
+    pub timeline_thumbnails: bool,
+    pub timeline_filmstrip: bool, // legacy setting, used when the new modes are unset
+    pub timeline_windowed_visualization: Option<TimelineVisualization>,
+    pub timeline_fullscreen_visualization: Option<TimelineVisualization>,
+    pub timeline_fullscreen_hover: Option<bool>,
+    pub timeline_opacity: u32,
+    pub timeline_fullscreen_opacity: Option<u32>,
+    pub timeline_fullscreen_height: Option<u32>,
+    pub playlist_thumbnails: PlaylistThumbnails,
+    pub playlist_thumbnail_times: HashMap<String, f64>,
+    pub chapter_thumbnails: bool,
+    pub timeline_adaptive: bool,
+    pub timeline_filmstrip_height: u32,
+    pub timeline_filmstrip_min_height: u32,
+    pub timeline_hover: bool,
+    pub thumbnail_cache_dir: Option<PathBuf>,
+    pub thumbnail_cache_days: u32,
+    pub thumbnail_cache_mb: u32,
     // Video
     pub hwdec: HwDecode,
     pub deinterlace: Deinterlace,
@@ -287,6 +340,7 @@ impl Default for Settings {
             playlist_double_click: false,
             scroll_action: ScrollAction::Volume,
             show_playlist: false,
+            playlist_width: 320.,
             hide_playlist_in_fullscreen: true,
             key_bindings: BTreeMap::new(),
             bar_controls: BarControl::ALL.to_vec(),
@@ -305,6 +359,24 @@ impl Default for Settings {
             exact_seeks: true,
             seek_drag: SeekDragMode::KeepPlaying,
             screenshot_dir: None,
+            timeline_thumbnails: true,
+            timeline_filmstrip: true,
+            timeline_windowed_visualization: None,
+            timeline_fullscreen_visualization: None,
+            timeline_fullscreen_hover: None,
+            timeline_opacity: 100,
+            timeline_fullscreen_opacity: None,
+            timeline_fullscreen_height: None,
+            playlist_thumbnails: PlaylistThumbnails::InlineSide,
+            playlist_thumbnail_times: HashMap::new(),
+            chapter_thumbnails: true,
+            timeline_adaptive: true,
+            timeline_filmstrip_height: 32,
+            timeline_filmstrip_min_height: 16,
+            timeline_hover: true,
+            thumbnail_cache_dir: None,
+            thumbnail_cache_days: 90,
+            thumbnail_cache_mb: 1024,
             hwdec: HwDecode::Always,
             deinterlace: Deinterlace::Auto,
             scale_quality: ScaleQuality::Good,
@@ -400,6 +472,39 @@ impl Settings {
         self.recent.truncate(15);
     }
 
+    pub fn timeline_visualization(&self, fullscreen: bool) -> TimelineVisualization {
+        let mode = if fullscreen { self.timeline_fullscreen_visualization.or(self.timeline_windowed_visualization) } else { self.timeline_windowed_visualization };
+        mode.unwrap_or(if self.timeline_filmstrip { TimelineVisualization::Filmstrip } else { TimelineVisualization::None })
+    }
+
+    pub fn set_timeline_visualization(&mut self, fullscreen: bool, mode: TimelineVisualization) {
+        if fullscreen { self.timeline_fullscreen_visualization = Some(mode); }
+        else { self.timeline_windowed_visualization = Some(mode); }
+    }
+
+    pub fn timeline_hover_enabled(&self, fullscreen: bool) -> bool {
+        if fullscreen { self.timeline_fullscreen_hover.unwrap_or(self.timeline_hover) } else { self.timeline_hover }
+    }
+
+    pub fn set_timeline_hover(&mut self, fullscreen: bool, enabled: bool) {
+        if fullscreen { self.timeline_fullscreen_hover = Some(enabled); }
+        else { self.timeline_hover = enabled; }
+    }
+
+    pub fn visualization_height(&self, fullscreen: bool) -> u32 {
+        (if fullscreen { self.timeline_fullscreen_height.unwrap_or(self.timeline_filmstrip_height) } else { self.timeline_filmstrip_height }).clamp(12, 96)
+    }
+
+    pub fn visualization_opacity(&self, fullscreen: bool) -> u32 {
+        (if fullscreen { self.timeline_fullscreen_opacity.unwrap_or(self.timeline_opacity) } else { self.timeline_opacity }).clamp(50, 100)
+    }
+
+    pub fn thumbnail_cache_dir(&self) -> PathBuf {
+        self.thumbnail_cache_dir.clone().unwrap_or_else(|| {
+            dirs::cache_dir().map(|p| p.join("mavplayer")).unwrap_or_else(config_dir).join("thumbnails")
+        })
+    }
+
     pub fn screenshot_dir(&self) -> PathBuf {
         self.screenshot_dir
             .clone()
@@ -416,7 +521,7 @@ pub fn config_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("mavplayer")
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(p: &Path) -> Option<T> {
+pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(p: &Path) -> Option<T> {
     let data = std::fs::read(p).ok()?;
     match serde_json::from_slice(&data) {
         Ok(v) => Some(v),
@@ -431,7 +536,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(p: &Path) -> Option<T> {
 /// temporary file is per process, so two windows saving at once can't mix
 /// their writes, and (on Unix) readable only by the user: these files hold
 /// what was watched, and stream URLs can carry credentials.
-fn write_json<T: Serialize>(p: &Path, v: &T) -> std::io::Result<()> {
+pub(crate) fn write_json<T: Serialize>(p: &Path, v: &T) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(d) = p.parent() {
         std::fs::create_dir_all(d)?;
@@ -538,6 +643,69 @@ impl ResumeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_preview_preferences_roundtrip() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.playlist_thumbnails, PlaylistThumbnails::InlineSide);
+        assert!(PlaylistThumbnails::InlineSide.inline() && PlaylistThumbnails::InlineSide.side());
+        assert!(PlaylistThumbnails::Inline.inline() && !PlaylistThumbnails::Inline.side());
+        assert!(PlaylistThumbnails::Hover.side() && !PlaylistThumbnails::Hover.inline());
+        settings.playlist_width = 425.;
+        settings.playlist_thumbnail_times.insert("0:example.mp4".into(), 25.);
+        let restored: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.playlist_width, 425.);
+        assert_eq!(restored.playlist_thumbnail_times.get("0:example.mp4"), Some(&25.));
+        assert_eq!(restored.playlist_thumbnails, PlaylistThumbnails::InlineSide);
+    }
+
+    #[test]
+    fn timeline_modes_preserve_legacy_settings_and_are_independent() {
+        let mut s: Settings = serde_json::from_str(r#"{"timeline_filmstrip":false,"timeline_hover":true}"#).unwrap();
+        assert_eq!(s.timeline_visualization(false), TimelineVisualization::None);
+        assert_eq!(s.timeline_visualization(true), TimelineVisualization::None);
+        s.set_timeline_visualization(false, TimelineVisualization::BarcodeAverage);
+        s.set_timeline_hover(false, false);
+        assert_eq!(s.timeline_visualization(true), TimelineVisualization::BarcodeAverage);
+        assert!(!s.timeline_hover_enabled(true));
+        s.set_timeline_visualization(true, TimelineVisualization::Filmstrip);
+        s.set_timeline_hover(true, false);
+        let s: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(s.timeline_visualization(false), TimelineVisualization::BarcodeAverage);
+        assert_eq!(s.timeline_visualization(true), TimelineVisualization::Filmstrip);
+        assert!(!s.timeline_hover_enabled(false));
+        assert!(!s.timeline_hover_enabled(true));
+    }
+
+    #[test]
+    fn fullscreen_visualization_inherits_each_windowed_setting() {
+        let mut s = Settings::default();
+        s.timeline_opacity = 70;
+        s.timeline_filmstrip_height = 40;
+        s.set_timeline_hover(false, false);
+        s.set_timeline_visualization(false, TimelineVisualization::BarcodeAverage);
+        assert_eq!(s.visualization_height(true), 40);
+        assert_eq!(s.visualization_opacity(true), 70);
+        assert!(!s.timeline_hover_enabled(true));
+        assert_eq!(s.timeline_visualization(true), TimelineVisualization::BarcodeAverage);
+        s.timeline_fullscreen_height = Some(56);
+        s.timeline_fullscreen_opacity = Some(90);
+        s.timeline_fullscreen_hover = Some(true);
+        s.timeline_fullscreen_visualization = Some(TimelineVisualization::None);
+        let mut s: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(s.visualization_height(true), 56);
+        assert_eq!(s.visualization_opacity(true), 90);
+        assert!(s.timeline_hover_enabled(true));
+        assert_eq!(s.timeline_visualization(true), TimelineVisualization::None);
+        s.timeline_fullscreen_height = None;
+        s.timeline_fullscreen_opacity = None;
+        s.timeline_fullscreen_hover = None;
+        s.timeline_fullscreen_visualization = None;
+        assert_eq!(s.visualization_height(true), 40);
+        assert_eq!(s.visualization_opacity(true), 70);
+        assert!(!s.timeline_hover_enabled(true));
+        assert_eq!(s.timeline_visualization(true), TimelineVisualization::BarcodeAverage);
+    }
 
     #[test]
     fn resume_store_evicts_the_oldest() {

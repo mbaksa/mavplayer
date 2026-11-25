@@ -32,6 +32,7 @@ pub mod probe;
 mod spu;
 mod subs;
 mod sync;
+pub mod thumbnails;
 pub mod types;
 mod upscale;
 mod video;

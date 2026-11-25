@@ -1,6 +1,8 @@
 //! The play queue: ordering, shuffle/repeat, folder expansion and
 //! M3U / PLS import & export.
 
+pub(crate) mod session;
+
 use crate::engine::MediaSource;
 use crate::engine::disc;
 use crate::settings::RepeatMode;
@@ -32,6 +34,7 @@ pub struct PlaylistItem {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub duration: Option<f64>,
+    pub video_stream: Option<usize>,
     pub probed: bool,
     pub failed: bool,
 }
@@ -113,7 +116,7 @@ impl Playlist {
             .map(|s| {
                 let id = self.next_id;
                 self.next_id += 1;
-                PlaylistItem { id, source: s, title: None, artist: None, duration: None, probed: false, failed: false }
+                PlaylistItem { id, source: s, title: None, artist: None, duration: None, video_stream: None, probed: false, failed: false }
             })
             .collect();
         let n = new.len();
@@ -442,6 +445,15 @@ pub fn expand_paths(paths: &[PathBuf]) -> Vec<MediaSource> {
     out
 }
 
+/// Playlist additions accept media, folders and playlist files, but not subtitles
+/// or unrelated documents. Opening a subtitle on the video remains separate.
+pub fn expand_playlist_paths(paths: &[PathBuf]) -> Vec<MediaSource> {
+    expand_paths(paths).into_iter().filter(|source| match source {
+        MediaSource::File(path) => is_media_path(path) || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("m3u8")),
+        _ => true,
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +466,13 @@ mod tests {
 
     fn names(p: &Playlist) -> Vec<String> {
         p.items.iter().map(|i| i.source.display_name()).collect()
+    }
+
+    #[test]
+    fn playlist_additions_reject_subtitle_and_document_files() {
+        let paths = ["movie.mp4", "subtitle.SRT", "notes.txt", "audio.flac", "subtitle.ass"].map(PathBuf::from);
+        let sources = expand_playlist_paths(&paths);
+        assert_eq!(sources, vec![MediaSource::File("movie.mp4".into()), MediaSource::File("audio.flac".into())]);
     }
 
     #[test]

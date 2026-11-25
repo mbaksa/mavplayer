@@ -191,10 +191,12 @@ impl PlayerView {
                     .map(|c| {
                         let start = c.start;
                         let cur = pos >= c.start && pos < c.end;
-                        M::action(format!("{}  ({})", c.title, format_time(c.start)), move |this, _, _| {
+                        let item = M::action(format!("{}  ({})", c.title, format_time(c.start)), move |this, _, _| {
                             this.player.seek(start, false, true)
-                        })
-                        .selected(cur)
+                        }).selected(cur);
+                        if let Some(preview) = self.thumbnails.for_chapter(&st, &self.settings, c.start, c.end) {
+                            item.thumbnail(preview)
+                        } else { item }
                     })
                     .collect()
             })
@@ -474,7 +476,7 @@ impl PlayerView {
             }
         }
         items.push(M::Separator);
-        items.push(M::action("Upscaling Settings…", |this, w, cx| this.show_dialog(Dialog::Settings(2), w, cx)));
+        items.push(M::action("Upscaling Settings…", |this, w, cx| this.show_dialog(Dialog::Settings(3), w, cx)));
         items
     }
 

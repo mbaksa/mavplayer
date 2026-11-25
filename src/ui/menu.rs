@@ -23,6 +23,7 @@ pub enum MenuItem {
         enabled: bool,
         icon: Option<Icon>,
         run: MenuFn,
+        thumbnail: Option<(std::sync::Arc<gpui::RenderImage>, u32, u32)>,
     },
     Submenu {
         label: SharedString,
@@ -47,7 +48,14 @@ impl MenuItem {
             enabled: true,
             icon: None,
             run: Rc::new(run),
+            thumbnail: None,
         }
+    }
+    pub(super) fn thumbnail(mut self, preview: &super::thumbnails::Preview) -> Self {
+        if let MenuItem::Action { thumbnail, .. } = &mut self {
+            *thumbnail = Some((preview.image.clone(), preview.width, preview.height));
+        }
+        self
     }
     pub fn submenu(label: impl Into<SharedString>, items: Vec<MenuItem>) -> Self {
         let enabled = !items.is_empty();
@@ -145,6 +153,8 @@ impl PlayerView {
 
     pub fn close_menu(&mut self, cx: &mut Context<Self>) {
         if self.menu.take().is_some() {
+            self.playlist_previews.resume_hover();
+            self.note_activity(cx);
             cx.notify();
         }
     }
@@ -168,21 +178,24 @@ impl PlayerView {
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
+                    cx.listener(|this, ev: &gpui::MouseDownEvent, _, cx| {
+                        this.playlist_previews.pointer = Some(ev.position);
                         this.close_menu(cx);
                         cx.stop_propagation();
                     }),
                 )
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(|this, _, _, cx| {
+                    cx.listener(|this, ev: &gpui::MouseDownEvent, _, cx| {
+                        this.playlist_previews.pointer = Some(ev.position);
                         this.close_menu(cx);
                         cx.stop_propagation();
                     }),
                 )
                 .on_mouse_down(
                     MouseButton::Middle,
-                    cx.listener(|this, _, _, cx| {
+                    cx.listener(|this, ev: &gpui::MouseDownEvent, _, cx| {
+                        this.playlist_previews.pointer = Some(ev.position);
                         this.close_menu(cx);
                         cx.stop_propagation();
                     }),
@@ -190,7 +203,7 @@ impl PlayerView {
                 .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.stop_propagation()))
         };
         let bar = self.menubar_bounds.get();
-        let mut layer = div().absolute().top_0().left_0().size_full();
+        let mut layer = div().absolute().top_0().left_0().size_full().on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, _, _| { this.playlist_previews.pointer = Some(ev.position); }));
         layer = if menu.menubar_index.is_some() && bar.size.height > px(0.) {
             layer
                 .child(backdrop("menu-backdrop-top").top_0().h(bar.top()))
@@ -291,7 +304,7 @@ impl PlayerView {
                     .text_color(theme.text_dim)
                     .child(t.clone())
                     .into_any_element(),
-                MenuItem::Action { label, shortcut, checked, radio, enabled, icon: ic, run } => {
+                MenuItem::Action { label, shortcut, checked, radio, enabled, icon: ic, run, thumbnail } => {
                     let run = run.clone();
                     let enabled = *enabled;
                     let color = if enabled { theme.text } else { theme.text_disabled };
@@ -310,7 +323,7 @@ impl PlayerView {
                     let pp = path_prefix.clone();
                     div()
                         .id(SharedString::from(format!("mi-{level}-{i}")))
-                        .h(px(ITEM_H))
+                        .h(px(if thumbnail.is_some() { 56.0 } else { ITEM_H }))
                         .flex_none()
                         .mx_1()
                         .px_2()
@@ -321,6 +334,7 @@ impl PlayerView {
                         .text_color(color)
                         .when(enabled, |d| d.hover(|s| s.bg(theme.accent).text_color(theme.on_accent)))
                         .when(has_checks, |d| d.child(lead))
+                        .when_some(thumbnail.clone(), |d, (image, width, height)| d.child(super::thumbnails::Preview { time: 0.0, image, width, height }.element(88., 50.)))
                         .child(div().flex_1().truncate().child(label.clone()))
                         .when_some(shortcut.clone(), |d, sc| d.child(div().text_size(px(11.)).opacity(0.65).child(sc)))
                         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -334,9 +348,11 @@ impl PlayerView {
                             }
                         }))
                         .when(enabled, |d| {
-                            d.on_click(cx.listener(move |this, _, window, cx| {
-                                this.menu = None;
+                            d.on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                                this.playlist_previews.pointer = Some(ev.position());
+                                this.close_menu(cx);
                                 run(this, window, cx);
+                                this.note_activity(cx);
                                 cx.notify();
                             }))
                         })
