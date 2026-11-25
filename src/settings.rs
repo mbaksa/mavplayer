@@ -215,9 +215,6 @@ pub struct Settings {
     pub single_click_pause: bool,
     pub drag_video_to_move_window: bool,
     pub double_click_fullscreen: bool,
-    /// Playlist entries play on a double click (a single click only selects
-    /// them) rather than on a single click.
-    pub playlist_double_click: bool,
     pub scroll_action: ScrollAction,
     pub show_playlist: bool,
     pub playlist_width: f32,
@@ -337,7 +334,6 @@ impl Default for Settings {
             single_click_pause: false,
             drag_video_to_move_window: false,
             double_click_fullscreen: true,
-            playlist_double_click: false,
             scroll_action: ScrollAction::Volume,
             show_playlist: false,
             playlist_width: 320.,

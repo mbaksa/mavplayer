@@ -119,6 +119,18 @@ impl Library {
         true
     }
 
+    pub fn can_delete(&self) -> bool { self.writable && self.slots.len() > 1 }
+
+    pub fn delete_active(&mut self) -> bool {
+        if !self.can_delete() { return false; }
+        self.slots.remove(self.active);
+        let next = self.active.min(self.slots.len() - 1);
+        self.active = if self.slots[next].open { next } else { self.slots.iter().position(|s| s.open).unwrap_or(next) };
+        self.slots[self.active].open = true;
+        self.dirty = true;
+        true
+    }
+
     pub fn valid_name(&self, name: &str, rename: bool) -> bool {
         !name.trim().is_empty() && !self.slots.iter().enumerate().any(|(i, s)| (!rename || i != self.active) && s.name.eq_ignore_ascii_case(name.trim()))
     }
@@ -184,6 +196,26 @@ mod tests {
         assert!(!restored.autosave());
         assert!(restored.switch(0));
         assert_eq!(restored.snapshot(), &snapshot("first.mp4", 12.5));
+    }
+
+    #[test]
+    fn deleting_playlist_preserves_other_saved_slots() {
+        let mut lib = Library::empty(true);
+        lib.capture(snapshot("first.mp4", 12.5), true, true);
+        lib.create("Second".into());
+        lib.capture(snapshot("second.mp4", 42.), true, false);
+        lib.create("Third".into());
+        lib.capture(snapshot("third.mp4", 70.), true, false);
+        assert!(lib.switch(1));
+        assert!(lib.delete_active());
+        assert_eq!(lib.slots.len(), 2);
+        assert_eq!(lib.name(), "Third");
+        assert_eq!(lib.snapshot(), &snapshot("third.mp4", 70.));
+        assert!(lib.switch(0));
+        assert_eq!(lib.snapshot(), &snapshot("first.mp4", 12.5));
+        assert!(lib.delete_active());
+        assert!(!lib.delete_active());
+        assert_eq!(lib.name(), "Third");
     }
 
     #[test]

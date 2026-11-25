@@ -186,7 +186,8 @@ pub struct PlayerView {
     pub fs_playlist: bool,
     /// Fullscreen as of the last render.
     pub in_fullscreen: bool,
-    pub playlist_selected: Option<usize>,
+    pub playlist_selection: playlist::Selection,
+    pub playlist_hovered: Option<u64>,
     pub ab_loop: (Option<f64>, Option<f64>),
     pub loop_file: bool,
     /// The playlist item queued in the engine to follow the current one.
@@ -367,6 +368,14 @@ impl PlayerView {
             }
         })
         .detach();
+        // Cache previews wake the UI as soon as the first JPEG is available.
+        let (preview_tx, mut preview_rx) = futures::channel::mpsc::unbounded();
+        cx.spawn_in(window, async move |this, cx| {
+            while preview_rx.next().await.is_some() {
+                while preview_rx.try_recv().is_ok() {}
+                if this.update_in(cx, |v, _, cx| v.refresh_playlist_hover(cx)).is_err() && this.upgrade().is_none() { break; }
+            }
+        }).detach();
         // Periodic UI refresh (time display, auto-hide, A-B loop, OSD expiry).
         // Like the wake-ups, it only stops once the view is gone.
         cx.spawn_in(window, async move |this, cx| {
@@ -489,9 +498,10 @@ impl PlayerView {
             drag: None,
             seek_hover: None,
             thumbnails: Default::default(),
-            playlist_previews: Default::default(),
+            playlist_previews: super::playlist_thumbnails::PlaylistPreviews::with_wake(preview_tx),
             scrub: None,
-            playlist_selected: None,
+            playlist_selection: Default::default(),
+            playlist_hovered: None,
             ab_loop: (None, None),
             loop_file: false,
             armed: None,
@@ -740,7 +750,7 @@ impl PlayerView {
         }
         if let MediaSource::File(path) = &src { self.playlist_previews.invalidate(path); }
         if idx != prev {
-            self.playlist_selected = idx;
+            if let Some(i) = idx { self.playlist_selection.select_if_empty(&self.playlist.items, i); }
             self.ab_loop = (None, None);
             self.sub_delay = 0.0;
             self.load_counter += 1;
@@ -757,6 +767,11 @@ impl PlayerView {
         self.subs.clear();
         self.update_next();
         cx.notify();
+    }
+
+    pub(super) fn refresh_playlist_hover(&mut self, cx: &mut Context<Self>) {
+        let visible = self.playlist_shown();
+        if self.playlist_previews.update_hover(&self.settings, visible, &self.thumbnails) { cx.notify(); }
     }
 
     pub fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -904,6 +919,55 @@ impl PlayerView {
             None
         });
         self.playlist_previews.regenerate(path, stream);
+        cx.notify();
+    }
+
+    /// Queue missing or explicitly requested thumbnails for local playlist items.
+    pub(super) fn generate_playlist_items(&mut self, ids: Option<&[u64]>, missing_only: bool, cx: &mut Context<Self>) {
+        if !self.settings.timeline_thumbnails { return; }
+        let jobs: Vec<_> = self.playlist.items.iter().filter(|it| ids.is_none_or(|ids| ids.contains(&it.id)))
+            .filter_map(|it| {
+                let MediaSource::File(path) = &it.source else { return None; };
+                if it.probed && it.duration.is_some() && it.video_stream.is_none() { return None; }
+                Some((path.clone(), it.video_stream))
+            }).collect();
+        for (path, stream) in jobs {
+            let selected_stream = self.player.with_state(|st| {
+                if matches!(&st.source, Some(MediaSource::File(p)) if p == &path)
+                    && let Some(TrackId::Stream(stream)) = st.selected.video { return Some(stream); }
+                stream
+            });
+            if missing_only { self.playlist_previews.generate_missing(path, selected_stream); }
+            else { self.playlist_previews.regenerate(path, selected_stream); }
+        }
+        cx.notify();
+    }
+
+    pub(super) fn remove_playlist_items(&mut self, ids: &[u64], window: &mut Window, cx: &mut Context<Self>) {
+        if self.playlist.current.and_then(|i| self.playlist.items.get(i)).is_some_and(|it| ids.contains(&it.id)) {
+            self.stop(window, cx);
+        }
+        for i in (0..self.playlist.items.len()).rev() {
+            if ids.contains(&self.playlist.items[i].id) { self.playlist.remove(i); }
+        }
+        self.playlist_selection.remove(ids);
+        if self.playlist_hovered.is_some_and(|id| ids.contains(&id)) { self.playlist_hovered = None; }
+        if self.playlist_previews.hover.as_ref().is_some_and(|h| ids.contains(&h.id)) { self.playlist_previews.hover = None; }
+        self.update_next();
+        cx.notify();
+    }
+
+    pub(super) fn move_playlist_items(&mut self, ids: &[u64], up: bool, cx: &mut Context<Self>) {
+        self.playlist.move_selected(ids, up);
+        self.playlist_previews.hover = None;
+        self.update_next();
+        cx.notify();
+    }
+
+    pub(super) fn drop_playlist_items(&mut self, ids: &[u64], at: usize, cx: &mut Context<Self>) {
+        self.playlist.drop_selected(ids, at);
+        self.playlist_previews.hover = None;
+        self.update_next();
         cx.notify();
     }
 
@@ -1103,6 +1167,13 @@ impl PlayerView {
         self.restore_playlist_workspace(window, cx);
     }
 
+    pub(super) fn delete_playlist_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.playlist_library.can_delete() { return; }
+        self.close_dialog(window, cx);
+        self.stop(window, cx);
+        if self.playlist_library.delete_active() { self.restore_playlist_workspace(window, cx); }
+    }
+
     pub(super) fn name_playlist_workspace(&mut self, name: String, rename: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !self.playlist_library.valid_name(&name, rename) { self.osd("Choose a unique playlist name", cx); return; }
         self.close_dialog(window, cx);
@@ -1120,7 +1191,8 @@ impl PlayerView {
     fn restore_playlist_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let snapshot = self.playlist_library.snapshot().clone();
         self.playlist.clear(); // Keep the monotonic item IDs used by asynchronous probes.
-        self.playlist_selected = None;
+        self.playlist_selection.clear();
+        self.playlist_hovered = None;
         self.playlist_previews.hover = None;
         self.armed = None;
         self.playlist.add(snapshot.sources);
@@ -1168,7 +1240,7 @@ impl PlayerView {
         self.reset_thumbnails();
         self.save_current_position();
         self.playlist.current = Some(idx);
-        self.playlist_selected = Some(idx);
+        self.playlist_selection.select_if_empty(&self.playlist.items, idx);
         self.ab_loop = (None, None);
         self.sub_delay = 0.0;
         let old = self.frame.take();
@@ -1253,7 +1325,8 @@ impl PlayerView {
             RunningMode::Replace => {
                 self.save_current_position();
                 self.playlist.clear();
-                self.playlist_selected = None;
+                self.playlist_selection.clear();
+                self.playlist_hovered = None;
                 let range = self.playlist.add(req.sources);
                 self.probe_playlist(cx);
                 self.play_index(range.start, window, cx);
@@ -1280,12 +1353,6 @@ impl PlayerView {
         let was_empty = self.playlist.items.is_empty();
         let n = sources.len();
         let range = self.playlist.insert(at, sources);
-        // Keep the selection on the same item.
-        if let Some(sel) = self.playlist_selected.as_mut()
-            && *sel >= range.start
-        {
-            *sel += n;
-        }
         self.probe_playlist(cx);
         if was_empty || !self.player.is_active() {
             self.play_index(range.start, window, cx);
@@ -1337,7 +1404,9 @@ impl PlayerView {
             let (queue, tx, cfg) = (queue.clone(), tx.clone(), cfg.clone());
             cx.background_executor()
                 .spawn(async move {
-                    while let Some((id, s)) = queue.lock().pop_front() {
+                    loop {
+                        let job = queue.lock().pop_front();
+                        let Some((id, s)) = job else { break; };
                         if tx.unbounded_send((id, engine::probe::probe(&s, &cfg))).is_err() {
                             break; // the window closed
                         }

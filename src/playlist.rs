@@ -49,6 +49,46 @@ impl PlaylistItem {
     }
 }
 
+#[derive(Default)]
+pub struct Selection {
+    ids: HashSet<u64>,
+    anchor: Option<u64>,
+}
+
+impl Selection {
+    pub fn clear(&mut self) { self.ids.clear(); self.anchor = None; }
+    pub fn contains(&self, id: u64) -> bool { self.ids.contains(&id) }
+    pub fn ids(&self, items: &[PlaylistItem]) -> Vec<u64> {
+        items.iter().filter(|it| self.contains(it.id)).map(|it| it.id).collect()
+    }
+    pub fn single(&mut self, id: u64) {
+        self.ids.clear();
+        self.ids.insert(id);
+        self.anchor = Some(id);
+    }
+    pub fn select_if_empty(&mut self, items: &[PlaylistItem], index: usize) {
+        if !items.iter().any(|it| self.contains(it.id)) && let Some(it) = items.get(index) { self.single(it.id); }
+    }
+    pub fn click(&mut self, items: &[PlaylistItem], index: usize, control: bool, shift: bool) {
+        let Some(item) = items.get(index) else { return; };
+        if shift {
+            let anchor = self.anchor.and_then(|id| items.iter().position(|it| it.id == id)).unwrap_or(index);
+            if !control { self.ids.clear(); }
+            self.ids.extend(items[anchor.min(index)..=anchor.max(index)].iter().map(|it| it.id));
+            self.anchor = Some(items[anchor].id);
+        } else if control {
+            if !self.ids.remove(&item.id) { self.ids.insert(item.id); }
+            self.anchor = Some(item.id);
+        } else {
+            self.single(item.id);
+        }
+    }
+    pub fn remove(&mut self, ids: &[u64]) {
+        self.ids.retain(|id| !ids.contains(id));
+        if self.anchor.is_some_and(|id| ids.contains(&id)) { self.anchor = None; }
+    }
+}
+
 pub struct Playlist {
     pub items: Vec<PlaylistItem>,
     pub current: Option<usize>,
@@ -163,6 +203,49 @@ impl Playlist {
             if *x > idx {
                 *x -= 1;
             }
+        }
+    }
+
+    /// Move selected rows one step without changing their relative order.
+    pub fn can_move_selected(&self, ids: &[u64], up: bool) -> bool {
+        self.items.iter().enumerate().any(|(i, item)| ids.contains(&item.id) &&
+            if up { i > 0 && !ids.contains(&self.items[i - 1].id) }
+            else { i + 1 < self.items.len() && !ids.contains(&self.items[i + 1].id) })
+    }
+
+    pub fn move_selected(&mut self, ids: &[u64], up: bool) {
+        if up {
+            for i in 1..self.items.len() {
+                if ids.contains(&self.items[i].id) && !ids.contains(&self.items[i - 1].id) { self.move_item(i, i - 1); }
+            }
+        } else {
+            for i in (0..self.items.len().saturating_sub(1)).rev() {
+                if ids.contains(&self.items[i].id) && !ids.contains(&self.items[i + 1].id) { self.move_item(i, i + 1); }
+            }
+        }
+    }
+
+    /// Drop a selected group at an insertion point in the original list.
+    /// Translate the grabbed row's displacement to the leading edge of the group.
+    pub fn group_drop_gap(&self, ids: &[u64], anchor: u64, target_row: usize) -> Option<usize> {
+        let from = self.items.iter().position(|it| it.id == anchor)?;
+        let first = self.items.iter().position(|it| ids.contains(&it.id))?;
+        let last = self.items.iter().rposition(|it| ids.contains(&it.id))?;
+        let target_row = target_row.min(self.items.len().saturating_sub(1));
+        match target_row.cmp(&from) {
+            std::cmp::Ordering::Less if first > 0 => Some(first.saturating_sub(from - target_row)),
+            std::cmp::Ordering::Greater if last + 1 < self.items.len() => Some((last + 1).saturating_add(target_row - from).min(self.items.len())),
+            _ => None,
+        }
+    }
+
+    pub fn drop_selected(&mut self, ids: &[u64], at: usize) {
+        let at = at.min(self.items.len());
+        let before = self.items[..at].iter().filter(|it| !ids.contains(&it.id)).count();
+        let mut order: Vec<_> = self.items.iter().filter(|it| !ids.contains(&it.id)).map(|it| it.id).collect();
+        order.splice(before..before, self.items.iter().filter(|it| ids.contains(&it.id)).map(|it| it.id));
+        for (to, id) in order.into_iter().enumerate() {
+            if self.items[to].id != id && let Some(from) = self.items.iter().position(|it| it.id == id) { self.move_item(from, to); }
         }
     }
 
@@ -466,6 +549,59 @@ mod tests {
 
     fn names(p: &Playlist) -> Vec<String> {
         p.items.iter().map(|i| i.source.display_name()).collect()
+    }
+
+    #[test]
+    fn playlist_multi_selection_survives_group_move() {
+        let mut p = pl(&["a", "b", "c", "d", "e"]);
+        let mut selection = Selection::default();
+        selection.click(&p.items, 1, false, false);
+        selection.click(&p.items, 2, false, true);
+        selection.click(&p.items, 4, true, false);
+        let ids = selection.ids(&p.items);
+        assert_eq!(ids, vec![p.items[1].id, p.items[2].id, p.items[4].id]);
+        p.current = Some(2);
+        p.move_selected(&ids, true);
+        assert_eq!(names(&p), ["b", "c", "a", "e", "d"]);
+        assert_eq!(p.current, Some(1));
+        assert_eq!(selection.ids(&p.items), ids);
+        p.move_selected(&ids, false);
+        assert_eq!(names(&p), ["a", "b", "c", "d", "e"]);
+        assert_eq!(p.current, Some(2));
+        selection.click(&p.items, 1, true, false);
+        assert!(!selection.contains(p.items[1].id));
+    }
+
+    #[test]
+    fn playlist_group_drag_moves_relative_to_grabbed_row() {
+        for grabbed in 4..8 {
+            let mut p = pl(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+            p.current = Some(7);
+            let ids: Vec<_> = p.items[4..].iter().map(|it| it.id).collect();
+            let anchor = p.items[grabbed].id;
+            assert_eq!(p.group_drop_gap(&ids, anchor, grabbed), None);
+            let at = p.group_drop_gap(&ids, anchor, grabbed - 1).unwrap();
+            p.drop_selected(&ids, at);
+            assert_eq!(names(&p), ["a", "b", "c", "e", "f", "g", "h", "d"]);
+            assert_eq!(p.current, Some(6));
+            let at = p.group_drop_gap(&ids, anchor, grabbed).unwrap();
+            p.drop_selected(&ids, at);
+            assert_eq!(names(&p), ["a", "b", "c", "d", "e", "f", "g", "h"]);
+            assert_eq!(p.current, Some(7));
+        }
+    }
+
+    #[test]
+    fn playlist_group_drop_keeps_relative_order_and_current() {
+        let mut p = pl(&["a", "b", "c", "d", "e"]);
+        p.set_shuffle(true);
+        p.current = Some(3);
+        let ids = [p.items[1].id, p.items[3].id];
+        let play_order: Vec<_> = p.order.iter().map(|&i| p.items[i].id).collect();
+        p.drop_selected(&ids, 5);
+        assert_eq!(names(&p), ["a", "c", "e", "b", "d"]);
+        assert_eq!(p.current, Some(4));
+        assert_eq!(p.order.iter().map(|&i| p.items[i].id).collect::<Vec<_>>(), play_order);
     }
 
     #[test]

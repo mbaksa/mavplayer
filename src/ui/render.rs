@@ -38,9 +38,10 @@ const RESIZE_EDGE: f32 = 6.0;
 const ROW_H: f32 = 34.0;
 const LIST_PAD: f32 = 4.0;
 
-/// A playlist row being dragged to a new position.
+/// A playlist row or selected group being dragged to a new position.
 pub struct PlaylistDrag {
-    pub index: usize,
+    pub ids: Vec<u64>,
+    pub anchor: u64,
     pub title: SharedString,
 }
 
@@ -1685,6 +1686,9 @@ impl PlayerView {
         let width = self.settings.playlist_width.clamp(120., max_width);
         let count = self.playlist.items.len();
         let total: f64 = self.playlist.items.iter().filter_map(|i| i.duration).sum();
+        let selected_count = self.playlist_selection.ids(&self.playlist.items).len();
+        let switch_bounds = Rc::new(Cell::new(Bounds::default()));
+        let measured_switch = switch_bounds.clone();
         let header = div()
             .flex()
             .items_center()
@@ -1695,15 +1699,32 @@ impl PlayerView {
             .border_color(t.chrome_border)
             .child(
                 div()
+                    .id("playlist-switch")
+                    .relative()
                     .flex_1()
+                    .min_w_0()
                     .flex()
-                    .flex_col()
-                    .child(div().text_size(px(13.)).font_weight(gpui::FontWeight::SEMIBOLD).truncate().child(self.playlist_library.name().to_owned()))
-                    .child(div().text_size(px(11.)).text_color(t.text_dim).child(format!(
-                        "{count} item{}{}",
-                        if count == 1 { "" } else { "s" },
-                        if total > 0.0 { format!(" · {}", format_time(total)) } else { String::new() }
-                    ))),
+                    .items_center()
+                    .gap_1()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(t.hover))
+                    .child(canvas(move |b, _, _| measured_switch.set(b), |_, _, _, _| {}).absolute().size_full())
+                    .child(div().flex_1().min_w_0().flex().flex_col()
+                        .child(div().text_size(px(13.)).font_weight(gpui::FontWeight::SEMIBOLD).truncate().child(self.playlist_library.name().to_owned()))
+                        .child(div().text_size(px(11.)).text_color(t.text_dim).truncate().child(format!(
+                            "{count} item{}{}{}",
+                            if count == 1 { "" } else { "s" },
+                            if total > 0.0 { format!(" · {}", format_time(total)) } else { String::new() },
+                            if selected_count > 1 { format!(" · {selected_count} selected") } else { String::new() }
+                        ))))
+                    .child(icon(Icon::DropDown, px(12.), t.text_dim))
+                    .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                        if ev.is_right_click() { return; }
+                        let items = this.playlist_switch_menu();
+                        this.open_menu(items, super::menu::below(switch_bounds.get()), None, cx);
+                        cx.stop_propagation();
+                    })),
             )
             .child(self.icon_button(
                 "pl-add",
@@ -1728,7 +1749,7 @@ impl PlayerView {
             .child(self.icon_button(
                 "pl-save",
                 Icon::Save,
-                "Save playlist",
+                "Export playlist (M3U)",
                 t,
                 |this, _, w, cx| this.save_playlist(w, cx),
                 cx,
@@ -1741,13 +1762,14 @@ impl PlayerView {
                 |this, _, w, cx| {
                     this.stop(w, cx);
                     this.playlist.clear();
+                    this.playlist_selection.clear();
+                    this.playlist_hovered = None;
                     cx.notify();
                 },
                 cx,
             ));
 
         let current = self.playlist.current;
-        let selected = self.playlist_selected;
         let drop_at = self.pl_drop;
         let list = gpui::uniform_list(
             "playlist-items",
@@ -1779,8 +1801,11 @@ impl PlayerView {
                                 .when(top, |d| d.top(px(-1.)))
                                 .when(!top, |d| d.bottom(px(-1.)))
                         };
-                        let drag_value = PlaylistDrag { index: i, title: title.clone().into() };
                         let item_id = it.id;
+                        let selected = this.playlist_selection.contains(item_id);
+                        let drag_ids = if selected { this.playlist_selection.ids(&this.playlist.items) } else { vec![item_id] };
+                        let drag_title = if drag_ids.len() > 1 { format!("{} items", drag_ids.len()) } else { title.clone() };
+                        let drag_value = PlaylistDrag { ids: drag_ids, anchor: item_id, title: drag_title.into() };
                         let failed = it.failed;
                         let duration = it.duration.unwrap_or(0.0);
                         let mode = super::playlist_thumbnails::PlaylistPreviews::mode(&this.settings);
@@ -1797,6 +1822,24 @@ impl PlayerView {
                                     .or_else(|| this.playlist_previews.inline_pair(key, representative, duration * 0.05))
                             })
                         } else { None };
+                        let hovered = this.playlist_hovered == Some(item_id) && this.menu.is_none() && !dragging;
+                        let playing = is_cur && this.player.is_active() && !this.player.paused()
+                            && this.player.with_state(|s| s.status != Status::Ended);
+                        let play = (hovered || is_cur).then(|| this.icon_button(("pl-play", i),
+                            if playing { Icon::Pause } else { Icon::Play }, if playing { "Pause" } else { "Play" }, t,
+                            move |this, ev, w, cx| {
+                                if ev.is_right_click() { return; }
+                                cx.stop_propagation();
+                                if let Some(index) = this.playlist.items.iter().position(|it| it.id == item_id) {
+                                    if this.playlist.current == Some(index) && this.player.is_active() {
+                                        this.player.toggle_pause();
+                                    } else {
+                                        this.play_index(index, w, cx);
+                                    }
+                                    cx.notify();
+                                }
+                            }, cx).size(px(22.)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).into_any_element());
+                        let (inline_play, row_play) = if mode.inline() && !is_cur { (play, None) } else { (None, play) };
                         div()
                             .id(("pl-row", i))
                             .relative()
@@ -1808,9 +1851,21 @@ impl PlayerView {
                             .gap_2()
                             .rounded(px(6.))
                             .cursor_pointer()
-                            .when(selected == Some(i) && !is_cur, |d| d.bg(t.hover))
                             .when(is_cur, |d| d.bg(t.accent_soft))
+                            .when(selected && !is_cur, |d| d.bg(t.pressed))
+                            .when(selected && is_cur, |d| d.bg(t.accent_soft).border_1().border_color(t.accent))
                             .hover(|s| s.bg(t.hover))
+                            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                if *hovered {
+                                    if this.playlist_hovered != Some(item_id) { this.playlist_hovered = Some(item_id); cx.notify(); }
+                                } else {
+                                    if this.playlist_hovered == Some(item_id) { this.playlist_hovered = None; cx.notify(); }
+                                    if this.menu.is_none() && this.playlist_previews.hover.as_ref().is_some_and(|h| h.id == item_id) {
+                                        this.playlist_previews.hover = None;
+                                        cx.notify();
+                                    }
+                                }
+                            }))
                             .when(mode != PlaylistThumbnails::None, |d| {
                                 d.child(canvas(move |b, _, _| measured.set(b), |_, _, _, _| {}).absolute().size_full())
                                     .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
@@ -1819,13 +1874,8 @@ impl PlayerView {
                                         let b = bounds.get();
                                         let fraction = frac_in(b, ev.position, false);
                                         this.playlist_previews.hover = Some(super::playlist_thumbnails::Hover { id: item_id, key, duration, fraction, bounds: b });
+                                        this.refresh_playlist_hover(cx);
                                         cx.notify();
-                                    }))
-                                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                                        if !*hovered && this.menu.is_none() && this.playlist_previews.hover.as_ref().is_some_and(|h| h.id == item_id) {
-                                            this.playlist_previews.hover = None;
-                                            cx.notify();
-                                        }
                                     }))
                             })
                             .child(
@@ -1835,15 +1885,17 @@ impl PlayerView {
                                     .justify_center()
                                     .text_size(px(11.))
                                     .text_color(t.text_dim)
-                                    .child(if is_cur {
+                                    .items_center()
+                                    .child(row_play.unwrap_or_else(|| if is_cur {
                                         icon(Icon::Play, px(12.), t.accent).into_any_element()
                                     } else {
                                         div().child(format!("{}", i + 1)).into_any_element()
-                                    }),
+                                    })),
                             )
                             .when(mode.inline(), |d| d.child(
-                                div().w(px(72.)).h(px(44.)).flex_none().flex().items_center().justify_center()
+                                div().relative().w(px(72.)).h(px(44.)).flex_none().flex().items_center().justify_center()
                                     .when_some(image, |d, p| d.child(p.element(72., 44.)))
+                                    .when_some(inline_play, |d, button| d.child(div().absolute().left(px(24.)).top(px(10.)).rounded_full().bg(rgba(0x000000b0)).child(button)))
                             ))
                             .child(
                                 div()
@@ -1861,6 +1913,13 @@ impl PlayerView {
                                     .child(title),
                             )
                             .child(div().text_size(px(11.)).text_color(t.text_dim).child(dur))
+                            .child(div().w(px(22.)).flex_none().when(hovered, |d| d.child(
+                                this.icon_button(("pl-remove", i), Icon::Delete, "Remove from playlist", t, move |this, ev, w, cx| {
+                                    if ev.is_right_click() { return; }
+                                    cx.stop_propagation();
+                                    this.remove_playlist_items(&[item_id], w, cx);
+                                }, cx).size(px(22.)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            )))
                             .when(dragging && drop_at == Some(i), |d| d.child(marker(true)))
                             .when(dragging && i + 1 == count && drop_at == Some(count), |d| d.child(marker(false)))
                             .on_drag(drag_value, move |d, _, _, cx| {
@@ -1868,24 +1927,27 @@ impl PlayerView {
                                 cx.new(|_| PlaylistDragPreview { title, theme: t })
                             })
                             .on_click(cx.listener(move |this, ev: &ClickEvent, w, cx| {
-                                this.playlist_selected = Some(i);
-                                // One click plays (the second of a double
-                                // click mustn't start it again), or two.
-                                let clicks = if this.settings.playlist_double_click { 2 } else { 1 };
-                                if ev.click_count() == clicks {
-                                    this.play_index(i, w, cx);
+                                if ev.is_right_click() { return; }
+                                let modifiers = ev.modifiers();
+                                let control = modifiers.control || modifiers.platform;
+                                let shift = modifiers.shift;
+                                let Some(index) = this.playlist.items.iter().position(|it| it.id == item_id) else { return; };
+                                this.playlist_selection.click(&this.playlist.items, index, control, shift);
+                                if !control && !shift && ev.click_count() == 2 {
+                                    this.play_index(index, w, cx);
                                 }
                                 cx.notify();
                             }))
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                                    this.playlist_selected = Some(i);
+                                    if !this.playlist_selection.contains(item_id) { this.playlist_selection.single(item_id); }
                                     this.playlist_previews.pointer = Some(ev.position);
                                     if this.playlist_previews.hover.as_ref().is_some_and(|h| h.id != item_id) {
                                         this.playlist_previews.hover = None;
                                     }
-                                    let items = this.playlist_item_menu(i);
+                                    let Some(index) = this.playlist.items.iter().position(|it| it.id == item_id) else { return; };
+                                    let items = this.playlist_item_menu(index);
                                     this.open_menu(items, ev.position, None, cx);
                                     cx.stop_propagation();
                                 }),
@@ -1901,7 +1963,21 @@ impl PlayerView {
             this.update_playlist_drop(ev.bounds, ev.event.position, cx);
         }))
         .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<PlaylistDrag>, _, cx| {
-            this.update_playlist_drop(ev.bounds, ev.event.position, cx);
+            let drag = ev.drag(cx);
+            let at = if drag.ids.len() > 1 && ev.bounds.contains(&ev.event.position) {
+                let scroll = this.pl_scroll.0.borrow().base_handle.offset().y;
+                let y = f32::from(ev.event.position.y - ev.bounds.top() - scroll) - LIST_PAD;
+                this.playlist.group_drop_gap(&drag.ids, drag.anchor, (y / this.playlist_row_height()).floor().max(0.0) as usize)
+            } else if drag.ids.len() == 1 {
+                this.update_playlist_drop(ev.bounds, ev.event.position, cx);
+                return;
+            } else {
+                None
+            };
+            if at != this.pl_drop {
+                this.pl_drop = at;
+                cx.notify();
+            }
         }))
         .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
             let at = this.pl_drop.take().unwrap_or(this.playlist.items.len());
@@ -1912,13 +1988,9 @@ impl PlayerView {
             cx.notify();
         }))
         .on_drop(cx.listener(|this, d: &PlaylistDrag, _, cx| {
-            let at = this.pl_drop.take().unwrap_or(this.playlist.items.len());
-            // `at` is an insertion point; once the item is taken out, the
-            // points after it shift up by one.
-            let to = if at > d.index { at - 1 } else { at }.min(this.playlist.items.len().saturating_sub(1));
-            this.playlist.move_item(d.index, to);
-            this.playlist_selected = Some(to);
-            cx.notify();
+            let Some(at) = this.pl_drop.take() else { return; };
+            if d.ids.len() == 1 && !this.playlist_selection.contains(d.ids[0]) { this.playlist_selection.single(d.ids[0]); }
+            this.drop_playlist_items(&d.ids, at, cx);
         }));
 
         let body: AnyElement = if count == 0 {
@@ -2010,14 +2082,21 @@ impl PlayerView {
         }
     }
 
+    fn playlist_switch_menu(&self) -> Vec<M> {
+        self.playlist_library.slots.iter().enumerate().filter(|(_, slot)| slot.open).map(|(index, slot)| {
+            M::action(slot.name.clone(), move |this, w, cx| this.switch_playlist_workspace(index, w, cx)).selected(index == self.playlist_library.active)
+        }).collect()
+    }
+
     fn playlist_panel_menu(&self) -> Vec<M> {
-        let modes = PlaylistThumbnails::ALL.into_iter().map(|mode| M::action(mode.label(), move |this, _, cx| {
+        let mut modes: Vec<_> = PlaylistThumbnails::ALL.into_iter().map(|mode| M::action(mode.label(), move |this, _, cx| {
             this.settings.playlist_thumbnails = mode;
             this.apply_settings(cx);
         }).selected(self.settings.playlist_thumbnails == mode)).collect();
-        let playlists = self.playlist_library.slots.iter().enumerate().filter(|(_, slot)| slot.open).map(|(index, slot)| {
-            M::action(slot.name.clone(), move |this, w, cx| this.switch_playlist_workspace(index, w, cx)).selected(index == self.playlist_library.active)
-        }).collect();
+        modes.push(M::Separator);
+        modes.push(M::action("Generate missing thumbnails", |this, _, cx| this.generate_playlist_items(None, true, cx))
+            .enabled(self.playlist.items.iter().any(|it| matches!(it.source, MediaSource::File(_)) && (it.video_stream.is_some() || !it.probed || it.duration.is_none()))));
+        let playlists = self.playlist_switch_menu();
         let closed = self.playlist_library.slots.iter().enumerate().filter(|(_, slot)| !slot.open).map(|(index, slot)| {
             M::action(slot.name.clone(), move |this, w, cx| this.switch_playlist_workspace(index, w, cx))
         }).collect();
@@ -2027,8 +2106,9 @@ impl PlayerView {
             M::action("Close playlist", |this, w, cx| this.close_playlist_workspace(w, cx)).enabled(self.playlist_library.can_close()),
             M::action("New playlist…", |this, w, cx| this.show_dialog(super::dialogs::Dialog::NamePlaylist(false), w, cx)),
             M::action("Rename playlist…", |this, w, cx| this.show_dialog(super::dialogs::Dialog::NamePlaylist(true), w, cx)),
+            M::action("Delete playlist…", |this, w, cx| this.show_dialog(super::dialogs::Dialog::DeletePlaylist, w, cx)).icon(Icon::Delete).enabled(self.playlist_library.can_delete()),
             M::action("Auto save playlist", |this, _, cx| this.toggle_playlist_autosave(cx)).checked(self.playlist_library.autosave()).enabled(self.playlist_library.writable),
-            M::action("Save playlist state", |this, _, cx| this.save_playlist_workspace(cx)).enabled(self.playlist_library.writable),
+            M::action("Save playlist state", |this, _, cx| this.save_playlist_workspace(cx)).icon(Icon::Save).enabled(self.playlist_library.writable),
             M::Separator,
             M::action("Add files", |this, w, cx| {
                 this.prompt_playlist_add(false, w, cx);
@@ -2037,42 +2117,46 @@ impl PlayerView {
                 this.prompt_playlist_add(true, w, cx);
             }).icon(Icon::OpenFolder),
             M::action("Export playlist (M3U)", |this, w, cx| this.save_playlist(w, cx)).icon(Icon::Save),
-            M::action("Clear playlist", |this, w, cx| { this.stop(w, cx); this.playlist.clear(); cx.notify(); }).icon(Icon::Clear),
+            M::action("Clear playlist", |this, w, cx| { this.stop(w, cx); this.playlist.clear(); this.playlist_selection.clear(); this.playlist_hovered = None; cx.notify(); }).icon(Icon::Clear),
             M::Separator,
             M::submenu("Thumbnails", modes).enabled(self.settings.timeline_thumbnails),
         ]
     }
 
     fn playlist_item_menu(&self, i: usize) -> Vec<M> {
-        let n = self.playlist.items.len();
+        let Some(item) = self.playlist.items.get(i) else { return Vec::new(); };
+        let item_id = item.id;
+        let ids = if self.playlist_selection.contains(item_id) { self.playlist_selection.ids(&self.playlist.items) } else { vec![item_id] };
+        let count = ids.len();
+        let up = ids.clone();
+        let down = ids.clone();
+        let remove = ids.clone();
         let mut v = vec![
-            M::action("Play", move |this, w, cx| this.play_index(i, w, cx)).icon(Icon::Play),
-            M::action("Move Up", move |this, _, _| {
-                this.playlist.move_item(i, i.saturating_sub(1));
-                this.playlist_selected = Some(i.saturating_sub(1));
-            })
-            .icon(Icon::Up)
-            .enabled(i > 0),
-            M::action("Move Down", move |this, _, _| {
-                this.playlist.move_item(i, (i + 1).min(n - 1));
-                this.playlist_selected = Some((i + 1).min(n - 1));
-            })
-            .icon(Icon::Down)
-            .enabled(i + 1 < n),
-            M::action("Remove", move |this, w, cx| {
-                if this.playlist.current == Some(i) {
-                    this.stop(w, cx);
-                }
-                this.playlist.remove(i);
-            })
-            .icon(Icon::Remove),
+            M::action(if count > 1 { "Play this item" } else { "Play" }, move |this, w, cx| {
+                if let Some(index) = this.playlist.items.iter().position(|it| it.id == item_id) { this.play_index(index, w, cx); }
+            }).icon(Icon::Play),
+            M::action("Move Up", move |this, _, cx| this.move_playlist_items(&up, true, cx)).icon(Icon::Up)
+                .enabled(self.playlist.can_move_selected(&ids, true)),
+            M::action("Move Down", move |this, _, cx| this.move_playlist_items(&down, false, cx)).icon(Icon::Down)
+                .enabled(self.playlist.can_move_selected(&ids, false)),
+            M::action(if count > 1 { format!("Remove {count} items") } else { "Remove".into() }, move |this, w, cx| this.remove_playlist_items(&remove, w, cx)).icon(Icon::Remove),
         ];
-        if let Some(MediaSource::File(p)) = self.playlist.items.get(i).map(|it| it.source.clone()) {
+        let can_generate = self.settings.timeline_thumbnails && self.playlist.items.iter().any(|it| ids.contains(&it.id)
+            && matches!(it.source, MediaSource::File(_)) && (it.video_stream.is_some() || !it.probed || it.duration.is_none()));
+        if count > 1 {
+            let missing = ids.clone();
             v.push(M::Separator);
-            let media_path = p.clone();
+            v.push(M::action("Generate missing thumbnails for selected items", move |this, _, cx| this.generate_playlist_items(Some(&missing), true, cx)).enabled(can_generate));
+            v.push(M::action("Regenerate thumbnails for selected items", move |this, _, cx| this.generate_playlist_items(Some(&ids), false, cx)).enabled(can_generate));
+            return v;
+        }
+        if let MediaSource::File(p) = &item.source {
+            v.push(M::Separator);
+            let p = p.clone();
             v.push(M::action("Show in File Manager", move |_, _, cx| cx.reveal_path(&p)).icon(Icon::OpenFolder));
-            v.push(M::action("Regenerate video thumbnails", move |this, _, cx| this.regenerate_playlist_thumbnails(media_path.clone(), cx))
-                .enabled(self.settings.timeline_thumbnails && self.playlist.items.get(i).is_some_and(|it| it.video_stream.is_some() || !it.probed || it.duration.is_none())));
+            let missing = ids.clone();
+            v.push(M::action("Generate missing thumbnails", move |this, _, cx| this.generate_playlist_items(Some(&missing), true, cx)).enabled(can_generate));
+            v.push(M::action("Regenerate video thumbnails", move |this, _, cx| this.generate_playlist_items(Some(&ids), false, cx)).enabled(can_generate));
             if let Some(key) = self.playlist.items.get(i).and_then(|it| super::playlist_thumbnails::Key::new(it, &self.settings)) {
                 let time = self.playlist_previews.hover.as_ref().filter(|h| h.key == key && self.playlist.items.get(i).is_some_and(|it| it.id == h.id)).and_then(|h| {
                     let time = h.duration * f64::from(h.fraction);

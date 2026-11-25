@@ -26,6 +26,7 @@ pub enum Dialog {
     MediaInfo,
     OpenUrl,
     NamePlaylist(bool),
+    DeletePlaylist,
     OpenDisc,
     JumpTo,
     About,
@@ -1029,6 +1030,13 @@ impl PlayerView {
                     |this, _, w, cx| this.on_input_submit("playlist_name", w, cx), cx).into_any_element();
                 self.modal(if rename { "Rename playlist" } else { "New playlist" }, 380., body, Some(footer), cx)
             }
+            Dialog::DeletePlaylist => {
+                let body = div().p_4().child(format!("Delete the saved playlist ‘{}’? This does not delete any media files.", self.playlist_library.name())).into_any_element();
+                let footer = div().flex().gap_2()
+                    .child(self.text_button("playlist-delete-cancel", "Cancel", false, |this, _, w, cx| this.close_dialog(w, cx), cx))
+                    .child(self.text_button("playlist-delete-confirm", "Delete", true, |this, _, w, cx| this.delete_playlist_workspace(w, cx), cx)).into_any_element();
+                self.modal("Delete playlist", 420., body, Some(footer), cx)
+            }
             Dialog::JumpTo => {
                 let dur = self.player.duration();
                 let body = div()
@@ -1575,14 +1583,6 @@ impl PlayerView {
                         None,
                         s.double_click_fullscreen,
                         |t, _| t.settings.double_click_fullscreen = !t.settings.double_click_fullscreen,
-                        cx,
-                    ))
-                    .child(self.toggle_row(
-                        "pldblclick",
-                        "Double-click to play playlist entries",
-                        Some("A single click then only selects them"),
-                        s.playlist_double_click,
-                        |t, _| t.settings.playlist_double_click = !t.settings.playlist_double_click,
                         cx,
                     ))
                     .child(self.row(
