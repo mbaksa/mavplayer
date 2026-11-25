@@ -2458,6 +2458,17 @@ impl PlayerView {
                     // Clicks, right-clicks and the wheel over the controls
                     // are theirs, not the video's.
                     .occlude()
+                    .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+                        if this.handle_drag_move(ev, window, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                        if this.drag.is_some() {
+                            this.end_drag(window, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(|_, _, cx| cx.stop_propagation())
                     .child(self.control_bar(ot, true, window, cx)),
