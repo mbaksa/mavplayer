@@ -178,6 +178,7 @@ pub struct PlayerView {
     pub seek_hover: Option<f32>,
     pub(super) thumbnails: super::thumbnails::TimelineThumbnails,
     pub(super) playlist_previews: super::playlist_thumbnails::PlaylistPreviews,
+    pub(super) cache_badges: super::cache_badges::CacheBadges,
     pub scrub: Option<Scrub>,
     /// The playlist beside the video in a window (saved in settings).
     pub show_playlist: bool,
@@ -188,6 +189,7 @@ pub struct PlayerView {
     pub in_fullscreen: bool,
     pub playlist_selection: playlist::Selection,
     pub playlist_hovered: Option<u64>,
+    pub playlist_filter_open: bool,
     pub ab_loop: (Option<f64>, Option<f64>),
     pub loop_file: bool,
     /// The playlist item queued in the engine to follow the current one.
@@ -376,6 +378,18 @@ impl PlayerView {
                 if this.update_in(cx, |v, _, cx| v.refresh_playlist_hover(cx)).is_err() && this.upgrade().is_none() { break; }
             }
         }).detach();
+        // Smooth playback position even when no mouse events arrive. Keep the
+        // expensive housekeeping tick separate, and avoid redraws when hidden.
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(33)).await;
+                if this.update_in(cx, |v, window, cx| {
+                    if !v.player.paused() && v.player.with_state(|s| s.status == Status::Playing)
+                        && (!window.is_fullscreen() || v.controls_visible())
+                    { cx.notify(); }
+                }).is_err() && this.upgrade().is_none() { break; }
+            }
+        }).detach();
         // Periodic UI refresh (time display, auto-hide, A-B loop, OSD expiry).
         // Like the wake-ups, it only stops once the view is gone.
         cx.spawn_in(window, async move |this, cx| {
@@ -499,9 +513,11 @@ impl PlayerView {
             seek_hover: None,
             thumbnails: Default::default(),
             playlist_previews: super::playlist_thumbnails::PlaylistPreviews::with_wake(preview_tx),
+            cache_badges: Default::default(),
             scrub: None,
             playlist_selection: Default::default(),
             playlist_hovered: None,
+            playlist_filter_open: false,
             ab_loop: (None, None),
             loop_file: false,
             armed: None,
@@ -637,7 +653,7 @@ impl PlayerView {
             }
         }
         if chrome {
-            self.update_thumbnails();
+            self.update_thumbnails(self.in_fullscreen);
             cx.notify();
         }
     }
@@ -652,6 +668,7 @@ impl PlayerView {
             && let Some(it) = self.playlist.items.get_mut(i)
         {
             it.duration = Some(media.duration).filter(|d| *d > 0.0);
+            it.audio_stream = match st.selected.audio { Some(TrackId::Stream(i)) if media.seekable => Some(i), _ => None };
             it.video_stream = match st.selected.video {
                 Some(TrackId::Stream(i)) if media.seekable && media.tracks.iter().any(|t| t.id == TrackId::Stream(i) && !t.is_cover_art) => Some(i),
                 _ => None,
@@ -729,6 +746,7 @@ impl PlayerView {
 
     /// The queued item took over from the one that just finished.
     fn on_advanced(&mut self, src: MediaSource, window: &mut Window, cx: &mut Context<Self>) {
+        self.thumbnails.waveform.reset();
         let prev = self.playlist.current;
         if let Some(it) = prev.and_then(|i| self.playlist.items.get(i)) {
             self.resume.forget(&it.source.key());
@@ -742,6 +760,7 @@ impl PlayerView {
             let st = self.player.state();
             if let Some(media) = st.media.as_ref() {
                 it.duration = Some(media.duration).filter(|d| *d > 0.0);
+                it.audio_stream = match st.selected.audio { Some(TrackId::Stream(i)) if media.seekable => Some(i), _ => None };
                 it.video_stream = match st.selected.video {
                     Some(TrackId::Stream(i)) if media.seekable && media.tracks.iter().any(|t| t.id == TrackId::Stream(i) && !t.is_cover_art) => Some(i),
                     _ => None,
@@ -775,14 +794,15 @@ impl PlayerView {
     }
 
     pub fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut changed = self.update_thumbnails();
+        let mut changed = self.update_thumbnails(window.is_fullscreen());
         let current = self.player.state();
         let playlist_shown = self.playlist_shown();
+        changed |= self.cache_badges.update(playlist_shown);
         let (playlist_changed, retired) = self.playlist_previews.update(&self.settings, playlist_shown, &self.thumbnails, &current);
         self.retired.extend(retired.into_iter().map(|id| (id, RETIRE_AFTER)));
         changed |= playlist_changed;
         if let Some(message) = self.playlist_previews.take_message() { self.osd(message, cx); }
-        if self.playlist_previews.take_maintenance() { self.thumbnails.refresh_cache_stats(); }
+        if self.playlist_previews.take_maintenance() { self.thumbnails.refresh_cache_stats(); self.cache_badges.invalidate(); }
         if let Some((key, duration)) = self.playlist_previews.take_completed() {
             for (index, it) in self.playlist.items.iter_mut().enumerate() {
                 if matches!(&it.source, MediaSource::File(path) if path == &key.path) {
@@ -795,7 +815,7 @@ impl PlayerView {
             if matches!(&current.source, Some(MediaSource::File(path)) if path == &key.path)
                 && current.selected.video == Some(TrackId::Stream(key.stream)) {
                 self.reset_thumbnails();
-                self.update_thumbnails();
+                self.update_thumbnails(window.is_fullscreen());
             }
             changed = true;
         }
@@ -890,16 +910,18 @@ impl PlayerView {
         }
     }
 
-    fn update_thumbnails(&mut self) -> bool {
+    fn update_thumbnails(&mut self, fullscreen: bool) -> bool {
+        let waveform_changed = self.thumbnails.waveform.update(&self.player, &self.settings, fullscreen);
+        if self.thumbnails.waveform.take_maintenance() { self.thumbnails.refresh_cache_stats(); self.cache_badges.invalidate(); }
         if self.settings.timeline_thumbnails && self.player.with_state(|st| {
             let Some(MediaSource::File(path)) = &st.source else { return false; };
             let stream = match st.selected.video { Some(TrackId::Stream(stream)) => Some(stream), _ => None };
             self.playlist_previews.generating_for(path, stream)
-        }) { return false; }
-        let (changed, retired) = self.thumbnails.update(&self.player, &self.settings);
+        }) { return waveform_changed; }
+        let (changed, retired) = self.thumbnails.update(&self.player, &self.settings, fullscreen);
         self.retired.extend(retired.into_iter().map(|id| (id, RETIRE_AFTER)));
         if let Some((path, generated)) = self.thumbnails.take_completed_path() {
-            if generated { self.playlist_previews.invalidate(&path); }
+            if generated { self.playlist_previews.invalidate(&path); self.cache_badges.invalidate(); }
             let st = self.player.state();
             if let Some(index) = self.playlist.current
                 && let Some(it) = self.playlist.items.get_mut(index)
@@ -909,7 +931,7 @@ impl PlayerView {
                 it.video_stream = Some(stream);
             }
         }
-        changed
+        changed || waveform_changed
     }
 
     pub(super) fn regenerate_playlist_thumbnails(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -940,6 +962,27 @@ impl PlayerView {
             if missing_only { self.playlist_previews.generate_missing(path, selected_stream); }
             else { self.playlist_previews.regenerate(path, selected_stream); }
         }
+        cx.notify();
+    }
+
+    /// Explicit waveform jobs use a separate FIFO and never change playback.
+    pub(super) fn generate_playlist_waveforms(&mut self, ids: Option<&[u64]>, missing_only: bool, cx: &mut Context<Self>) {
+        if !self.settings.timeline_waveform { return; }
+        let jobs: Vec<_> = self.playlist.items.iter().filter(|it| ids.is_none_or(|ids| ids.contains(&it.id)))
+            .filter_map(|it| {
+                let MediaSource::File(path) = &it.source else { return None; };
+                if it.probed && it.duration.is_some() && it.audio_stream.is_none() { return None; }
+                Some((path.clone(), it.audio_stream))
+            }).collect();
+        for (path, stream) in jobs {
+            let stream = self.player.with_state(|st| {
+                if matches!(&st.source, Some(MediaSource::File(p)) if p == &path)
+                    && let Some(TrackId::Stream(i)) = st.selected.audio { return Some(i); }
+                stream
+            });
+            self.thumbnails.waveform.enqueue(path, stream, &self.settings, !missing_only);
+        }
+        self.update_thumbnails(self.in_fullscreen);
         cx.notify();
     }
 
@@ -1237,6 +1280,7 @@ impl PlayerView {
 
     fn start_item_at(&mut self, idx: usize, load: bool, paused: bool, restored_position: Option<Option<f64>>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.playlist.items.get(idx).cloned() else { return };
+        self.thumbnails.waveform.reset();
         self.reset_thumbnails();
         self.save_current_position();
         self.playlist.current = Some(idx);
@@ -1287,6 +1331,7 @@ impl PlayerView {
     pub fn reload_current(&mut self, cx: &mut Context<Self>) {
         let st = self.player.state();
         let Some(src) = st.source else { return };
+        self.thumbnails.waveform.reset();
         self.reset_thumbnails();
         let pos = self.player.position();
         let paused = self.player.paused();
@@ -1426,6 +1471,7 @@ impl PlayerView {
                         if let (Some(it), Some(r)) = (v.playlist.items.iter_mut().find(|i| i.id == id), r) {
                             it.duration = Some(r.duration).filter(|d| *d > 0.0);
                             if it.video_stream.is_none() { it.video_stream = r.video_stream; }
+                            if it.audio_stream.is_none() { it.audio_stream = r.audio_stream; }
                             it.title = it.title.take().or(r.title);
                             it.artist = it.artist.take().or(r.artist);
                         }
@@ -1793,6 +1839,7 @@ impl PlayerView {
         let sub = cx.subscribe_in(&e, window, move |this, _, ev: &InputEvent, window, cx| match ev {
             InputEvent::Submit => this.on_input_submit(key, window, cx),
             InputEvent::Cancel if key == "volume" => this.finish_volume_edit(false, window, cx),
+            InputEvent::Cancel if key == "playlist_filter" => { this.playlist_filter_open = false; window.focus(&this.focus); cx.notify(); },
             InputEvent::Cancel => this.close_dialog(window, cx),
             InputEvent::Changed => this.on_input_changed(key, cx),
         });
@@ -1858,7 +1905,7 @@ impl PlayerView {
     }
 
     pub fn apply_settings(&mut self, cx: &mut Context<Self>) {
-        self.update_thumbnails();
+        self.update_thumbnails(self.in_fullscreen);
         self.player.set_config(self.engine_config());
         icons::set_use_system_theme(self.settings.icon_theme == crate::settings::IconTheme::System);
         self.settings.save();
@@ -1869,6 +1916,10 @@ impl PlayerView {
 
     pub fn select_track(&mut self, kind: TrackKind, id: Option<TrackId>, cx: &mut Context<Self>) {
         self.player.select_track(kind, id);
+        if kind == TrackKind::Audio && let Some(item) = self.playlist.current.and_then(|i| self.playlist.items.get_mut(i)) {
+            item.audio_stream = match id { Some(TrackId::Stream(i)) => Some(i), _ => item.audio_stream };
+            self.cache_badges.invalidate();
+        }
         let label = self.track_label(kind, id);
         let what = match kind {
             TrackKind::Audio => "Audio",
@@ -2205,6 +2256,7 @@ impl PlayerView {
 
     pub fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_playlist_session(true, false);
+        self.thumbnails.waveform.reset();
         self.reset_thumbnails();
         self.save_current_position();
         self.player.stop();

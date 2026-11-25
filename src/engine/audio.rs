@@ -841,7 +841,7 @@ fn fx_chain(fx: &AudioFx, in_channels: i32) -> Vec<String> {
     v
 }
 
-fn layout_string(l: &ff::AVChannelLayout) -> String {
+pub(super) fn layout_string(l: &ff::AVChannelLayout) -> String {
     if l.order == ff::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC || l.nb_channels <= 0 {
         let mut d: ff::AVChannelLayout = unsafe { std::mem::zeroed() };
         unsafe { ff::av_channel_layout_default(&mut d, l.nb_channels.max(1)) };

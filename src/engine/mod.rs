@@ -36,6 +36,7 @@ pub mod thumbnails;
 pub mod types;
 mod upscale;
 mod video;
+pub mod waveform;
 
 pub use types::*;
 

@@ -13,7 +13,7 @@ pub struct Thumbnail {
     pub image: RgbaImage,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThumbnailSpec {
     pub stream: usize,
     pub count: u32,

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const MAGIC: &[u8; 8] = b"MAVTHM03";
 const MAX_BYTES: u64 = 80 * 1024 * 1024;
-static CACHE_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static CACHE_LOCK: Mutex<()> = Mutex::new(());
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -43,9 +43,16 @@ impl Key {
     }
 }
 
+pub struct GenerationControl<'a> {
+    pub stop: &'a AtomicBool,
+    pub generating: &'a AtomicBool,
+    pub progress: &'a GenerationProgress,
+}
+
 /// Blocking operation: call on a dedicated worker. Cache errors do not prevent
 /// playback or extraction. A changed source is never published to the cache.
-pub fn load_or_generate(path: &Path, cfg: &EngineConfig, spec: ThumbnailSpec, directory: &Path, stop: &AtomicBool, force: bool, generating: &AtomicBool, progress: &GenerationProgress) -> anyhow::Result<Vec<Thumbnail>> {
+pub fn load_or_generate(path: &Path, cfg: &EngineConfig, spec: ThumbnailSpec, directory: &Path, force: bool, control: GenerationControl<'_>) -> anyhow::Result<Vec<Thumbnail>> {
+    let GenerationControl { stop, generating, progress } = control;
     spec.validate()?;
     super::cancelled(stop)?;
     let key = Key::new(path, spec).ok();
@@ -106,6 +113,17 @@ pub fn load_cached(path: &Path, spec: ThumbnailSpec, directory: &Path, target: O
         let _ = handle.set_modified(SystemTime::now());
     }
     Ok(result)
+}
+
+/// Check the source identity and index without decoding any JPEGs.
+pub fn cached(path: &Path, spec: ThumbnailSpec, directory: &Path) -> bool {
+    (|| -> anyhow::Result<()> {
+        spec.validate()?;
+        let key = Key::new(path, spec)?;
+        let mut reader = BufReader::new(fs::File::open(key.file(directory)?)?);
+        read_index(&mut reader, &key)?;
+        Ok(())
+    })().is_ok()
 }
 
 fn decode_jpeg(jpeg: Vec<u8>, key: &Key, time: f64) -> anyhow::Result<Thumbnail> {
@@ -275,7 +293,7 @@ pub struct Stats {
 pub fn maintain(policy: &Policy, clear: bool) -> anyhow::Result<Stats> {
     let _guard = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut entries = Vec::new();
-    for (version, magic) in [("v3", MAGIC)] {
+    for (version, magic) in [("v3", MAGIC), ("waveform-v1", crate::engine::waveform::MAGIC)] {
         let dir = policy.directory.join(version);
         match fs::symlink_metadata(&dir) {
             Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
@@ -333,6 +351,7 @@ mod tests {
             let key = Key::new(&source, spec)?;
             let images: Vec<_> = [0., 10., 20.].into_iter().map(|time| Thumbnail { time, image: image::RgbaImage::from_pixel(8, 8, image::Rgba([30, 50, 70, 255])) }).collect();
             save(&key.file(&root)?, &key, &images, &AtomicBool::new(false))?;
+            assert!(cached(&source, spec, &root));
             let representative = load_cached(&source, spec, &root, Some(8.))?;
             assert_eq!(representative.len(), 1);
             assert_eq!(representative[0].time, 10.);
@@ -340,6 +359,7 @@ mod tests {
             assert_eq!(load_cached(&source, spec, &root, Some(19.))?[0].time, 20.);
             assert_eq!(load_cached(&source, spec, &root, None)?.len(), 3);
             fs::write(&source, b"new contents of a different size")?;
+            assert!(!cached(&source, spec, &root));
             assert!(load_cached(&source, spec, &root, None).is_err());
             Ok(())
         })();

@@ -104,10 +104,30 @@ pub enum TimelineVisualization {
     Filmstrip,
     BarcodeAverage,
     BarcodeCompressed,
+    Luma,
+    LumaRange,
+    Saturation,
+    DominantColors,
+    VisualComplexity,
+    FrameDifference,
+    Waveform,
+    FilmstripWaveform,
 }
 
 impl TimelineVisualization {
-    pub const ALL: [Self; 4] = [Self::None, Self::Filmstrip, Self::BarcodeAverage, Self::BarcodeCompressed];
+    pub const ALL: [Self; 12] = [Self::None, Self::Filmstrip, Self::BarcodeAverage, Self::BarcodeCompressed, Self::Luma, Self::LumaRange, Self::Saturation, Self::DominantColors, Self::VisualComplexity, Self::FrameDifference, Self::Waveform, Self::FilmstripWaveform];
+
+    pub fn uses_video(self) -> bool { !matches!(self, Self::None | Self::Waveform) }
+
+    pub fn uses_audio(self) -> bool { matches!(self, Self::Waveform | Self::FilmstripWaveform) }
+
+    pub fn available(self, video: bool, audio: bool) -> Self {
+        match self {
+            Self::FilmstripWaveform => match (video, audio) { (true, true) => self, (true, false) => Self::Filmstrip, (false, true) => Self::Waveform, _ => Self::None },
+            _ if self.uses_video() && !video || self.uses_audio() && !audio => Self::None,
+            _ => self,
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -115,6 +135,14 @@ impl TimelineVisualization {
             Self::Filmstrip => "Filmstrip",
             Self::BarcodeAverage => "Barcode – average color",
             Self::BarcodeCompressed => "Barcode – compressed frames",
+            Self::Luma => "Luma",
+            Self::LumaRange => "Luma range",
+            Self::Saturation => "Saturation",
+            Self::DominantColors => "Barcode – dominant colors",
+            Self::VisualComplexity => "Visual complexity",
+            Self::FrameDifference => "Frame difference",
+            Self::Waveform => "Audio waveform",
+            Self::FilmstripWaveform => "Filmstrip + waveform",
         }
     }
 }
@@ -250,6 +278,10 @@ pub struct Settings {
     pub seek_drag: SeekDragMode,
     pub screenshot_dir: Option<PathBuf>,
     pub timeline_thumbnails: bool,
+    pub timeline_waveform: bool,
+    pub waveform_auto_audio: bool,
+    pub filmstrip_auto_video: bool,
+    pub timeline_hover_playhead: bool,
     pub timeline_filmstrip: bool, // legacy setting, used when the new modes are unset
     pub timeline_windowed_visualization: Option<TimelineVisualization>,
     pub timeline_fullscreen_visualization: Option<TimelineVisualization>,
@@ -356,6 +388,10 @@ impl Default for Settings {
             seek_drag: SeekDragMode::KeepPlaying,
             screenshot_dir: None,
             timeline_thumbnails: true,
+            timeline_waveform: true,
+            waveform_auto_audio: true,
+            filmstrip_auto_video: false,
+            timeline_hover_playhead: true,
             timeline_filmstrip: true,
             timeline_windowed_visualization: None,
             timeline_fullscreen_visualization: None,
@@ -471,6 +507,12 @@ impl Settings {
     pub fn timeline_visualization(&self, fullscreen: bool) -> TimelineVisualization {
         let mode = if fullscreen { self.timeline_fullscreen_visualization.or(self.timeline_windowed_visualization) } else { self.timeline_windowed_visualization };
         mode.unwrap_or(if self.timeline_filmstrip { TimelineVisualization::Filmstrip } else { TimelineVisualization::None })
+    }
+
+    pub fn visualization_enabled(&self, fullscreen: bool) -> bool {
+        let mode = self.timeline_visualization(fullscreen);
+        mode.available(self.timeline_thumbnails, self.timeline_waveform) != TimelineVisualization::None
+            || (mode.uses_video() && self.timeline_waveform && self.waveform_auto_audio)
     }
 
     pub fn set_timeline_visualization(&mut self, fullscreen: bool, mode: TimelineVisualization) {
@@ -753,4 +795,15 @@ mod tests {
         // Chosen after the change: kept.
         assert_eq!(load(r#"{"hwdec":"Auto","config_version":1}"#).hwdec, HwDecode::Auto);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn timeline_visualization_generators_are_independent() {
+    use TimelineVisualization::*;
+    assert_eq!(FilmstripWaveform.available(false, true), Waveform);
+    assert_eq!(FilmstripWaveform.available(true, false), Filmstrip);
+    assert_eq!(FilmstripWaveform.available(false, false), None);
+    assert_eq!(Luma.available(false, true), None);
+    assert_eq!(Waveform.available(false, true), Waveform);
 }

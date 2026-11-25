@@ -1,6 +1,6 @@
 //! Bounded, cache-only playlist previews. Explicit regeneration uses a separate worker.
 use super::thumbnails::{Preview, TimelineThumbnails};
-use crate::engine::{MediaSource, PlaybackState, thumbnails::{GenerationProgress, Thumbnail, ThumbnailSpec, cache::{load_cached, load_or_generate, stream_cached}}};
+use crate::engine::{MediaSource, PlaybackState, thumbnails::{GenerationProgress, Thumbnail, ThumbnailSpec, cache::{GenerationControl, load_cached, load_or_generate, stream_cached}}};
 use crate::playlist::PlaylistItem;
 use crate::settings::{PlaylistThumbnails, Settings};
 use gpui::{Bounds, ImageId, Pixels, Point};
@@ -456,7 +456,7 @@ impl PlaylistPreviews {
                             }
                             let progress = report.as_ref().expect("manual generation progress");
                             progress.set_total(key.count);
-                            let images = load_or_generate(&key.path, &cfg, key.spec(), &key.directory, &stop, true, &AtomicBool::new(false), progress)?;
+                            let images = load_or_generate(&key.path, &cfg, key.spec(), &key.directory, true, GenerationControl { stop: &stop, generating: &AtomicBool::new(false), progress })?;
                             Ok(JobOutput::Media(key, images.into_iter().map(to_bgra).collect(), Some(probe.duration)))
                         }
                     }

@@ -35,6 +35,7 @@ pub struct PlaylistItem {
     pub artist: Option<String>,
     pub duration: Option<f64>,
     pub video_stream: Option<usize>,
+    pub audio_stream: Option<usize>,
     pub probed: bool,
     pub failed: bool,
 }
@@ -156,7 +157,7 @@ impl Playlist {
             .map(|s| {
                 let id = self.next_id;
                 self.next_id += 1;
-                PlaylistItem { id, source: s, title: None, artist: None, duration: None, video_stream: None, probed: false, failed: false }
+                PlaylistItem { id, source: s, title: None, artist: None, duration: None, video_stream: None, audio_stream: None, probed: false, failed: false }
             })
             .collect();
         let n = new.len();
@@ -206,22 +207,29 @@ impl Playlist {
         }
     }
 
-    /// Move selected rows one step without changing their relative order.
+    /// Translate the complete selection without compressing gaps between rows.
     pub fn can_move_selected(&self, ids: &[u64], up: bool) -> bool {
-        self.items.iter().enumerate().any(|(i, item)| ids.contains(&item.id) &&
-            if up { i > 0 && !ids.contains(&self.items[i - 1].id) }
-            else { i + 1 < self.items.len() && !ids.contains(&self.items[i + 1].id) })
+        if up { self.items.iter().position(|it| ids.contains(&it.id)).is_some_and(|i| i > 0) }
+        else { self.items.iter().rposition(|it| ids.contains(&it.id)).is_some_and(|i| i + 1 < self.items.len()) }
     }
 
     pub fn move_selected(&mut self, ids: &[u64], up: bool) {
-        if up {
-            for i in 1..self.items.len() {
-                if ids.contains(&self.items[i].id) && !ids.contains(&self.items[i - 1].id) { self.move_item(i, i - 1); }
-            }
-        } else {
-            for i in (0..self.items.len().saturating_sub(1)).rev() {
-                if ids.contains(&self.items[i].id) && !ids.contains(&self.items[i + 1].id) { self.move_item(i, i + 1); }
-            }
+        self.translate_selected(ids, if up { -1 } else { 1 });
+    }
+
+    fn translate_selected(&mut self, ids: &[u64], delta: isize) {
+        let Some(first) = self.items.iter().position(|it| ids.contains(&it.id)) else { return; };
+        let last = self.items.iter().rposition(|it| ids.contains(&it.id)).unwrap();
+        let delta = delta.clamp(-(first as isize), (self.items.len() - 1 - last) as isize);
+        if delta == 0 { return; }
+        let mut order = vec![None; self.items.len()];
+        for (i, item) in self.items.iter().enumerate() {
+            if ids.contains(&item.id) { order[(i as isize + delta) as usize] = Some(item.id); }
+        }
+        let mut others = self.items.iter().filter(|it| !ids.contains(&it.id)).map(|it| it.id);
+        let order: Vec<_> = order.into_iter().map(|id| id.unwrap_or_else(|| others.next().unwrap())).collect();
+        for (to, id) in order.into_iter().enumerate() {
+            if self.items[to].id != id && let Some(from) = self.items.iter().position(|it| it.id == id) { self.move_item(from, to); }
         }
     }
 
@@ -240,6 +248,14 @@ impl Playlist {
     }
 
     pub fn drop_selected(&mut self, ids: &[u64], at: usize) {
+        if ids.len() > 1 {
+            let Some(first) = self.items.iter().position(|it| ids.contains(&it.id)) else { return; };
+            let last = self.items.iter().rposition(|it| ids.contains(&it.id)).unwrap();
+            let delta = if at < first { at as isize - first as isize }
+                else if at > last + 1 { (at - last - 1) as isize } else { 0 };
+            self.translate_selected(ids, delta);
+            return;
+        }
         let at = at.min(self.items.len());
         let before = self.items[..at].iter().filter(|it| !ids.contains(&it.id)).count();
         let mut order: Vec<_> = self.items.iter().filter(|it| !ids.contains(&it.id)).map(|it| it.id).collect();
@@ -592,6 +608,20 @@ mod tests {
     }
 
     #[test]
+    fn playlist_noncontiguous_selection_preserves_gaps() {
+        let mut p = pl(&["a", "b", "c", "d", "e"]);
+        let ids = [p.items[0].id, p.items[2].id, p.items[3].id];
+        p.current = Some(3);
+        let at = p.group_drop_gap(&ids, ids[2], 4).unwrap();
+        p.drop_selected(&ids, at);
+        assert_eq!(names(&p), ["b", "a", "e", "c", "d"]);
+        assert_eq!(p.current, Some(4));
+        p.move_selected(&ids, true);
+        assert_eq!(names(&p), ["a", "b", "c", "d", "e"]);
+        assert_eq!(p.current, Some(3));
+    }
+
+    #[test]
     fn playlist_group_drop_keeps_relative_order_and_current() {
         let mut p = pl(&["a", "b", "c", "d", "e"]);
         p.set_shuffle(true);
@@ -599,7 +629,7 @@ mod tests {
         let ids = [p.items[1].id, p.items[3].id];
         let play_order: Vec<_> = p.order.iter().map(|&i| p.items[i].id).collect();
         p.drop_selected(&ids, 5);
-        assert_eq!(names(&p), ["a", "c", "e", "b", "d"]);
+        assert_eq!(names(&p), ["a", "c", "b", "e", "d"]);
         assert_eq!(p.current, Some(4));
         assert_eq!(p.order.iter().map(|&i| p.items[i].id).collect::<Vec<_>>(), play_order);
     }

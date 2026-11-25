@@ -204,7 +204,7 @@ impl PlayerView {
                 // Valid values were already applied by on_input_changed.
                 cx.notify();
             }
-            "shortcut_search" => {}
+            "shortcut_search" | "playlist_filter" => {}
             _ => self.close_dialog(window, cx),
         }
     }
@@ -212,6 +212,11 @@ impl PlayerView {
     pub fn on_input_changed(&mut self, key: &'static str, cx: &mut Context<Self>) {
         let text = self.inputs.get(key).map(|i| i.read(cx).text()).unwrap_or_default();
         match key {
+            "playlist_filter" => {
+                self.pl_scroll.0.borrow().base_handle.set_offset(gpui::Point::default());
+                cx.notify();
+                return;
+            }
             "shortcut_search" => {
                 self.modal_scroll.set_offset(gpui::Point::default());
                 cx.notify();
@@ -590,7 +595,7 @@ impl PlayerView {
         let mut options: Vec<_> = TimelineVisualization::ALL.into_iter().map(|m| (m.label().into(), Some(m))).collect();
         if fullscreen { options.insert(0, ("Same as in windowed mode".into(), None)); }
         self.thumbnail_choice(if fullscreen { "thumb-fullscreen-mode" } else { "thumb-windowed-mode" }, "Visualization type", options,
-            if fullscreen { s.timeline_fullscreen_visualization } else { Some(s.timeline_visualization(false)) }, s.timeline_thumbnails,
+            if fullscreen { s.timeline_fullscreen_visualization } else { Some(s.timeline_visualization(false)) }, s.timeline_thumbnails || s.timeline_waveform,
             move |t, mode, _| if fullscreen { t.settings.timeline_fullscreen_visualization = mode; } else if let Some(mode) = mode { t.settings.set_timeline_visualization(false, mode); }, cx)
     }
 
@@ -605,7 +610,7 @@ impl PlayerView {
             (false, false) => Some(s.visualization_opacity(false)),
         };
         self.thumbnail_choice(if height { "thumb-fs-height" } else if fullscreen { "thumb-fs-opacity" } else { "thumb-opacity" }, if height { "Visualization height" } else { "Visualization opacity" }, options, current,
-            s.timeline_thumbnails && s.timeline_visualization(fullscreen) != TimelineVisualization::None,
+            s.visualization_enabled(fullscreen),
             move |t, v, _| match (fullscreen, height) {
                 (true, true) => t.settings.timeline_fullscreen_height = v,
                 (true, false) => t.settings.timeline_fullscreen_opacity = v,
@@ -619,9 +624,9 @@ impl PlayerView {
         let max = s.timeline_filmstrip_height.clamp(12, 96);
         let min = s.timeline_filmstrip_min_height.clamp(12, max);
         let (label, current, enabled) = if minimum {
-            ("Minimum visualization height", min, s.timeline_thumbnails && s.timeline_visualization(false) != TimelineVisualization::None && s.timeline_adaptive)
+            ("Minimum visualization height", min, s.visualization_enabled(false) && s.timeline_adaptive)
         } else {
-            ("Visualization height", max, s.timeline_thumbnails && s.timeline_visualization(false) != TimelineVisualization::None)
+            ("Visualization height", max, s.visualization_enabled(false))
         };
         if !enabled {
             return div().opacity(0.45).child(self.row(label, None, div().child(format!("{current} px")).into_any_element())).into_any_element();
@@ -1642,6 +1647,14 @@ impl PlayerView {
                         "thumb-enabled", "Enable video thumbnails", None, s.timeline_thumbnails,
                         |t, _| t.settings.timeline_thumbnails = !t.settings.timeline_thumbnails, cx,
                     ))
+                    .child(self.toggle_row("waveform-enabled", "Enable audio waveform generation", None, s.timeline_waveform,
+                        |t, _| t.settings.timeline_waveform = !t.settings.timeline_waveform, cx))
+                    .child(self.thumbnail_toggle_row("waveform-auto-audio", "Automatically create waveform of audio files", s.waveform_auto_audio, s.timeline_waveform,
+                        |t, _| t.settings.waveform_auto_audio = !t.settings.waveform_auto_audio, cx))
+                    .child(self.thumbnail_toggle_row("filmstrip-auto-video", "Automatically create filmstrip thumbnails of video files", s.filmstrip_auto_video, s.timeline_thumbnails,
+                        |t, _| t.settings.filmstrip_auto_video = !t.settings.filmstrip_auto_video, cx))
+                    .child(self.toggle_row("timeline-hover-playhead", "Show playhead on timeline hover", None, s.timeline_hover_playhead,
+                        |t, _| t.settings.timeline_hover_playhead = !t.settings.timeline_hover_playhead, cx))
                     .child(self.section("Windowed"))
                     .child(self.thumbnail_toggle_row(
                         "thumb-hover", "Show thumbnail preview on hover", s.timeline_hover_enabled(false), s.timeline_thumbnails,
@@ -1651,7 +1664,7 @@ impl PlayerView {
                     .child(self.visualization_number_row(false, false, cx))
                     .child(self.thumbnail_toggle_row(
                         "thumb-adaptive", "Adapt visualization size to window width", s.timeline_adaptive,
-                        s.timeline_thumbnails && s.timeline_visualization(false) != TimelineVisualization::None,
+                        s.visualization_enabled(false),
                         |t, _| t.settings.timeline_adaptive = !t.settings.timeline_adaptive, cx,
                     ))
                     .child(self.thumbnail_height_row(false, cx))
@@ -1664,7 +1677,7 @@ impl PlayerView {
                     .child(self.section("Playlist and chapters"))
                     .child(self.thumbnail_choice("playlist-thumbnails", "Playlist thumbnails", crate::settings::PlaylistThumbnails::ALL.into_iter().map(|mode| (mode.label().into(), mode)).collect(), s.playlist_thumbnails, s.timeline_thumbnails, |t, v, _| t.settings.playlist_thumbnails = v, cx))
                     .child(self.thumbnail_toggle_row("chapter-thumbnails", "Show thumbnails in chapter list", s.chapter_thumbnails, s.timeline_thumbnails, |t, _| t.settings.chapter_thumbnails = !t.settings.chapter_thumbnails, cx))
-                    .child(self.section("Thumbnail cache"))
+                    .child(self.section("Visualization cache"))
                     .child(self.row(
                         "Cache directory",
                         Some(&s.thumbnail_cache_dir().display().to_string()),

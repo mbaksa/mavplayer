@@ -3,6 +3,7 @@
 pub mod actions;
 mod activity;
 mod barcode;
+mod cache_badges;
 pub mod bar;
 pub mod dialogs;
 pub mod keymap;
@@ -18,4 +19,5 @@ pub mod text_input;
 pub mod theme;
 mod thumbnails;
 pub mod tray;
+mod waveform;
 pub mod widgets;

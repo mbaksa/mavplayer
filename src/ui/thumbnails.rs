@@ -1,6 +1,6 @@
 //! Shared timeline previews, backed by a cancellable local-file worker.
 
-use crate::engine::thumbnails::{GenerationProgress, Thumbnail, ThumbnailSpec, cache::{Policy, Stats, load_or_generate, maintain}};
+use crate::engine::thumbnails::{GenerationProgress, Thumbnail, ThumbnailSpec, cache::{GenerationControl, Policy, Stats, load_or_generate, load_cached, maintain}};
 use crate::engine::{MediaSource, PlaybackState, Player, Status, TrackId};
 use crate::settings::{Settings, TimelineVisualization};
 use gpui::{AnyElement, Bounds, ContentMask, Corners, Hsla, ImageId, RenderImage, canvas, div, point, prelude::*, px, relative, size};
@@ -20,7 +20,7 @@ struct Request {
 impl Request {
     fn from_state(st: &PlaybackState, settings: &Settings) -> Option<Self> {
         if !settings.timeline_thumbnails || (settings.playlist_thumbnails == crate::settings::PlaylistThumbnails::None && !settings.chapter_thumbnails && ![false, true].into_iter().any(|fullscreen| {
-            settings.timeline_visualization(fullscreen) != TimelineVisualization::None || settings.timeline_hover_enabled(fullscreen)
+            settings.timeline_visualization(fullscreen).uses_video() || settings.timeline_hover_enabled(fullscreen)
         })) {
             return None;
         }
@@ -60,7 +60,6 @@ impl Drop for Worker {
 
 struct WorkerImages {
     thumbnails: Vec<Thumbnail>,
-    barcodes: [image::RgbaImage; 2],
     generated: bool,
 }
 
@@ -94,11 +93,14 @@ impl Preview {
 
 #[derive(Default)]
 pub(super) struct TimelineThumbnails {
+    pub(super) waveform: super::waveform::Waveform,
     request: Option<Request>,
     worker: Option<Worker>,
     attempted: bool,
     previews: Vec<Preview>,
-    barcodes: Option<[Arc<RenderImage>; 2]>,
+    samples: Option<Arc<Vec<Thumbnail>>>,
+    barcodes: Vec<(TimelineVisualization, Arc<RenderImage>)>,
+    barcode_worker: Option<(TimelineVisualization, Receiver<image::RgbaImage>)>,
     policy: Option<Policy>,
     maintenance: Option<Receiver<anyhow::Result<Stats>>>,
     maintenance_pending: bool,
@@ -121,9 +123,9 @@ impl TimelineThumbnails {
 
     fn take_images(&mut self) -> Vec<ImageId> {
         let mut retired: Vec<_> = self.previews.drain(..).map(|p| p.image.id).collect();
-        if let Some(barcodes) = self.barcodes.take() {
-            retired.extend(barcodes.into_iter().map(|image| image.id));
-        }
+        self.samples = None;
+        self.barcode_worker = None;
+        retired.extend(self.barcodes.drain(..).map(|(_, image)| image.id));
         retired
     }
 
@@ -144,7 +146,7 @@ impl TimelineThumbnails {
     }
 
     /// Called from the existing UI tick and engine events. Never blocks on extraction.
-    pub(super) fn update(&mut self, player: &Player, settings: &Settings) -> (bool, Vec<ImageId>) {
+    pub(super) fn update(&mut self, player: &Player, settings: &Settings, fullscreen: bool) -> (bool, Vec<ImageId>) {
         let mut changed = self.update_cache(settings);
         let request = player.with_state(|st| Request::from_state(st, settings));
         let request_changed = self.request != request;
@@ -166,16 +168,16 @@ impl TimelineThumbnails {
                 match result {
                     Ok(images) => {
                         retired.extend(self.take_images());
-                        self.barcodes = Some(images.barcodes.map(|image| Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(image)]))));
-                        self.previews = images.thumbnails.into_iter().map(|t| {
+                        self.previews = images.thumbnails.iter().map(|t| {
                             let (width, height) = t.image.dimensions();
                             Preview {
                                 time: t.time,
-                                image: Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(t.image)])),
+                                image: Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(t.image.clone())])),
                                 width,
                                 height,
                             }
                         }).collect();
+                        self.samples = Some(Arc::new(images.thumbnails));
                         self.maintenance_pending = true;
                         self.completed_path = self.request.as_ref().map(|r| (r.path.clone(), images.generated));
                     }
@@ -197,11 +199,15 @@ impl TimelineThumbnails {
             let generation_flag = generating.clone();
             let progress = Arc::new(GenerationProgress::new(request.count));
             let generation_progress = progress.clone();
-            let duration = player.with_state(|st| st.media.as_ref().map_or(0.0, |m| m.duration));
             let (tx, result) = std::sync::mpsc::channel();
+            let auto_generate = settings.filmstrip_auto_video;
             match std::thread::Builder::new().name("timeline-thumbnails".into()).spawn(move || {
                 let spec = ThumbnailSpec { stream: request.stream, count: request.count, width: 240, height: 135 };
-                let thumbnails = load_or_generate(&request.path, &config, spec, &request.directory, &stop, false, &generation_flag, &generation_progress).map(|mut thumbnails| {
+                let thumbnails = if auto_generate {
+                    load_or_generate(&request.path, &config, spec, &request.directory, false, GenerationControl { stop: &stop, generating: &generation_flag, progress: &generation_progress })
+                } else {
+                    load_cached(&request.path, spec, &request.directory, None)
+                }.map(|mut thumbnails| {
                     // Extracted and cached images are RGBA; GPUI's RenderImage expects BGRA.
                     for thumbnail in &mut thumbnails {
                         let pixels: &mut [u8] = thumbnail.image.as_mut();
@@ -209,8 +215,7 @@ impl TimelineThumbnails {
                             pixel.swap(0, 2);
                         }
                     }
-                    let barcodes = super::barcode::build(&thumbnails, duration);
-                    WorkerImages { thumbnails, barcodes, generated: generation_flag.load(Ordering::Relaxed) }
+                    WorkerImages { thumbnails, generated: generation_flag.load(Ordering::Relaxed) }
                 });
                 let _ = tx.send(thumbnails);
             }) {
@@ -218,7 +223,38 @@ impl TimelineThumbnails {
                 Err(err) => { log::debug!("could not start thumbnail worker: {err}"); },
             }
         }
+        let duration = player.with_state(|st| st.media.as_ref().map_or(0.0, |m| m.duration));
+        changed |= self.update_barcodes(settings, duration, fullscreen);
         (changed || self.generating(), retired)
+    }
+
+    fn update_barcodes(&mut self, settings: &Settings, duration: f64, fullscreen: bool) -> bool {
+        let mut changed = false;
+        if let Some((mode, receiver)) = &self.barcode_worker {
+            match receiver.try_recv() {
+                Ok(image) => {
+                    self.barcodes.push((*mode, Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(image)]))));
+                    self.barcode_worker = None;
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => { self.barcode_worker = None; }
+            }
+        }
+        // Analyze only the currently selected visualization, not the hidden
+        // windowed/fullscreen preference. Never redo an analysis during playback.
+        let mode = settings.timeline_visualization(fullscreen);
+        if let Some(samples) = &self.samples
+            && !matches!(mode, TimelineVisualization::None | TimelineVisualization::Filmstrip | TimelineVisualization::Waveform | TimelineVisualization::FilmstripWaveform)
+            && !self.barcodes.iter().any(|(existing, _)| *existing == mode)
+        {
+            let samples = samples.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            if std::thread::Builder::new().name("timeline-barcode".into()).spawn(move || {
+                let _ = tx.send(super::barcode::build(mode, &samples, duration));
+            }).is_ok() { self.barcode_worker = Some((mode, rx)); }
+        }
+        changed
     }
 
     fn update_cache(&mut self, settings: &Settings) -> bool {
@@ -270,6 +306,7 @@ impl TimelineThumbnails {
     pub(super) fn refresh_cache_stats(&mut self) { self.maintenance_pending = true; }
 
     pub(super) fn clear_cache(&mut self, settings: &Settings) {
+        self.waveform.clear_pending();
         self.clear_pending = Some(Policy { directory: settings.thumbnail_cache_dir(), days: settings.thumbnail_cache_days, mb: settings.thumbnail_cache_mb });
         // Keep already loaded images; prevent an in-flight extraction from
         // writing the entry back after the user clears the cache.
@@ -291,24 +328,34 @@ impl TimelineThumbnails {
         }
     }
 
+    pub(super) fn available_visualization(&self, st: &PlaybackState, settings: &Settings, fullscreen: bool) -> TimelineVisualization {
+        let mode = settings.timeline_visualization(fullscreen);
+        let video = settings.timeline_thumbnails && !self.previews.is_empty() && self.request == Request::from_state(st, settings)
+            && (matches!(mode, TimelineVisualization::Filmstrip | TimelineVisualization::FilmstripWaveform) || self.barcodes.iter().any(|(m, _)| *m == mode));
+        let audio = self.waveform.ready(st, settings);
+        if mode.uses_video() && !video && audio && settings.waveform_auto_audio && st.media.as_ref().is_some_and(|m| !m.has_video()) {
+            TimelineVisualization::Waveform
+        } else { mode.available(video, audio) }
+    }
+
     pub(super) fn has_previews(&self, st: &PlaybackState, settings: &Settings, fullscreen: bool) -> bool {
-        settings.timeline_thumbnails && settings.timeline_visualization(fullscreen) != TimelineVisualization::None
-            && !self.previews.is_empty() && self.request == Request::from_state(st, settings)
+        self.available_visualization(st, settings, fullscreen) != TimelineVisualization::None
     }
 
     pub(super) fn visualization(&self, mode: TimelineVisualization, duration: f64, height: f32, opacity: f32) -> AnyElement {
         let element = match mode {
             TimelineVisualization::Filmstrip => self.filmstrip(duration, height),
-            TimelineVisualization::BarcodeAverage | TimelineVisualization::BarcodeCompressed => {
-                let index = usize::from(mode == TimelineVisualization::BarcodeCompressed);
-                let image = self.barcodes.as_ref().map(|images| images[index].clone());
+            TimelineVisualization::Waveform => self.waveform.element(height, 0.0),
+            TimelineVisualization::FilmstripWaveform => div().absolute().size_full().child(self.filmstrip(duration, height * 0.6)).child(self.waveform.element(height * 0.4, height * 0.6)).into_any_element(),
+            TimelineVisualization::None => div().into_any_element(),
+            _ => {
+                let image = self.barcodes.iter().find(|(m, _)| *m == mode).map(|(_, image)| image.clone());
                 canvas(|_, _, _| (), move |bounds, _, window, _| {
                     if let Some(image) = &image {
                         let _ = window.paint_image(bounds, Corners::default(), image.clone(), 0, false);
                     }
                 }).absolute().top_0().left_0().w_full().h(px(height)).into_any_element()
             }
-            TimelineVisualization::None => div().into_any_element(),
         };
         div().absolute().top_0().left_0().w_full().h(px(height)).opacity(opacity).child(element).into_any_element()
     }
