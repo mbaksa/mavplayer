@@ -1233,8 +1233,8 @@ impl PlayerView {
             .when(seekable, |d| d.cursor_pointer())
             .child(canvas(move |b, _, _| b1.set(b), |_, _, _, _| {}).absolute().size_full())
             .when(filmstrip, |d| d.child(self.thumbnails.visualization(mode, dur, height, self.settings.visualization_opacity(window.is_fullscreen()) as f32 / 100.0)))
-            .when(seekable && self.settings.timeline_hover_playhead, |d| d.when_some(self.seek_hover, |d, f| d.child(
-                div().absolute().left(relative(f)).top_0().bottom_0().w(px(1.))
+            .when(filmstrip && self.settings.timeline_hover_playhead, |d| d.when_some(self.seek_hover, |d, f| d.child(
+                div().absolute().left(relative(f)).top_0().h(px(height)).w(px(1.))
                     .bg(rgba(0xffffffcc)).shadow_sm()
             )))
             .child(
@@ -1907,6 +1907,9 @@ impl PlayerView {
                             })
                         } else { None };
                         let hovered = this.playlist_hovered == Some(item_id) && this.menu.is_none() && !dragging;
+                        let hover_playhead = this.playlist_previews.hover.as_ref()
+                            .filter(|h| hovered && mode != PlaylistThumbnails::None && this.dialog.is_none() && h.id == item_id)
+                            .map(|h| h.fraction);
                         let playing = is_cur && this.player.is_active() && !this.player.paused()
                             && this.player.with_state(|s| s.status != Status::Ended);
                         let play = (hovered || is_cur).then(|| this.icon_button(("pl-play", item_id),
@@ -2009,6 +2012,10 @@ impl PlayerView {
                                     this.remove_playlist_items(&[item_id], w, cx);
                                 }, cx).size(px(22.)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             )))
+                            .when_some(hover_playhead, |d, f| d.child(
+                                div().absolute().left(relative(f)).top_0().bottom_0().w(px(1.))
+                                    .bg(rgba(0x409cffff)).shadow_sm()
+                            ))
                             .when(dragging && drop_at == Some(i), |d| d.child(marker(true)))
                             .when(dragging && i + 1 == count && drop_at == Some(count), |d| d.child(marker(false)))
                             .when(!filter_active, |d| d.on_drag(drag_value, move |d, _, _, cx| {

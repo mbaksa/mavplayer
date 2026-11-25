@@ -1434,7 +1434,6 @@ impl PlayerView {
                 i.probed = true;
                 (i.id, i.source.clone())
             })
-            .take(2000)
             .collect();
         if todo.is_empty() {
             return;
@@ -1474,6 +1473,13 @@ impl PlayerView {
                             if it.audio_stream.is_none() { it.audio_stream = r.audio_stream; }
                             it.title = it.title.take().or(r.title);
                             it.artist = it.artist.take().or(r.artist);
+                            if v.settings.timeline_thumbnails && v.settings.filmstrip_auto_video
+                                && let MediaSource::File(path) = &it.source
+                                && let Some(stream) = it.video_stream
+                                && it.duration.is_some_and(|d| d.is_finite() && d > 0.0)
+                            {
+                                v.playlist_previews.generate_missing(path.clone(), Some(stream));
+                            }
                         }
                     }
                     cx.notify();

@@ -424,7 +424,7 @@ impl PlaylistPreviews {
             }
             changed = true;
         }
-        // Only explicit generation requests enter this queue. Hover has its own worker.
+        // Explicit and automatic generation requests share this queue. Hover has its own worker.
         let kind = if let Some((path, stream)) = self.manual.front() {
             if timeline.busy_for(path, *stream) { None }
             else { self.manual.pop_front().map(|(path, stream)| JobKind::Generate(path, stream)) }
