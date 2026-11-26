@@ -4,7 +4,7 @@ use crate::engine::thumbnails::{GenerationProgress, Thumbnail, ThumbnailSpec, ca
 use crate::engine::{MediaSource, PlaybackState, Player, Status, TrackId};
 use crate::settings::{Settings, TimelineVisualization};
 use gpui::{AnyElement, Bounds, ContentMask, Corners, Hsla, ImageId, RenderImage, canvas, div, point, prelude::*, px, relative, size};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
@@ -121,6 +121,9 @@ pub(super) struct TimelineThumbnails {
     barcode_display: Rc<RefCell<BarcodeDisplay>>,
     barcode_worker: Option<(TimelineVisualization, Arc<AtomicBool>, Receiver<image::RgbaImage>)>,
     barcode_fingerprint: Arc<OnceLock<u64>>,
+    barcode_failed: Vec<TimelineVisualization>,
+    barcode_requested: Option<TimelineVisualization>,
+    displayed: [Cell<Option<TimelineVisualization>>; 2],
     policy: Option<Policy>,
     maintenance: Option<Receiver<anyhow::Result<Stats>>>,
     maintenance_pending: bool,
@@ -128,6 +131,10 @@ pub(super) struct TimelineThumbnails {
     maintenance_error: bool,
     stats: Option<Stats>,
     completed_path: Option<(PathBuf, bool)>,
+}
+
+fn display_during_transition(available: TimelineVisualization, previous: TimelineVisualization, pending: bool) -> TimelineVisualization {
+    if pending && previous != TimelineVisualization::None { previous } else { available }
 }
 
 impl TimelineThumbnails {
@@ -139,6 +146,7 @@ impl TimelineThumbnails {
         // queue cannot start a second extractor for the same file and stream.
         self.request = None;
         self.attempted = false;
+        for mode in &self.displayed { mode.set(None); }
         self.take_images()
     }
 
@@ -150,6 +158,8 @@ impl TimelineThumbnails {
         if let Some((_, stop, _)) = self.barcode_worker.take() { stop.store(true, Ordering::Relaxed); }
         self.barcode_fingerprint = Arc::default();
         self.barcodes.clear();
+        self.barcode_failed.clear();
+        self.barcode_requested = None;
         self.barcode_display.borrow_mut().invalidate();
         retired.extend(self.take_retired_barcode_images());
         retired
@@ -178,7 +188,18 @@ impl TimelineThumbnails {
         let request_changed = self.request != request;
         changed |= request_changed;
         let mut retired = if request_changed {
+            // Selecting a video visualization can start a new thumbnail request
+            // while the current audio waveform is already visible and valid.
+            let keep_waveform = player.with_state(|st| self.waveform.ready(st, settings));
+            let previous = self.displayed.each_ref().map(|mode| mode.get());
             let retired = self.reset();
+            if keep_waveform {
+                for (slot, old) in self.displayed.iter().zip(previous) {
+                    if old.is_some_and(TimelineVisualization::uses_audio) {
+                        slot.set(Some(TimelineVisualization::Waveform));
+                    }
+                }
+            }
             self.request = request;
             retired
         } else {
@@ -255,7 +276,7 @@ impl TimelineThumbnails {
                 let _ = tx.send(thumbnails);
             }) {
                 Ok(_) => self.worker = Some(Worker { request: worker_request, cancel, generating, progress, result }),
-                Err(err) => { log::debug!("could not start thumbnail worker: {err}"); },
+                Err(err) => { log::debug!("could not start thumbnail worker: {err}"); changed = true; },
             }
         }
         let duration = player.with_state(|st| st.media.as_ref().map_or(0.0, |m| m.duration));
@@ -265,6 +286,11 @@ impl TimelineThumbnails {
 
     fn update_barcodes(&mut self, settings: &Settings, duration: f64, fullscreen: bool) -> bool {
         let mut changed = false;
+        let mode = settings.timeline_visualization(fullscreen);
+        if self.barcode_requested != Some(mode) {
+            self.barcode_requested = Some(mode);
+            self.barcode_failed.retain(|m| *m != mode);
+        }
         if let Some((mode, _, receiver)) = &self.barcode_worker {
             match receiver.try_recv() {
                 Ok(image) => {
@@ -274,13 +300,18 @@ impl TimelineThumbnails {
                     changed = true;
                 }
                 Err(TryRecvError::Empty) => return false,
-                Err(TryRecvError::Disconnected) => { self.barcode_worker = None; }
+                Err(TryRecvError::Disconnected) => {
+                    self.barcode_failed.push(*mode);
+                    self.barcode_worker = None;
+                    changed = true;
+                }
             }
         }
         // Analyze only the currently selected visualization, not the hidden
         // windowed/fullscreen preference. Never redo an analysis during playback.
-        let mode = settings.timeline_visualization(fullscreen);
         if let Some(samples) = &self.samples
+            && !samples.is_empty()
+            && !self.barcode_failed.contains(&mode)
             && !matches!(mode, TimelineVisualization::None | TimelineVisualization::Filmstrip | TimelineVisualization::Waveform | TimelineVisualization::FilmstripWaveform)
             && !self.barcodes.iter().any(|(existing, _)| *existing == mode)
         {
@@ -304,6 +335,7 @@ impl TimelineThumbnails {
                 });
                 let _ = tx.send(image);
             }).is_ok() { self.barcode_worker = Some((mode, stop, rx)); }
+            else { self.barcode_failed.push(mode); changed = true; }
         }
         changed
     }
@@ -382,12 +414,36 @@ impl TimelineThumbnails {
 
     pub(super) fn available_visualization(&self, st: &PlaybackState, settings: &Settings, fullscreen: bool) -> TimelineVisualization {
         let mode = settings.timeline_visualization(fullscreen);
-        let video = settings.timeline_thumbnails && !self.previews.is_empty() && self.request == Request::from_state(st, settings)
-            && (matches!(mode, TimelineVisualization::Filmstrip | TimelineVisualization::FilmstripWaveform) || self.barcodes.iter().any(|(m, _)| *m == mode));
+        let displayed = &self.displayed[usize::from(fullscreen)];
+        if mode == TimelineVisualization::None {
+            displayed.set(None);
+            return mode;
+        }
+        let request = Request::from_state(st, settings);
+        let samples_ready = request.is_some() && self.request == request && !self.previews.is_empty();
+        let video_ready = |mode| samples_ready
+            && (matches!(mode, TimelineVisualization::Filmstrip | TimelineVisualization::FilmstripWaveform)
+                || self.barcodes.iter().any(|(m, _)| *m == mode));
         let audio = self.waveform.ready(st, settings);
-        if mode.uses_video() && !video && audio && settings.waveform_auto_audio && st.media.as_ref().is_some_and(|m| !m.has_video()) {
+        let video = video_ready(mode);
+        let available = if mode.uses_video() && !video && audio && settings.waveform_auto_audio && st.media.as_ref().is_some_and(|m| !m.has_video()) {
             TimelineVisualization::Waveform
-        } else { mode.available(video, audio) }
+        } else { mode.available(video, audio) };
+        let video_pending = mode.uses_video() && !video && request.as_ref().is_some_and(|request| {
+            if samples_ready {
+                !self.barcode_failed.contains(&mode)
+            } else {
+                self.request.as_ref() != Some(request) || !self.attempted
+                    || self.worker.as_ref().is_some_and(|w| &w.request == request && !w.cancel.load(Ordering::Relaxed))
+            }
+        });
+        let audio_pending = mode.uses_audio() && !audio && self.waveform.pending(st, settings, fullscreen);
+        // Keep the last usable visualization while the new one is being loaded.
+        // Revalidate its data against the current media and enabled settings.
+        let previous = displayed.get().map_or(TimelineVisualization::None, |old| old.available(video_ready(old), audio));
+        let visible = display_during_transition(available, previous, video_pending || audio_pending);
+        displayed.set((visible != TimelineVisualization::None).then_some(visible));
+        visible
     }
 
     pub(super) fn has_previews(&self, st: &PlaybackState, settings: &Settings, fullscreen: bool) -> bool {
@@ -557,6 +613,40 @@ pub(super) fn hover_preview(fraction: f32, preview: &Preview, background: Hsla, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visualization_transition_keeps_previous_until_ready_or_failed() {
+        use TimelineVisualization::{BarcodeAverage, Filmstrip, FilmstripWaveform, None};
+        assert_eq!(display_during_transition(None, Filmstrip, true), Filmstrip);
+        assert_eq!(display_during_transition(BarcodeAverage, Filmstrip, false), BarcodeAverage);
+        assert_eq!(display_during_transition(None, Filmstrip, false), None);
+        assert_eq!(display_during_transition(None, None, true), None);
+        assert_eq!(display_during_transition(Filmstrip, BarcodeAverage, true), BarcodeAverage);
+        assert_eq!(display_during_transition(FilmstripWaveform, BarcodeAverage, false), FilmstripWaveform);
+    }
+
+    #[test]
+    fn disconnected_barcode_worker_is_not_retried_until_reselection() {
+        let mode = TimelineVisualization::BarcodeAverage;
+        let mut settings = Settings::default();
+        settings.set_timeline_visualization(false, mode);
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        let mut timeline = TimelineThumbnails {
+            barcode_worker: Some((mode, Arc::new(AtomicBool::new(false)), rx)),
+            barcode_requested: Some(mode),
+            ..Default::default()
+        };
+        assert!(timeline.update_barcodes(&settings, 10.0, false));
+        assert!(timeline.barcode_failed.contains(&mode));
+        assert!(!timeline.update_barcodes(&settings, 10.0, false));
+        assert!(timeline.barcode_failed.contains(&mode));
+        settings.set_timeline_visualization(false, TimelineVisualization::Filmstrip);
+        timeline.update_barcodes(&settings, 10.0, false);
+        settings.set_timeline_visualization(false, mode);
+        timeline.update_barcodes(&settings, 10.0, false);
+        assert!(!timeline.barcode_failed.contains(&mode));
+    }
 
     #[test]
     fn cancelling_timeline_worker_keeps_its_media_reserved() {

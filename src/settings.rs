@@ -115,8 +115,6 @@ pub enum TimelineVisualization {
 }
 
 impl TimelineVisualization {
-    pub const ALL: [Self; 12] = [Self::None, Self::Filmstrip, Self::BarcodeAverage, Self::BarcodeCompressed, Self::Luma, Self::LumaRange, Self::Saturation, Self::DominantColors, Self::VisualComplexity, Self::FrameDifference, Self::Waveform, Self::FilmstripWaveform];
-
     pub fn uses_video(self) -> bool { !matches!(self, Self::None | Self::Waveform) }
 
     pub fn uses_audio(self) -> bool { matches!(self, Self::Waveform | Self::FilmstripWaveform) }
@@ -148,14 +146,15 @@ impl TimelineVisualization {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PlaylistThumbnails { None, Hover, Inline, InlineSide }
+pub enum PlaylistThumbnails { None, Hover, Inline, InlineSide, StaticInline }
 
 impl PlaylistThumbnails {
-    pub const ALL: [Self; 4] = [Self::None, Self::Inline, Self::InlineSide, Self::Hover];
+    pub const ALL: [Self; 5] = [Self::None, Self::StaticInline, Self::Inline, Self::InlineSide, Self::Hover];
     pub fn label(self) -> &'static str {
-        match self { Self::None => "None", Self::Inline => "Inline preview", Self::InlineSide => "Inline + side preview", Self::Hover => "Side preview on hover" }
+        match self { Self::None => "None", Self::StaticInline => "Inline", Self::Inline => "Inline preview", Self::InlineSide => "Inline + side preview", Self::Hover => "Side preview on hover" }
     }
-    pub fn inline(self) -> bool { matches!(self, Self::Inline | Self::InlineSide) }
+    pub fn inline(self) -> bool { matches!(self, Self::Inline | Self::InlineSide | Self::StaticInline) }
+    pub fn scrubbing(self) -> bool { matches!(self, Self::Hover | Self::Inline | Self::InlineSide) }
     pub fn side(self) -> bool { matches!(self, Self::Hover | Self::InlineSide) }
 }
 
@@ -246,6 +245,7 @@ pub struct Settings {
     pub scroll_action: ScrollAction,
     pub show_playlist: bool,
     pub playlist_width: f32,
+    pub playlist_autohide: bool,
     /// Going fullscreen starts with the playlist hidden, whatever the window
     /// showed (it can still be opened there; leaving restores the window's).
     pub hide_playlist_in_fullscreen: bool,
@@ -280,7 +280,9 @@ pub struct Settings {
     pub timeline_thumbnails: bool,
     pub timeline_waveform: bool,
     pub waveform_auto_audio: bool,
+    pub waveform_auto_video: bool,
     pub filmstrip_auto_video: bool,
+    pub playlist_thumbnail_auto_video: bool,
     pub timeline_hover_playhead: bool,
     pub timeline_filmstrip: bool, // legacy setting, used when the new modes are unset
     pub timeline_windowed_visualization: Option<TimelineVisualization>,
@@ -369,6 +371,7 @@ impl Default for Settings {
             scroll_action: ScrollAction::Volume,
             show_playlist: false,
             playlist_width: 320.,
+            playlist_autohide: false,
             hide_playlist_in_fullscreen: true,
             key_bindings: BTreeMap::new(),
             bar_controls: BarControl::ALL.to_vec(),
@@ -390,7 +393,9 @@ impl Default for Settings {
             timeline_thumbnails: true,
             timeline_waveform: true,
             waveform_auto_audio: true,
+            waveform_auto_video: false,
             filmstrip_auto_video: false,
+            playlist_thumbnail_auto_video: true,
             timeline_hover_playhead: true,
             timeline_filmstrip: true,
             timeline_windowed_visualization: None,
@@ -688,6 +693,7 @@ mod tests {
         assert_eq!(settings.playlist_thumbnails, PlaylistThumbnails::InlineSide);
         assert!(PlaylistThumbnails::InlineSide.inline() && PlaylistThumbnails::InlineSide.side());
         assert!(PlaylistThumbnails::Inline.inline() && !PlaylistThumbnails::Inline.side());
+        assert!(PlaylistThumbnails::StaticInline.inline() && !PlaylistThumbnails::StaticInline.scrubbing());
         assert!(PlaylistThumbnails::Hover.side() && !PlaylistThumbnails::Hover.inline());
         settings.playlist_width = 425.;
         settings.playlist_thumbnail_times.insert("0:example.mp4".into(), 25.);

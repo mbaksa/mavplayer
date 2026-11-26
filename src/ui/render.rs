@@ -296,11 +296,12 @@ impl PlayerView {
     }
 
     pub(super) fn end_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.timeline_edge_drag = false;
         if let Some(d) = self.drag.take() {
             if let Some(r) = d.on_release {
                 r(self, d.last, window, cx);
             }
-            if self.menu.as_ref().is_some_and(|m| m.timeline_settings) { self.settings.save(); }
+            if self.menu.as_ref().is_some_and(|m| m.timeline_settings) || matches!(self.dialog, Some(super::dialogs::Dialog::Settings(1))) { self.settings.save(); }
             cx.notify();
         }
     }
@@ -594,6 +595,8 @@ impl PlayerView {
             .when(active && !show_controls && self.menu.is_none(), |d| d.cursor(CursorStyle::None))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 this.note_activity(cx);
+                this.playlist_previews.pointer = Some(ev.position);
+                this.update_playlist_autohide(window, cx);
                 if this.settings.drag_video_to_move_window
                     && let Some(start) = this.window_move_origin
                 {
@@ -1229,7 +1232,7 @@ impl PlayerView {
         });
         let height = super::thumbnails::filmstrip_height(&self.settings, window, cx);
         let extra = if filmstrip { height + 2.0 } else { 0.0 };
-        let resizing = self.drag.is_some() && self.menu.as_ref().is_some_and(|m| m.timeline_settings);
+        let resizing = self.drag.is_some() && (self.timeline_edge_drag || matches!(self.dialog, Some(super::dialogs::Dialog::Settings(1))) || self.menu.as_ref().is_some_and(|m| m.timeline_settings));
         div()
             .id("seek")
             .group("seek")
@@ -1298,14 +1301,15 @@ impl PlayerView {
                     this.seek_hover = None;
                     this.playlist_previews.hover = None;
                     window.focus(&this.focus);
-                    this.control_bounds.set(Bounds::default());
-                    this.open_menu(Vec::new(), point(ev.position.x, b4.get().top()), None, cx);
+                    let bar = this.control_bounds.get();
+                    let top = if bar.size.height > px(0.) { bar.top() } else { b4.get().top() };
+                    this.open_menu(Vec::new(), point(ev.position.x, top), None, cx);
                     if let Some(menu) = this.menu.as_mut() { menu.timeline_settings = true; }
                 }
                 cx.stop_propagation();
             }))
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
-                if this.scrub.is_some() {
+                if this.scrub.is_some() || this.timeline_edge_drag {
                     return; // the drag keeps the label under the pointer
                 }
                 let f = frac_in(b2.get(), ev.position, false);
@@ -1324,6 +1328,7 @@ impl PlayerView {
                 d.on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        window.focus(&this.focus);
                         let f = frac_in(b3.get(), ev.position, false);
                         this.scrub_start(f, cx);
                         let on_change: SliderFn = Rc::new(|this, f, _, cx| this.scrub_move(f, cx));
@@ -1335,7 +1340,6 @@ impl PlayerView {
                             on_release: Some(on_release),
                             last: f,
                         });
-                        let _ = window;
                         cx.stop_propagation();
                     }),
                 )
@@ -1586,7 +1590,7 @@ impl PlayerView {
                         |this, _, w, cx| this.toggle_playlist(w, cx),
                         cx,
                     )
-                    .when(self.playlist_shown(), |d| d.bg(t.accent_soft))
+                    .when(self.playlist_enabled(), |d| d.bg(t.accent_soft))
                     .into_any_element(),
                 BarControl::Settings => self
                     .icon_button(
@@ -1679,15 +1683,14 @@ impl PlayerView {
             }
         }
 
+        let filmstrip = dur > 0.0 && st.media.as_ref().is_some_and(|m| m.seekable)
+            && self.thumbnails.available_visualization(&st, &self.settings, fullscreen) != TimelineVisualization::None;
+        let height = super::thumbnails::filmstrip_height(&self.settings, window, cx);
         let control_bounds = self.control_bounds.clone();
         div()
             .id(if overlay { "controls-overlay" } else { "controls" })
-            .when(self.menu.as_ref().is_some_and(|m| m.timeline_settings)
-                || (overlay && self.playlist_shown() && self.playlist_previews.hover.is_some()
-                && super::playlist_thumbnails::PlaylistPreviews::mode(&self.settings).side()), |d| {
-                d.relative().child(canvas(move |b, _, _| control_bounds.set(b), |_, _, _, _| {})
-                    .absolute().top_0().left_0().size_full())
-            })
+            .relative().child(canvas(move |b, _, _| control_bounds.set(b), |_, _, _, _| {})
+                .absolute().top_0().left_0().size_full())
             .flex_none()
             .flex()
             .flex_col()
@@ -1700,6 +1703,36 @@ impl PlayerView {
             .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| this.note_activity(cx)))
             .child(seek_row)
             .child(div().flex().items_center().gap_2().child(left).child(center).child(right))
+            .when(filmstrip, |d| d.child(
+                div().id("timeline-resize").absolute().top_0().left_0().w_full().h(px(10.))
+                    .cursor(CursorStyle::ResizeUpDown)
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        window.focus(&this.focus);
+                        let start = height.clamp(12., 96.);
+                        let bottom = ev.position.y + px(start - 12.);
+                        let bounds = Rc::new(Cell::new(Bounds::new(point(px(0.), bottom - px(84.)), size(px(1.), px(84.)))));
+                        this.timeline_edge_drag = true;
+                        this.seek_hover = None;
+                        this.drag = Some(Drag {
+                            bounds, vertical: true, last: (start - 12.) / 84.,
+                            on_change: Rc::new(move |this, f, _, _| {
+                                let n = (12. + f * 84.).round() as u32;
+                                if n == start.round() as u32 && ((!fullscreen && this.settings.timeline_adaptive)
+                                    || (fullscreen && this.settings.timeline_fullscreen_height.is_none())) { return; }
+                                if fullscreen {
+                                    this.settings.timeline_fullscreen_height = Some(n);
+                                } else {
+                                    this.settings.timeline_adaptive = false;
+                                    this.settings.timeline_filmstrip_height = n;
+                                    this.settings.timeline_filmstrip_min_height = this.settings.timeline_filmstrip_min_height.min(n);
+                                }
+                            }),
+                            on_release: Some(Rc::new(|this, _, _, _| this.settings.save())),
+                        });
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
+            ))
             .into_any_element()
     }
 
@@ -1874,19 +1907,17 @@ impl PlayerView {
                                 let time = if scrub { this.playlist_previews.hover.as_ref().map_or(representative, |h| duration * f64::from(h.fraction)) } else { representative };
                                 this.thumbnails.for_playlist(&key.path, key.stream, key.count, time).cloned()
                                     .or_else(|| if scrub { this.playlist_previews.scrub(key, time).cloned() } else { None })
-                                    .or_else(|| this.playlist_previews.inline_pair(key, representative, duration * 0.05))
+                                    .or_else(|| this.playlist_previews.inline_pair(key, representative, duration * crate::engine::thumbnails::representative_fraction(&key.path)))
                             })
                         } else { None };
                         let hovered = this.playlist_hovered == Some(item_id) && this.menu.is_none() && !dragging;
                         let hover_playhead = this.playlist_previews.hover.as_ref()
-                            .filter(|h| hovered && mode != PlaylistThumbnails::None && this.dialog.is_none() && h.id == item_id)
+                            .filter(|h| hovered && mode.scrubbing() && this.dialog.is_none() && h.id == item_id)
                             .and_then(|h| {
                                 if h.duration <= 0.0 { return None; }
                                 let time = h.duration * f64::from(h.fraction);
-                                let preview = if mode == PlaylistThumbnails::Inline { image.as_ref() } else {
-                                    this.thumbnails.for_playlist(&h.key.path, h.key.stream, h.key.count, time)
-                                        .or_else(|| this.playlist_previews.scrub(&h.key, time))
-                                };
+                                let preview = this.thumbnails.for_playlist(&h.key.path, h.key.stream, h.key.count, time)
+                                    .or_else(|| this.playlist_previews.scrub(&h.key, time));
                                 preview.map(|p| (p.time / h.duration).clamp(0.0, 1.0) as f32)
                             });
                         let playing = is_cur && this.player.is_active() && !this.player.paused()
@@ -1949,8 +1980,10 @@ impl PlayerView {
                                         div().child(format!("{}", i + 1)).into_any_element()
                                     })),
                             )
+                            .when(mode == PlaylistThumbnails::None && (it.video_stream.is_some() || it.audio_stream.is_some()), |d| d.child(
+                                icon(if it.video_stream.is_some() { Icon::Video } else { Icon::Audio }, px(14.), t.text_dim)))
                             .child(div().id(("pl-scrub", item_id)).relative().flex_1().min_w_0().h_full().overflow_hidden().flex().items_center().gap_2()
-                            .when(mode != PlaylistThumbnails::None, |d| {
+                            .when(mode.scrubbing(), |d| {
                                 d.child(canvas(move |b, _, _| measured.set(b), |_, _, _, _| {}).absolute().size_full())
                                     .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
                                         if cx.has_active_drag() || this.menu.is_some() || this.dialog.is_some() { return; }
@@ -1991,9 +2024,10 @@ impl PlayerView {
                                     })
                                     .child(title),
                             )
-                            .when(!mode.inline() && (cached.video || cached.audio), |d| d.child(div().flex().items_center().gap(px(2.)).flex_none()
-                                .when(cached.video, |d| d.child(icon(Icon::Video, px(12.), t.text_dim)))
-                                .when(cached.audio, |d| d.child(waveform_badge(t.text_dim)))))
+                            .when((!mode.inline() && (cached.video || cached.audio)) || (it.video_stream.is_some() && it.has_subtitles), |d| d.child(div().flex().items_center().gap(px(2.)).flex_none()
+                                .when(!mode.inline() && cached.video, |d| d.child(icon(Icon::Video, px(12.), t.text_dim)))
+                                .when(!mode.inline() && cached.audio, |d| d.child(waveform_badge(t.text_dim)))
+                                .when(it.video_stream.is_some() && it.has_subtitles, |d| d.child(icon(Icon::Subtitles, px(12.), t.text_dim)))))
                             .child(div().flex_none().text_size(px(11.)).text_color(t.text_dim).child(dur))
                             .when_some(hover_playhead, |d, f| d.child(
                                 div().absolute().left(relative(f)).top_0().bottom_0().w(px(1.))
@@ -2128,8 +2162,14 @@ impl PlayerView {
                 .into_any_element()
         };
 
+        let playlist_bounds = self.playlist_bounds.clone();
         div()
             .id("playlist-panel")
+            .child(canvas(move |b, _, _| playlist_bounds.set(b), |_, _, _, _| {}).absolute().size_full())
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+                this.playlist_previews.pointer = Some(ev.position);
+                this.update_playlist_autohide(window, cx);
+            }))
             .relative()
             .w(px(width))
             .flex_1()
@@ -2199,8 +2239,10 @@ impl PlayerView {
             this.apply_settings(cx);
         }).selected(self.settings.playlist_thumbnails == mode)).collect();
         modes.push(M::Separator);
-        modes.push(M::action("Generate missing filmstrip thumbnails", |this, _, cx| this.generate_playlist_items(None, true, cx))
+        modes.push(M::action("Generate missing playlist thumbnails", |this, _, cx| this.generate_playlist_representatives(None, cx))
             .enabled(self.playlist.items.iter().any(|it| matches!(it.source, MediaSource::File(_)) && (it.video_stream.is_some() || !it.probed || it.duration.is_none()))));
+        modes.push(M::action("Generate missing filmstrip thumbnails", |this, _, cx| this.generate_playlist_items(None, true, cx))
+            .enabled(self.settings.timeline_thumbnails && self.playlist.items.iter().any(|it| matches!(it.source, MediaSource::File(_)) && (it.video_stream.is_some() || !it.probed || it.duration.is_none()))));
         let waveforms = vec![
             M::action("Generate missing waveforms", |this, _, cx| this.generate_playlist_waveforms(None, true, cx)),
             M::action("Regenerate audio waveforms", |this, _, cx| this.generate_playlist_waveforms(None, false, cx)),
@@ -2214,6 +2256,7 @@ impl PlayerView {
             M::submenu("Open saved playlist", closed),
             M::action("Close playlist", |this, w, cx| this.close_playlist_workspace(w, cx)).enabled(self.playlist_library.can_close()),
             M::action("New playlist…", |this, w, cx| this.show_dialog(super::dialogs::Dialog::NamePlaylist(false), w, cx)),
+            M::action("Duplicate playlist as…", |this, w, cx| this.show_dialog(super::dialogs::Dialog::DuplicatePlaylist, w, cx)).enabled(self.playlist_library.writable),
             M::action("Rename playlist…", |this, w, cx| this.show_dialog(super::dialogs::Dialog::NamePlaylist(true), w, cx)),
             M::action("Delete playlist…", |this, w, cx| this.show_dialog(super::dialogs::Dialog::DeletePlaylist, w, cx)).icon(Icon::Delete).enabled(self.playlist_library.can_delete()),
             M::action("Auto save playlist", |this, _, cx| this.toggle_playlist_autosave(cx)).checked(self.playlist_library.autosave()).enabled(self.playlist_library.writable),
@@ -2228,7 +2271,12 @@ impl PlayerView {
             M::action("Export playlist (M3U)", |this, w, cx| this.save_playlist(w, cx)).icon(Icon::Save),
             M::action("Clear playlist", |this, w, cx| { this.stop(w, cx); this.playlist.clear(); this.playlist_selection.clear(); this.playlist_hovered = None; cx.notify(); }).icon(Icon::Clear),
             M::Separator,
-            M::submenu("Thumbnails", modes).enabled(self.settings.timeline_thumbnails),
+            M::action("Autohide playlist", |this, _, cx| {
+                this.settings.playlist_autohide = !this.settings.playlist_autohide;
+                this.playlist_autohide_open = true;
+                this.apply_settings(cx);
+            }).checked(self.settings.playlist_autohide),
+            M::submenu("Thumbnails", modes),
             M::submenu("Waveforms", waveforms).enabled(self.settings.timeline_waveform),
         ]
     }
@@ -2251,8 +2299,9 @@ impl PlayerView {
                 .enabled(self.playlist.can_move_selected(&ids, false)),
             M::action(if count > 1 { format!("Remove {count} items") } else { "Remove".into() }, move |this, w, cx| this.remove_playlist_items(&remove, w, cx)).icon(Icon::Remove),
         ];
-        let can_generate = self.settings.timeline_thumbnails && self.playlist.items.iter().any(|it| ids.contains(&it.id)
+        let can_representative = self.playlist.items.iter().any(|it| ids.contains(&it.id)
             && matches!(it.source, MediaSource::File(_)) && (it.video_stream.is_some() || !it.probed || it.duration.is_none()));
+        let can_generate = self.settings.timeline_thumbnails && can_representative;
         let can_waveform = self.settings.timeline_waveform && self.playlist.items.iter().any(|it| ids.contains(&it.id)
             && matches!(it.source, MediaSource::File(_)) && (it.audio_stream.is_some() || !it.probed || it.duration.is_none()));
         let waveform_missing = ids.clone();
@@ -2264,6 +2313,8 @@ impl PlayerView {
         if count > 1 {
             let missing = ids.clone();
             v.push(M::Separator);
+            let representatives = ids.clone();
+            v.push(M::action("Generate missing playlist thumbnails for selected items", move |this, _, cx| this.generate_playlist_representatives(Some(&representatives), cx)).enabled(can_representative));
             v.push(M::action("Generate missing filmstrip thumbnails for selected items", move |this, _, cx| this.generate_playlist_items(Some(&missing), true, cx)).enabled(can_generate));
             v.push(M::action("Regenerate filmstrip thumbnails for selected items", move |this, _, cx| this.generate_playlist_items(Some(&ids), false, cx)).enabled(can_generate));
             v.append(&mut waveforms);
@@ -2274,6 +2325,8 @@ impl PlayerView {
             let p = p.clone();
             v.push(M::action("Show in File Manager", move |_, _, cx| cx.reveal_path(&p)).icon(Icon::OpenFolder));
             let missing = ids.clone();
+            let representatives = ids.clone();
+            v.push(M::action("Generate playlist thumbnail", move |this, _, cx| this.generate_playlist_representatives(Some(&representatives), cx)).enabled(can_representative));
             v.push(M::action("Generate missing filmstrip thumbnails", move |this, _, cx| this.generate_playlist_items(Some(&missing), true, cx)).enabled(can_generate));
             v.push(M::action("Regenerate filmstrip thumbnails", move |this, _, cx| this.generate_playlist_items(Some(&ids), false, cx)).enabled(can_generate));
             v.append(&mut waveforms);
@@ -2293,7 +2346,7 @@ impl PlayerView {
                         this.settings.save();
                         cx.notify();
                     }
-                }).enabled(self.settings.timeline_thumbnails && time.is_some()));
+                }).enabled(time.is_some()));
                 if self.settings.playlist_thumbnail_times.contains_key(&key.selection_key()) {
                     v.push(M::action("Reset video thumbnail", move |this, _, cx| {
                         this.settings.playlist_thumbnail_times.remove(&key.selection_key());
@@ -2368,7 +2421,9 @@ impl PlayerView {
             window.focus(&self.focus);
         }
 
+        let autohide = self.settings.playlist_autohide;
         let main = div()
+            .relative()
             .flex_1()
             .min_h_0()
             .flex()
@@ -2377,7 +2432,9 @@ impl PlayerView {
                 let reserve = if fullscreen && self.controls_visible() {
                     FULLSCREEN_CONTROL_BAR_H + if self.player.with_state(|st| self.thumbnails.has_previews(st, &self.settings, true)) { self.settings.visualization_height(true) as f32 + 2. } else { 0. }
                 } else { 0. };
-                d.child(div().flex_none().flex().flex_col().pb(px(reserve)).child(self.playlist_panel(window, cx)))
+                d.child(div().flex_none().flex().flex_col().pb(px(reserve))
+                    .when(autohide, |d| d.absolute().right_0().top_0().bottom_0().occlude())
+                    .child(self.playlist_panel(window, cx)))
             });
 
         let mut root = div()
@@ -2407,6 +2464,7 @@ impl PlayerView {
             .font_family(".SystemUIFont")
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 this.playlist_previews.pointer = Some(ev.position);
+                this.update_playlist_autohide(window, cx);
                 if this.menu.is_none() && this.playlist_previews.hover.as_ref().is_some_and(|h| !h.bounds.contains(&ev.position)) {
                     this.playlist_previews.hover = None;
                     this.refresh_playlist_hover(cx);
@@ -2427,12 +2485,18 @@ impl PlayerView {
                 this.open_paths(p, window, cx);
             }))
             .drag_over::<ExternalPaths>(|s, _, _, _| s)
-            .on_hover(cx.listener(|this, h: &bool, _, cx| {
+            .on_hover(cx.listener(|this, h: &bool, window, cx| {
                 if !*h {
                     // When the pointer leaves the window over the fullscreen
                     // control bar, its hover-exit event may not be delivered.
                     // Clear the stale state so the autohide timer can work.
+                    // An occluding playlist overlay can also cause root hover exit.
+                    if this.settings.playlist_autohide && window.is_window_hovered()
+                        && this.playlist_shown() && this.playlist_bounds.get().contains(&window.mouse_position()) {
+                        return;
+                    }
                     this.playlist_previews.pointer = None;
+                    this.update_playlist_autohide(window, cx);
                     let had_playlist_hover = this.menu.is_none() && this.playlist_previews.hover.take().is_some();
                     let had_hover = this.pointer_over_controls || had_playlist_hover;
                     let was_dropping = this.dropping;
@@ -2473,6 +2537,8 @@ impl PlayerView {
                     // are theirs, not the video's.
                     .occlude()
                     .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+                        this.playlist_previews.pointer = Some(ev.position);
+                        this.update_playlist_autohide(window, cx);
                         if this.handle_drag_move(ev, window, cx) {
                             cx.stop_propagation();
                         }
@@ -2504,13 +2570,14 @@ impl PlayerView {
                 let video_bounds = self.video_bounds.clone();
                 let control_bounds = self.control_bounds.clone();
                 let fullscreen_controls = fullscreen && self.controls_visible();
+                let playlist_overlay_width = if autohide { px(self.settings.playlist_width.clamp(120., (f32::from(window.viewport_size().width) - 120.).max(120.))) } else { px(0.) };
                 // Prepaint after the normal layout so the limit includes the actual
                 // visualization height, including adaptive sizing and fullscreen.
                 root = root.child(deferred(canvas(move |area, window, cx| {
                     let video = video_bounds.get();
                     let bottom = if fullscreen_controls { control_bounds.get().top() } else { video.bottom() };
                     let top = video.top().max(area.top()) + px(4.);
-                    let right = video.right() - px(6.);
+                    let right = video.right() - playlist_overlay_width - px(6.);
                     let width = px(246.).min(right - area.left() - px(4.));
                     let height = px(159.).min(bottom - top - px(4.));
                     if width < px(60.) || height < px(40.) { return None; }

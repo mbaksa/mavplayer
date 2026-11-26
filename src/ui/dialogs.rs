@@ -12,7 +12,7 @@ use crate::icons::Icon;
 use crate::playlist;
 use crate::settings::{
     BUNDLED_SUB_FONT_FAMILY, BarControl, DEFAULT_SUB_FONT_FAMILY, IconTheme, OpenMode, RunningMode, ScrollAction,
-    SeekDragMode, SubPosition, SubStyle, ThemeMode, TimelineVisualization,
+    SeekDragMode, SubPosition, SubStyle, ThemeMode,
 };
 use gpui::{
     AnyElement, ClickEvent, Context, Focusable, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent, Resource,
@@ -26,6 +26,7 @@ pub enum Dialog {
     MediaInfo,
     OpenUrl,
     NamePlaylist(bool),
+    DuplicatePlaylist,
     DeletePlaylist,
     OpenDisc,
     JumpTo,
@@ -80,6 +81,12 @@ impl PlayerView {
             Dialog::NamePlaylist(rename) => {
                 let input = self.input("playlist_name", "Playlist name", window, cx);
                 let name = if rename { self.playlist_library.name().to_owned() } else { self.playlist_library.suggested_name("Playlist") };
+                input.update(cx, |i, cx| i.set_text(name, cx));
+                window.focus(&input.focus_handle(cx));
+            }
+            Dialog::DuplicatePlaylist => {
+                let input = self.input("playlist_name", "Playlist name", window, cx);
+                let name = self.playlist_library.suggested_name(&format!("{} copy", self.playlist_library.name()));
                 input.update(cx, |i, cx| i.set_text(name, cx));
                 window.focus(&input.focus_handle(cx));
             }
@@ -189,6 +196,8 @@ impl PlayerView {
             "playlist_name" => {
                 if let Some(Dialog::NamePlaylist(rename)) = self.dialog {
                     self.name_playlist_workspace(text.trim().to_owned(), rename, window, cx);
+                } else if self.dialog == Some(Dialog::DuplicatePlaylist) {
+                    self.duplicate_playlist_workspace(text.trim().to_owned(), window, cx);
                 }
             }
             "jump" => match parse_time(&text) {
@@ -345,7 +354,8 @@ impl PlayerView {
                 // tooltips, right-click menus or wheel.
                 .occlude()
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, w, cx| this.close_dialog(w, cx)))
-                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+                    if this.handle_drag_move(ev, window, cx) { cx.stop_propagation(); return; }
                     let Some(ModalDragOrigin { start, initial, limits: (min_x, max_x, min_y, max_y) }) =
                         this.modal_drag_origin
                     else {
@@ -365,7 +375,8 @@ impl PlayerView {
                 }))
                 .on_mouse_up(
                     MouseButton::Left,
-                    cx.listener(|this, _, _, _| {
+                    cx.listener(|this, _, window, cx| {
+                        if this.drag.is_some() { this.end_drag(window, cx); cx.stop_propagation(); }
                         this.modal_drag_origin = None;
                     }),
                 )
@@ -503,10 +514,15 @@ impl PlayerView {
     }
 
     fn row(&self, label: &str, desc: Option<&str>, control: AnyElement) -> AnyElement {
+        self.aligned_row(label, desc, control, false)
+    }
+
+    fn aligned_row(&self, label: &str, desc: Option<&str>, control: AnyElement, top: bool) -> AnyElement {
         let t = self.theme;
         div()
             .flex()
-            .items_center()
+            .when(top, |d| d.items_start())
+            .when(!top, |d| d.items_center())
             .gap_4()
             .py_2()
             .border_b_1()
@@ -573,87 +589,107 @@ impl PlayerView {
         f: impl Fn(&mut Self, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let desc = match id {
+            "waveform-auto-audio" => Some("Analyze newly added audio files in the background."),
+            "waveform-auto-video" => Some("Analyze the audio track of newly added video files in the background."),
+            "filmstrip-auto-video" => Some("Generate a series of sampled frames for newly added video files."),
+            "thumb-hover" => Some("Preview the nearest sampled frame when hovering over the timeline."),
+            "thumb-adaptive" => Some("Reduce the visualization height in narrow windows."),
+            "chapter-thumbnails" => Some("Show sampled frames next to chapter titles when available."),
+            _ => None,
+        };
         if enabled {
-            return self.toggle_row(id, label, None, on, f, cx);
+            return self.toggle_row(id, label, desc, on, f, cx);
         }
         let t = self.theme;
         let control = div().w(px(40.)).h(px(22.)).rounded_full().p(px(3.)).flex()
             .bg(if on { t.accent } else { t.track })
             .when(on, |d| d.justify_end())
             .child(div().size(px(16.)).rounded_full().bg(gpui::white()).shadow_sm());
-        div().opacity(0.45).child(self.row(label, None, control.into_any_element())).into_any_element()
+        div().opacity(0.45).child(self.row(label, desc, control.into_any_element())).into_any_element()
     }
 
     #[allow(clippy::too_many_arguments)]
     fn thumbnail_choice<T: Clone + PartialEq + 'static>(&self, id: &str, label: &str, options: Vec<(String, T)>, current: T, enabled: bool, f: impl Fn(&mut Self, T, &mut Context<Self>) + 'static, cx: &mut Context<Self>) -> AnyElement {
+        let desc = match id {
+            "thumb-fullscreen-hover" => Some("Choose whether hovering shows a sampled video frame in fullscreen."),
+            "playlist-thumbnails" => Some("Inline shows a static image; Inline preview scrubs it; side preview opens beside the playlist."),
+            _ => None,
+        };
         if !enabled {
             let text = options.iter().find(|(_, v)| *v == current).map(|(l, _)| l.clone()).unwrap_or_default();
-            return div().opacity(0.45).child(self.row(label, None, div().child(text).into_any_element())).into_any_element();
+            return div().opacity(0.45).child(self.row(label, desc, div().child(text).into_any_element())).into_any_element();
         }
-        self.row(label, None, self.choice(id, options, current, f, cx))
+        self.row(label, desc, self.choice(id, options, current, f, cx))
     }
 
     fn timeline_visualization_row(&self, fullscreen: bool, cx: &mut Context<Self>) -> AnyElement {
+        use super::timeline_settings::{MAIN, BARCODES};
         let s = &self.settings;
-        let mut options: Vec<_> = TimelineVisualization::ALL.into_iter().map(|m| (m.label().into(), Some(m))).collect();
-        if fullscreen { options.insert(0, ("Same as in windowed mode".into(), None)); }
-        self.thumbnail_choice(if fullscreen { "thumb-fullscreen-mode" } else { "thumb-windowed-mode" }, "Visualization type", options,
-            if fullscreen { s.timeline_fullscreen_visualization } else { Some(s.timeline_visualization(false)) }, s.timeline_thumbnails || s.timeline_waveform,
-            move |t, mode, _| if fullscreen { t.settings.timeline_fullscreen_visualization = mode; } else if let Some(mode) = mode { t.settings.set_timeline_visualization(false, mode); }, cx)
+        let mut cards = div().w(px(300.)).flex().flex_col().gap_2();
+        if fullscreen {
+            cards = cards.child(self.toggle_row("thumb-fs-mode-inherit", "Same as in windowed mode", None, s.timeline_fullscreen_visualization.is_none(),
+                |t, _| t.settings.timeline_fullscreen_visualization = if t.settings.timeline_fullscreen_visualization.is_none() { Some(t.settings.timeline_visualization(false)) } else { None }, cx));
+        }
+        let control = cards.child(self.timeline_cards(&MAIN, fullscreen, cx))
+            .child(div().text_size(px(11.)).text_color(self.theme.text_dim).child("VIDEO BARCODES"))
+            .child(self.timeline_cards(&BARCODES, fullscreen, cx)).into_any_element();
+        self.aligned_row("Visualization type", Some("Choose the visual representation of the media above the seekbar."), control, true)
     }
 
     fn visualization_number_row(&self, fullscreen: bool, height: bool, cx: &mut Context<Self>) -> AnyElement {
         let s = &self.settings;
-        let mut options: Vec<_> = if height { (12..=96).step_by(4).map(|n| (format!("{n} px"), Some(n))).collect() } else { (50..=100).step_by(10).map(|n| (format!("{n}%"), Some(n))).collect() };
-        let current = match (fullscreen, height) {
-            (true, true) => s.timeline_fullscreen_height,
-            (true, false) => s.timeline_fullscreen_opacity,
-            (false, true) => Some(s.visualization_height(false)),
-            (false, false) => Some(s.visualization_opacity(false)),
-        };
-        // The timeline panel can set opacity in one-percent increments.
-        if let Some(n) = current && !options.iter().any(|(_, v)| *v == Some(n)) {
-            options.push((if height { format!("{n} px") } else { format!("{n}%") }, Some(n)));
-            options.sort_by_key(|(_, v)| *v);
+        let current = if height { s.visualization_height(fullscreen) } else { s.visualization_opacity(fullscreen) };
+        let (min, max) = if height { (12, 96) } else { (50, 100) };
+        let id = if height { "thumb-fs-height" } else if fullscreen { "thumb-fs-opacity" } else { "thumb-opacity" };
+        let label = if height { "Visualization height" } else { "Visualization opacity" };
+        let desc = if height { "Height of the visualization in logical pixels." } else { "Transparency of the visualization (100% is opaque)." };
+        let mut control = div().flex().flex_col().w(px(190.)).gap_1();
+        if fullscreen {
+            let inherited = if height { s.timeline_fullscreen_height.is_none() } else { s.timeline_fullscreen_opacity.is_none() };
+            control = control.child(div().flex().items_center().justify_between().text_size(px(11.)).child("Use windowed value")
+                .child(self.toggle(format!("{id}-inherit"), inherited, move |t, _| {
+                    if height { t.settings.timeline_fullscreen_height = if inherited { Some(t.settings.visualization_height(false)) } else { None }; }
+                    else { t.settings.timeline_fullscreen_opacity = if inherited { Some(t.settings.visualization_opacity(false)) } else { None }; }
+                }, cx)));
         }
-        if fullscreen { options.insert(0, ("Same as in windowed mode".into(), None)); }
-        self.thumbnail_choice(if height { "thumb-fs-height" } else if fullscreen { "thumb-fs-opacity" } else { "thumb-opacity" }, if height { "Visualization height" } else { "Visualization opacity" }, options, current,
-            s.visualization_enabled(fullscreen),
-            move |t, v, _| match (fullscreen, height) {
-                (true, true) => t.settings.timeline_fullscreen_height = v,
-                (true, false) => t.settings.timeline_fullscreen_opacity = v,
-                (false, false) => t.settings.timeline_opacity = v.unwrap_or(100),
-                (false, true) => {},
-            }, cx)
+        control = control.child(div().text_size(px(12.)).child(if height { format!("{current} px") } else { format!("{current}%") }));
+        if s.visualization_enabled(fullscreen) {
+            control = control.child(self.slider(id, (current - min) as f32 / (max - min) as f32, false, self.theme, move |t, f, _, _| {
+                let n = min + (f * (max - min) as f32).round() as u32;
+                match (fullscreen, height) {
+                    (true, true) => t.settings.timeline_fullscreen_height = Some(n),
+                    (true, false) => t.settings.timeline_fullscreen_opacity = Some(n),
+                    (false, false) => t.settings.timeline_opacity = n,
+                    (false, true) => {},
+                }
+            }, cx));
+        }
+        self.row(label, Some(desc), control.into_any_element())
     }
 
     fn thumbnail_height_row(&self, minimum: bool, cx: &mut Context<Self>) -> AnyElement {
         let s = &self.settings;
         let max = s.timeline_filmstrip_height.clamp(12, 96);
         let min = s.timeline_filmstrip_min_height.clamp(12, max);
-        let (label, current, enabled) = if minimum {
-            ("Minimum visualization height", min, s.visualization_enabled(false) && s.timeline_adaptive)
+        let (label, current, limit, enabled) = if minimum {
+            ("Minimum visualization height", min, max, s.visualization_enabled(false) && s.timeline_adaptive)
         } else {
-            ("Visualization height", max, s.visualization_enabled(false))
+            ("Visualization height", max, 96, s.visualization_enabled(false))
         };
-        if !enabled {
-            return div().opacity(0.45).child(self.row(label, None, div().child(format!("{current} px")).into_any_element())).into_any_element();
+        let mut control = div().w(px(190.)).child(div().text_size(px(12.)).child(format!("{current} px")));
+        if enabled && limit > 12 {
+            control = control.child(self.slider(if minimum { "thumb-min-height" } else { "thumb-height" },
+                (current - 12) as f32 / (limit - 12) as f32, false, self.theme, move |t, f, _, _| {
+                    let n = 12 + (f * (limit - 12) as f32).round() as u32;
+                    if minimum { t.settings.timeline_filmstrip_min_height = n; }
+                    else {
+                        t.settings.timeline_filmstrip_height = n;
+                        t.settings.timeline_filmstrip_min_height = t.settings.timeline_filmstrip_min_height.min(n);
+                    }
+                }, cx));
         }
-        self.row(label, None, self.stepper(
-            if minimum { "thumb-min-height" } else { "thumb-height" },
-            format!("{current} px"),
-            move |t, d, _| {
-                let max = t.settings.timeline_filmstrip_height.clamp(12, 96);
-                let min = t.settings.timeline_filmstrip_min_height.clamp(12, max);
-                if minimum {
-                    t.settings.timeline_filmstrip_min_height = (min as i32 + d * 4).clamp(12, max as i32) as u32;
-                } else {
-                    let max = (max as i32 + d * 4).clamp(12, 96) as u32;
-                    t.settings.timeline_filmstrip_height = max;
-                    t.settings.timeline_filmstrip_min_height = min.min(max);
-                }
-            }, cx,
-        ))
+        self.row(label, Some(if minimum { "Smallest height when adaptive sizing is enabled." } else { "Preferred visualization height in logical pixels." }), control.into_any_element())
     }
 
     /// Settings rows for enlarging video: the upscaler, and the options of
@@ -1042,6 +1078,12 @@ impl PlayerView {
                 let footer = self.text_button("playlist-name-confirm", if rename { "Rename" } else { "Create" }, true,
                     |this, _, w, cx| this.on_input_submit("playlist_name", w, cx), cx).into_any_element();
                 self.modal(if rename { "Rename playlist" } else { "New playlist" }, 380., body, Some(footer), cx)
+            }
+            Dialog::DuplicatePlaylist => {
+                let body = div().p_4().child(self.input_box("playlist_name")).into_any_element();
+                let footer = self.text_button("playlist-duplicate-confirm", "Duplicate", true,
+                    |this, _, w, cx| this.on_input_submit("playlist_name", w, cx), cx).into_any_element();
+                self.modal("Duplicate playlist as…", 380., body, Some(footer), cx)
             }
             Dialog::DeletePlaylist => {
                 let body = div().p_4().child(format!("Delete the saved playlist ‘{}’? This does not delete any media files.", self.playlist_library.name())).into_any_element();
@@ -1570,6 +1612,8 @@ impl PlayerView {
                         |t, _| t.settings.hide_playlist_in_fullscreen = !t.settings.hide_playlist_in_fullscreen,
                         cx,
                     ))
+                    .child(self.toggle_row("playlist-autohide", "Automatically hide playlist", Some("Reveal an enabled playlist at the right edge without resizing the video."), s.playlist_autohide,
+                        |t, _| { t.settings.playlist_autohide = !t.settings.playlist_autohide; t.playlist_autohide_open = false; }, cx))
                     .child(self.section("Mouse"))
                     .child(self.toggle_row(
                         "clickpause",
@@ -1649,23 +1693,29 @@ impl PlayerView {
                 c = c.child(self.bar_controls_section(cx));
             }
             1 => {
-                c = c
+                c = c.w_full()
                     .child(self.section("Timeline thumbnails"))
                     .child(self.toggle_row(
-                        "thumb-enabled", "Enable video thumbnails", None, s.timeline_thumbnails,
+                        "thumb-enabled", "Timeline video thumbnails", Some("Enable timeline video previews, filmstrip generation and video barcodes. Playlist thumbnails are independent."), s.timeline_thumbnails,
                         |t, _| t.settings.timeline_thumbnails = !t.settings.timeline_thumbnails, cx,
                     ))
-                    .child(self.toggle_row("waveform-enabled", "Enable audio waveform generation", None, s.timeline_waveform,
+                    .child(self.toggle_row("waveform-enabled", "Audio waveform generation", Some("Analyze audio amplitude for waveform visualizations."), s.timeline_waveform,
                         |t, _| t.settings.timeline_waveform = !t.settings.timeline_waveform, cx))
-                    .child(self.thumbnail_toggle_row("waveform-auto-audio", "Automatically create waveform of audio files", s.waveform_auto_audio, s.timeline_waveform,
+                    .child(self.section("Automatic generation"))
+                    .child(self.toggle_row("playlist-thumb-auto-video", "Playlist thumbnails", Some("Generate one representative image per video when no cached thumbnail is available."), s.playlist_thumbnail_auto_video,
+                        |t, _| t.settings.playlist_thumbnail_auto_video = !t.settings.playlist_thumbnail_auto_video, cx))
+                    .child(self.thumbnail_toggle_row("waveform-auto-audio", "Audio files waveform", s.waveform_auto_audio, s.timeline_waveform,
                         |t, _| t.settings.waveform_auto_audio = !t.settings.waveform_auto_audio, cx))
-                    .child(self.thumbnail_toggle_row("filmstrip-auto-video", "Automatically create filmstrip thumbnails of video files", s.filmstrip_auto_video, s.timeline_thumbnails,
+                    .child(self.thumbnail_toggle_row("waveform-auto-video", "Video files waveform", s.waveform_auto_video, s.timeline_waveform,
+                        |t, _| t.settings.waveform_auto_video = !t.settings.waveform_auto_video, cx))
+                    .child(self.thumbnail_toggle_row("filmstrip-auto-video", "Filmstrip thumbnails", s.filmstrip_auto_video, s.timeline_thumbnails,
                         |t, _| t.settings.filmstrip_auto_video = !t.settings.filmstrip_auto_video, cx))
-                    .child(self.toggle_row("timeline-hover-playhead", "Show timeline preview cursor", Some("Mark the timestamp of the preview frame with a temporary vertical line while hovering."), s.timeline_hover_playhead,
+                    .child(self.section("Timeline preview"))
+                    .child(self.toggle_row("timeline-hover-playhead", "Show cursor", Some("Mark the timestamp of the preview frame with a temporary vertical line while hovering."), s.timeline_hover_playhead,
                         |t, _| t.settings.timeline_hover_playhead = !t.settings.timeline_hover_playhead, cx))
                     .child(self.section("Windowed"))
                     .child(self.thumbnail_toggle_row(
-                        "thumb-hover", "Show thumbnail preview on hover", s.timeline_hover_enabled(false), s.timeline_thumbnails,
+                        "thumb-hover", "Thumbnail preview", s.timeline_hover_enabled(false), s.timeline_thumbnails,
                         |t, _| t.settings.set_timeline_hover(false, !t.settings.timeline_hover_enabled(false)), cx,
                     ))
                     .child(self.timeline_visualization_row(false, cx))
@@ -1678,12 +1728,12 @@ impl PlayerView {
                     .child(self.thumbnail_height_row(false, cx))
                     .child(self.thumbnail_height_row(true, cx))
                     .child(self.section("Fullscreen"))
-                    .child(self.thumbnail_choice("thumb-fullscreen-hover", "Show thumbnail preview on hover", vec![("Same as in windowed mode".into(), None), ("On".into(), Some(true)), ("Off".into(), Some(false))], s.timeline_fullscreen_hover, s.timeline_thumbnails, |t, v, _| t.settings.timeline_fullscreen_hover = v, cx))
+                    .child(self.thumbnail_choice("thumb-fullscreen-hover", "Thumbnail preview", vec![("Same as in windowed mode".into(), None), ("On".into(), Some(true)), ("Off".into(), Some(false))], s.timeline_fullscreen_hover, s.timeline_thumbnails, |t, v, _| t.settings.timeline_fullscreen_hover = v, cx))
                     .child(self.timeline_visualization_row(true, cx))
                     .child(self.visualization_number_row(true, false, cx))
                     .child(self.visualization_number_row(true, true, cx))
                     .child(self.section("Playlist and chapters"))
-                    .child(self.thumbnail_choice("playlist-thumbnails", "Playlist thumbnails", crate::settings::PlaylistThumbnails::ALL.into_iter().map(|mode| (mode.label().into(), mode)).collect(), s.playlist_thumbnails, s.timeline_thumbnails, |t, v, _| t.settings.playlist_thumbnails = v, cx))
+                    .child(self.thumbnail_choice("playlist-thumbnails", "Playlist thumbnails", crate::settings::PlaylistThumbnails::ALL.into_iter().map(|mode| (mode.label().into(), mode)).collect(), s.playlist_thumbnails, true, |t, v, _| t.settings.playlist_thumbnails = v, cx))
                     .child(self.thumbnail_toggle_row("chapter-thumbnails", "Show thumbnails in chapter list", s.chapter_thumbnails, s.timeline_thumbnails, |t, _| t.settings.chapter_thumbnails = !t.settings.chapter_thumbnails, cx))
                     .child(self.section("Visualization cache"))
                     .child(self.row(

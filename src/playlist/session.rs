@@ -146,6 +146,17 @@ impl Library {
         self.dirty = true;
     }
 
+    pub fn duplicate(&mut self, name: String, mut snapshot: Snapshot) -> bool {
+        if !self.writable || !self.valid_name(&name, false) { return false; }
+        snapshot.normalize();
+        let mut slot = Slot::new(name, true);
+        slot.saved = snapshot;
+        self.slots.push(slot);
+        self.active = self.slots.len() - 1;
+        self.dirty = true;
+        true
+    }
+
     pub fn rename(&mut self, name: String) {
         self.slots[self.active].name = name;
         self.dirty = true;
@@ -230,6 +241,27 @@ mod tests {
         assert!(!restored.slots[1].open);
         assert!(restored.switch(1));
         assert_eq!(restored.snapshot(), &snapshot("movie.mp4", 42.));
+    }
+
+    #[test]
+    fn duplicate_preserves_live_contents_without_overwriting_original() {
+        let mut lib = Library::empty(true);
+        lib.capture(snapshot("saved.mp4", 10.0), true, true);
+        lib.start_launch_playlist();
+        let live = snapshot("launch.mp4", 42.0);
+        lib.capture(live.clone(), true, false);
+        assert!(!lib.duplicate("Launch playlist".into(), live.clone()));
+        assert!(lib.duplicate("Movies".into(), live.clone()));
+        assert_eq!(lib.name(), "Movies");
+        assert_eq!(lib.snapshot(), &live);
+        let mut restored: Library = serde_json::from_str(&serde_json::to_string(&lib).unwrap()).unwrap();
+        assert_eq!(restored.snapshot(), &live);
+        assert!(restored.switch(0));
+        assert_eq!(restored.snapshot(), &snapshot("saved.mp4", 10.0));
+        assert!(restored.switch(1));
+        assert!(restored.snapshot().sources.is_empty());
+        assert!(lib.switch(1));
+        assert_eq!(lib.snapshot(), &live);
     }
 
     #[test]

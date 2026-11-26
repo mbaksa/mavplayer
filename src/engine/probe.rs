@@ -8,6 +8,7 @@ pub struct ProbeResult {
     pub duration: f64,
     pub video_stream: Option<usize>,
     pub audio_stream: Option<usize>,
+    pub has_subtitles: bool,
     pub title: Option<String>,
     pub artist: Option<String>,
 }
@@ -24,5 +25,7 @@ pub fn probe(source: &MediaSource, cfg: &EngineConfig) -> Option<ProbeResult> {
         _ => None,
     };
     let audio_stream = match selected.audio { Some(TrackId::Stream(i)) if info.seekable => Some(i), _ => None };
-    Some(ProbeResult { duration: info.duration, video_stream, audio_stream, title: info.title.clone(), artist: info.artist.clone() })
+    let has_subtitles = info.tracks.iter().any(|t| t.kind == TrackKind::Subtitle)
+        || (video_stream.is_some() && matches!(source, MediaSource::File(path) if !super::subs::find_sidecar_subtitles(path).is_empty()));
+    Some(ProbeResult { duration: info.duration, video_stream, audio_stream, has_subtitles, title: info.title.clone(), artist: info.artist.clone() })
 }

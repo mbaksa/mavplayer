@@ -36,6 +36,7 @@ pub struct PlaylistItem {
     pub duration: Option<f64>,
     pub video_stream: Option<usize>,
     pub audio_stream: Option<usize>,
+    pub has_subtitles: bool,
     pub probed: bool,
     pub failed: bool,
 }
@@ -175,7 +176,7 @@ impl Playlist {
             .map(|s| {
                 let id = self.next_id;
                 self.next_id += 1;
-                PlaylistItem { id, source: s, title: None, artist: None, duration: None, video_stream: None, audio_stream: None, probed: false, failed: false }
+                PlaylistItem { id, source: s, title: None, artist: None, duration: None, video_stream: None, audio_stream: None, has_subtitles: false, probed: false, failed: false }
             })
             .collect();
         let n = new.len();

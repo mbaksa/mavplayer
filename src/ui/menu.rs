@@ -2,7 +2,7 @@
 
 use super::player::PlayerView;
 use super::theme::Theme;
-use super::widgets::{icon, scrollbar, scrollbar_dragging};
+use super::widgets::{icon, scrollbar_with_tolerance, scrollbar_dragging};
 use crate::icons::Icon;
 use gpui::{
     AnyElement, Bounds, Context, Corner, MouseButton, Pixels, Point, ScrollHandle, SharedString, Window, anchored,
@@ -170,7 +170,7 @@ impl PlayerView {
         let theme = self.theme;
         let win_w = window.viewport_size().width;
         // Taller menus scroll rather than run off a short window.
-        let max_h = (window.viewport_size().height - px(16.)).clamp(px(120.), px(560.));
+        let max_h = (window.viewport_size().height - px(16.)).clamp(px(120.), px(563.));
         let open_left = menu.pos.x + px(MENU_W * 2.0) > win_w;
         // The backdrop takes every click and hover outside the menu, so
         // nothing behind it reacts. A menu-bar menu leaves the menu bar
@@ -457,7 +457,9 @@ impl PlayerView {
             };
             panel = panel.child(el);
         }
-        frame.child(panel).child(scrollbar(format!("menu-bar-{level}"), &scroll, theme)).into_any_element()
+        // Fractional display scaling can leave a tiny apparent overflow even
+        // when the menu content fits. Keep the normal tolerance in other UI.
+        frame.child(panel).child(scrollbar_with_tolerance(format!("menu-bar-{level}"), &scroll, theme, px(3.))).into_any_element()
     }
 }
 

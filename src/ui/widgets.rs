@@ -68,20 +68,24 @@ fn thumb_geometry(track: Bounds<Pixels>, view: Pixels, max: Pixels, scrolled: Pi
 /// scroll away); it fills that parent's right edge and draws nothing while
 /// everything fits. Wheel scrolling still reaches the area under it.
 pub fn scrollbar(id: impl Into<SharedString>, handle: &ScrollHandle, theme: Theme) -> impl IntoElement {
+    scrollbar_with_tolerance(id, handle, theme, px(0.5))
+}
+
+pub(super) fn scrollbar_with_tolerance(id: impl Into<SharedString>, handle: &ScrollHandle, theme: Theme, tolerance: Pixels) -> impl IntoElement {
     let id: SharedString = id.into();
     let handle = handle.clone();
     let h2 = handle.clone();
     canvas(
         move |bounds, window, _| {
             // The scroll area is an earlier sibling, so its size is current.
-            (h2.max_offset().height > px(0.5))
+            (h2.max_offset().height > tolerance)
                 .then(|| window.insert_hitbox(bounds, HitboxBehavior::BlockMouseExceptScroll))
         },
         move |bounds, hitbox, window, _| {
             let Some(hitbox) = hitbox else { return };
             let max = handle.max_offset().height;
             let view = handle.bounds().size.height;
-            if max <= px(0.5) || view <= px(0.) {
+            if max <= tolerance || view <= px(0.) {
                 return;
             }
             let track = Bounds::new(

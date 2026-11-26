@@ -23,6 +23,15 @@ pub struct ThumbnailSpec {
 
 pub const MAX_THUMBNAILS: u32 = 480;
 
+/// Stable variation per file: avoid identical intro frames across episodes.
+pub fn representative_fraction(path: &Path) -> f64 {
+    let hash = path.to_string_lossy().bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    0.03 + 0.05 * (hash % 10001) as f64 / 10000.0
+}
+
+
 /// Work units are requested sample positions, not necessarily distinct frames.
 /// The final percentage is reserved for cache publication.
 pub struct GenerationProgress {
@@ -113,9 +122,9 @@ pub fn generate(
         // preview is produced. Keep them at info level in this decoder only.
         (*codec.ctx.0).log_level_offset = 16;
         let mut targets: Vec<(f64, Option<(f64, f64)>)> = (0..spec.count).map(|i| {
-            (info.duration * (f64::from(i) + 0.5) / f64::from(spec.count), None)
+            (info.duration * if spec.count == 1 { representative_fraction(path) } else { (f64::from(i) + 0.5) / f64::from(spec.count) }, None)
         }).collect();
-        for chapter in &info.chapters {
+        for chapter in info.chapters.iter().filter(|_| spec.count > 1) {
             let start = chapter.start.max(0.0);
             let end = chapter.end.min(info.duration);
             if start.is_finite() && end.is_finite() && end > start
@@ -237,6 +246,17 @@ fn convert(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn representative_fraction_is_stable_and_varies_by_file() {
+        let a = Path::new("series/episode01.mkv");
+        let b = Path::new("series/episode02.mkv");
+        assert_eq!(representative_fraction(a), representative_fraction(a));
+        assert_ne!(representative_fraction(a), representative_fraction(b));
+        for i in 0..100 {
+            assert!((0.03..=0.08).contains(&representative_fraction(Path::new(&format!("episode{i}.mkv")))));
+        }
+    }
 
     #[test]
     fn sample_count_duration_boundaries() {

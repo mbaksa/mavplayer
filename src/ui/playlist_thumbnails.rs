@@ -21,7 +21,7 @@ impl Key {
     }
     pub fn selection_key(&self) -> String { format!("{}:{}", self.stream, self.path.to_string_lossy()) }
     pub fn representative_time(&self, settings: &Settings, duration: f64) -> f64 {
-        settings.playlist_thumbnail_times.get(&self.selection_key()).copied().filter(|t| t.is_finite() && *t >= 0.0 && *t <= duration).unwrap_or(duration * 0.05)
+        settings.playlist_thumbnail_times.get(&self.selection_key()).copied().filter(|t| t.is_finite() && *t >= 0.0 && *t <= duration).unwrap_or(duration * crate::engine::thumbnails::representative_fraction(&self.path))
     }
     fn spec(&self) -> ThumbnailSpec { ThumbnailSpec { stream: self.stream, count: self.count, width: 240, height: 135 } }
 }
@@ -33,7 +33,7 @@ pub(super) struct Hover {
     pub fraction: f32,
     pub bounds: Bounds<Pixels>,
 }
-enum JobOutput { Media(Key, Vec<Thumbnail>, Option<f64>), Existing(Key, f64, Thumbnail), Skipped }
+enum JobOutput { Media(Key, Vec<Thumbnail>, Option<f64>), Existing(Key, f64, Thumbnail), Representative(Key, f64, Thumbnail), Skipped }
 type JobResult = anyhow::Result<JobOutput>;
 
 struct Job {
@@ -44,7 +44,7 @@ struct Job {
 }
 impl Drop for Job { fn drop(&mut self) { self.cancel.store(true, Ordering::Relaxed); } }
 #[derive(Clone)]
-enum JobKind { Generate(PathBuf, Option<usize>) }
+enum JobKind { Generate(PathBuf, Option<usize>, bool) }
 
 struct HoverJob {
     key: Key,
@@ -97,11 +97,10 @@ pub(super) struct PlaylistPreviews {
     hover_worker: Option<HoverJob>,
     hover_wake: Option<futures::channel::mpsc::UnboundedSender<()>>,
     pending: VecDeque<(Key, f64)>,
-    manual: VecDeque<(PathBuf, Option<usize>)>,
+    manual: VecDeque<(PathBuf, Option<usize>, bool)>,
     batch_total: usize,
-    missing_only: Vec<(PathBuf, Option<usize>)>,
+    missing_only: Vec<(PathBuf, Option<usize>, bool)>,
     activity: Arc<QueueActivity>,
-    enabled: Option<bool>,
     worker: Option<Job>,
     inline_worker: Option<InlineJob>,
     directory: Option<PathBuf>,
@@ -116,7 +115,7 @@ impl PlaylistPreviews {
         Self { hover_wake: Some(wake), ..Default::default() }
     }
     pub fn mode(settings: &Settings) -> PlaylistThumbnails {
-        if settings.timeline_thumbnails { settings.playlist_thumbnails } else { PlaylistThumbnails::None }
+        settings.playlist_thumbnails
     }
     pub fn retain_visible(&mut self, visible: &[Key]) { self.pending.retain(|(key, _)| visible.contains(key)); }
 
@@ -182,28 +181,42 @@ impl PlaylistPreviews {
         images.iter().min_by(|a, b| (a.time - time).abs().total_cmp(&(b.time - time).abs()))
     }
     pub fn regenerate(&mut self, path: PathBuf, stream: Option<usize>) {
-        let active = self.worker.as_ref().is_some_and(|w| !w.cancel.load(Ordering::Relaxed) && matches!(&w.kind, JobKind::Generate(p, st) if p == &path && *st == stream));
-        self.missing_only.retain(|(p, st)| p != &path || *st != stream);
-        if active || self.manual.iter().any(|(p, st)| p == &path && *st == stream) { return; }
-        if self.manual.is_empty() && !self.worker.as_ref().is_some_and(|w| w.progress.is_some()) { self.batch_total = 0; }
-        self.manual.push_back((path, stream));
-        self.batch_total += 1;
-        self.refresh_activity();
+        self.enqueue(path, stream, false, false);
     }
     pub fn generate_missing(&mut self, path: PathBuf, stream: Option<usize>) {
-        let request = (path.clone(), stream);
-        if (self.worker.as_ref().is_some_and(|w| !w.cancel.load(Ordering::Relaxed)) && self.generating_for(&path, stream)) || self.manual.contains(&request) { return; }
-        self.regenerate(path, stream);
-        self.missing_only.push(request);
+        self.enqueue(path, stream, false, true);
+    }
+    pub fn generate_representative(&mut self, path: PathBuf, stream: Option<usize>) {
+        self.enqueue(path, stream, true, true);
+    }
+    fn enqueue(&mut self, path: PathBuf, stream: Option<usize>, single: bool, missing: bool) {
+        let request = (path, stream, single);
+        let same = |p: &PathBuf, s: Option<usize>, one: bool| p == &request.0
+            && (s.is_none() || stream.is_none() || s == stream) && (one == single || single);
+        if !missing { self.missing_only.retain(|r| r != &request); }
+        if self.worker.as_ref().is_some_and(|w| !w.cancel.load(Ordering::Relaxed)
+            && matches!(&w.kind, JobKind::Generate(p, s, one) if same(p, *s, *one)))
+            || self.manual.iter().any(|(p, s, one)| same(p, *s, *one)) { return; }
+        if !single {
+            let before = self.manual.len();
+            self.manual.retain(|(p, s, one)| !(*one && p == &request.0 && (s.is_none() || stream.is_none() || *s == stream)));
+            self.missing_only.retain(|(p, s, one)| !(*one && p == &request.0 && (s.is_none() || stream.is_none() || *s == stream)));
+            self.batch_total = self.batch_total.saturating_sub(before - self.manual.len());
+        }
+        if self.manual.is_empty() && !self.worker.as_ref().is_some_and(|w| w.progress.is_some()) { self.batch_total = 0; }
+        if missing { self.missing_only.push(request.clone()); }
+        self.manual.push_back(request);
+        self.batch_total += 1;
+        self.refresh_activity();
     }
     pub fn has_generation(&self) -> bool { self.worker.is_some() || !self.manual.is_empty() }
     pub fn retain_generation(&mut self, keep: impl Fn(&std::path::Path) -> bool) -> bool {
         let before = self.manual.len();
-        self.manual.retain(|(path, _)| keep(path));
-        self.missing_only.retain(|(path, _)| keep(path));
+        self.manual.retain(|(path, _, _)| keep(path));
+        self.missing_only.retain(|(path, _, _)| keep(path));
         self.batch_total = self.batch_total.saturating_sub(before - self.manual.len());
         let cancelled = self.worker.as_ref().is_some_and(|w| {
-            let JobKind::Generate(path, _) = &w.kind;
+            let JobKind::Generate(path, _, _) = &w.kind;
             !keep(path) && !w.cancel.swap(true, Ordering::Relaxed)
         });
         if cancelled || before != self.manual.len() { self.refresh_activity(); }
@@ -255,7 +268,7 @@ impl PlaylistPreviews {
     }
     fn refresh_activity(&self) {
         let active = self.worker.as_ref().filter(|w| !w.cancel.load(Ordering::Relaxed)).and_then(|worker| {
-            let JobKind::Generate(path, _) = &worker.kind;
+            let JobKind::Generate(path, _, _) = &worker.kind;
             Some(ActiveGeneration { progress: worker.progress.clone()?, filename: path.file_name().unwrap_or_default().to_string_lossy().into_owned(), index: self.batch_total.saturating_sub(self.manual.len()), total: self.batch_total })
         });
         *self.activity.0.lock() = active;
@@ -264,7 +277,7 @@ impl PlaylistPreviews {
         self.activity.0.lock().is_some().then(|| self.activity.clone())
     }
     pub fn generating_for(&self, path: &std::path::Path, stream: Option<usize>) -> bool {
-        self.worker.as_ref().is_some_and(|w| matches!(&w.kind, JobKind::Generate(p, s) if p.as_path() == path && (s.is_none() || stream.is_none() || *s == stream)))
+        self.worker.as_ref().is_some_and(|w| matches!(&w.kind, JobKind::Generate(p, s, _) if p.as_path() == path && (s.is_none() || stream.is_none() || *s == stream)))
     }
     /// Read the visible representatives as a batch, separately from the
     /// potentially slow FFmpeg generation and full scrub-preview jobs.
@@ -299,7 +312,9 @@ impl PlaylistPreviews {
             match std::thread::Builder::new().name("playlist-representatives".into()).spawn(move || {
                 for (key, target) in batch {
                     if stop.load(Ordering::Relaxed) { break; }
-                    let image = load_cached(&key.path, key.spec(), &key.directory, Some(target)).ok().and_then(|mut images| images.pop()).map(to_bgra);
+                    let image = load_cached(&key.path, key.spec(), &key.directory, Some(target))
+                        .or_else(|_| load_cached(&key.path, ThumbnailSpec { count: 1, ..key.spec() }, &key.directory, Some(target)))
+                        .ok().and_then(|mut images| images.pop()).map(to_bgra);
                     if tx.send((key, target, image)).is_err() { break; }
                 }
             }) {
@@ -318,7 +333,7 @@ impl PlaylistPreviews {
 
     /// Called directly by pointer events and by worker wake-ups, not just the UI tick.
     pub fn update_hover(&mut self, settings: &Settings, visible: bool, timeline: &TimelineThumbnails) -> bool {
-        let wanted = self.hover.as_ref().filter(|h| visible && Self::mode(settings) != PlaylistThumbnails::None
+        let wanted = self.hover.as_ref().filter(|h| visible && Self::mode(settings).scrubbing()
             && h.key.directory == settings.thumbnail_cache_dir()
             && timeline.for_playlist(&h.key.path, h.key.stream, h.key.count, 0.0).is_none()
             && !timeline.busy_for(&h.key.path, Some(h.key.stream)))
@@ -379,14 +394,13 @@ impl PlaylistPreviews {
         let mode = Self::mode(settings);
         let directory = settings.thumbnail_cache_dir();
         let mut changed = false;
-        if self.directory.as_ref() != Some(&directory) || self.mode != Some(mode) || self.enabled != Some(settings.timeline_thumbnails) {
+        if self.directory.as_ref() != Some(&directory) || self.mode != Some(mode) {
             let directory_changed = self.directory.as_ref().is_some_and(|d| d != &directory);
             self.directory = Some(directory.clone());
             self.mode = Some(mode);
-            self.enabled = Some(settings.timeline_thumbnails);
-            if directory_changed || !settings.timeline_thumbnails {
+            if directory_changed {
                 self.clear();
-            } else if mode == PlaylistThumbnails::None {
+            } else if !mode.scrubbing() {
                 self.hover = None;
                 self.pending.clear();
                 self.cancel_hover();
@@ -398,7 +412,18 @@ impl PlaylistPreviews {
             self.pending.clear();
             self.cancel_hover();
         }
-        if !settings.timeline_thumbnails { return (changed, std::mem::take(&mut self.retired)); }
+        if !settings.timeline_thumbnails {
+            let before = self.manual.len();
+            self.manual.retain(|(_, _, single)| *single);
+            self.missing_only.retain(|(_, _, single)| *single);
+            self.batch_total = self.batch_total.saturating_sub(before - self.manual.len());
+            if let Some(worker) = &self.worker
+                && matches!(&worker.kind, JobKind::Generate(_, _, false))
+            {
+                worker.cancel.store(true, Ordering::Relaxed);
+            }
+            if before != self.manual.len() { self.refresh_activity(); changed = true; }
+        }
         changed |= self.update_inline(visible && mode.inline());
         changed |= self.update_hover(settings, visible, timeline);
         if let Some(worker) = &self.worker {
@@ -417,7 +442,7 @@ impl PlaylistPreviews {
                 return (true, std::mem::take(&mut self.retired));
             }
             match kind {
-                JobKind::Generate(path, _) => {
+                JobKind::Generate(path, _, _) => {
                     match result {
                         Ok(JobOutput::Media(key, images, Some(duration))) => {
                             self.invalidate(&path);
@@ -425,6 +450,10 @@ impl PlaylistPreviews {
                             if mode != PlaylistThumbnails::None && self.hover.as_ref().is_none_or(|h| h.key == key) {
                                 self.replace_full(key, images.into_iter().map(Preview::from_bgra).collect());
                             }
+                        }
+                        Ok(JobOutput::Representative(key, target, image)) => {
+                            self.invalidate(&path);
+                            self.remember(key, target, Some(Preview::from_bgra(image)));
                         }
                         Ok(JobOutput::Existing(key, target, image)) => {
                             // A cache may have been created by another instance since
@@ -451,22 +480,22 @@ impl PlaylistPreviews {
         }
         // Explicit and automatic generation requests share this queue. Hover has its own worker.
         let preferred = if let (Some(MediaSource::File(path)), Some(TrackId::Stream(stream))) = (&current.source, current.selected.video) {
-            self.manual.iter().position(|(p, s)| p == path && *s == Some(stream))
-                .or_else(|| self.manual.iter().position(|(p, s)| p == path && s.is_none()))
+            self.manual.iter().position(|(p, s, _)| p == path && *s == Some(stream))
+                .or_else(|| self.manual.iter().position(|(p, s, _)| p == path && s.is_none()))
         } else { None };
         let index = preferred.unwrap_or(0);
-        let kind = if let Some((path, stream)) = self.manual.get(index) {
+        let kind = if let Some((path, stream, _)) = self.manual.get(index) {
             // The timeline worker may already be preparing this media. Other
             // queued jobs can proceed while that independent worker finishes.
             let index = if timeline.busy_for(path, *stream) {
-                self.manual.iter().position(|(p, s)| !timeline.busy_for(p, *s))
+                self.manual.iter().position(|(p, s, _)| !timeline.busy_for(p, *s))
             } else { Some(index) };
-            index.and_then(|i| self.manual.remove(i)).map(|(path, stream)| JobKind::Generate(path, stream))
+            index.and_then(|i| self.manual.remove(i)).map(|(path, stream, single)| JobKind::Generate(path, stream, single))
         } else { None };
         if let Some(kind) = kind {
             let work = kind.clone();
-            let JobKind::Generate(path, stream) = &kind;
-            let missing_only = self.missing_only.iter().position(|(p, st)| p == path && st == stream).map(|i| self.missing_only.remove(i)).is_some();
+            let JobKind::Generate(path, stream, single) = &kind;
+            let missing_only = self.missing_only.iter().position(|(p, st, one)| p == path && st == stream && one == single).map(|i| self.missing_only.remove(i)).is_some();
             let cfg = settings.engine_config();
             let cancel = Arc::new(AtomicBool::new(false));
             let stop = cancel.clone();
@@ -478,19 +507,29 @@ impl PlaylistPreviews {
                 let result = (|| -> JobResult {
                     anyhow::ensure!(!stop.load(Ordering::Relaxed), "thumbnail generation cancelled");
                     match work {
-                        JobKind::Generate(path, selected_stream) => {
+                        JobKind::Generate(path, selected_stream, single) => {
                             let probe = crate::engine::probe::probe(&MediaSource::File(path.clone()), &cfg).ok_or_else(|| anyhow::anyhow!("could not probe media"))?;
                             let Some(stream) = selected_stream.or(probe.video_stream) else {
                                 if missing_only { return Ok(JobOutput::Skipped); }
                                 return Err(anyhow::anyhow!("no video stream"));
                             };
                             let key = Key { path, stream, count: crate::engine::thumbnails::sample_count(probe.duration), directory };
-                            let target = probe.duration * 0.05;
+                            let target = probe.duration * crate::engine::thumbnails::representative_fraction(&key.path);
                             if missing_only && let Ok(mut images) = load_cached(&key.path, key.spec(), &key.directory, Some(target))
                                 && let Some(image) = images.pop() {
                                 return Ok(JobOutput::Existing(key, target, to_bgra(image)));
                             }
                             let progress = report.as_ref().expect("manual generation progress");
+                            if single {
+                                let spec = ThumbnailSpec { count: 1, ..key.spec() };
+                                if missing_only && let Ok(mut images) = load_cached(&key.path, spec, &key.directory, Some(target))
+                                    && let Some(image) = images.pop() {
+                                    return Ok(JobOutput::Existing(key, target, to_bgra(image)));
+                                }
+                                let mut images = load_or_generate(&key.path, &cfg, spec, &key.directory, !missing_only, GenerationControl { stop: &stop, generating: &AtomicBool::new(false), progress })?;
+                                let image = images.pop().ok_or_else(|| anyhow::anyhow!("no representative thumbnail"))?;
+                                return Ok(JobOutput::Representative(key, target, to_bgra(image)));
+                            }
                             progress.set_total(key.count);
                             let images = load_or_generate(&key.path, &cfg, key.spec(), &key.directory, true, GenerationControl { stop: &stop, generating: &AtomicBool::new(false), progress })?;
                             Ok(JobOutput::Media(key, images.into_iter().map(to_bgra).collect(), Some(probe.duration)))
@@ -536,6 +575,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn playlist_thumbnail_mode_is_independent_of_timeline() {
+        let mut settings = Settings::default();
+        settings.timeline_thumbnails = false;
+        settings.playlist_thumbnails = PlaylistThumbnails::StaticInline;
+        assert_eq!(PlaylistPreviews::mode(&settings), PlaylistThumbnails::StaticInline);
+        assert!(settings.playlist_thumbnail_auto_video);
+        assert!(!settings.filmstrip_auto_video);
+    }
+
+    #[test]
     fn playlist_representative_pair_survives_inline_mode_switch() {
         let mut settings = Settings::default();
         settings.playlist_thumbnails = PlaylistThumbnails::Inline;
@@ -544,7 +593,7 @@ mod tests {
         let make = |time| Preview::from_bgra(Thumbnail { time, image: image::RgbaImage::new(2, 2) });
         let default = make(5.0);
         let chosen = make(35.0);
-        let mut previews = PlaylistPreviews { directory: Some(key.directory.clone()), mode: Some(PlaylistThumbnails::Inline), enabled: Some(true), ..Default::default() };
+        let mut previews = PlaylistPreviews { directory: Some(key.directory.clone()), mode: Some(PlaylistThumbnails::Inline), ..Default::default() };
         previews.full = Some((key.clone(), vec![default.clone(), chosen.clone()]));
         assert!(Arc::ptr_eq(&previews.inline_pair(&key, 35., 5.).unwrap().image, &chosen.image));
         previews.drop_full();
@@ -575,7 +624,7 @@ mod tests {
     fn missing_thumbnail_requests_preserve_forced_regeneration() {
         let mut previews = PlaylistPreviews::default();
         let path = PathBuf::from("movie.mp4");
-        let request = (path.clone(), Some(0));
+        let request = (path.clone(), Some(0), false);
         previews.generate_missing(path.clone(), Some(0));
         previews.generate_missing(path.clone(), Some(0));
         assert_eq!(previews.manual.len(), 1);
@@ -588,24 +637,34 @@ mod tests {
     }
 
     #[test]
+    fn filmstrip_request_supersedes_pending_single_thumbnail() {
+        let mut previews = PlaylistPreviews::default();
+        let path = PathBuf::from("movie.mp4");
+        previews.generate_representative(path.clone(), Some(0));
+        previews.generate_missing(path.clone(), Some(0));
+        previews.generate_representative(path.clone(), Some(0));
+        assert_eq!(previews.manual, VecDeque::from([(path, Some(0), false)]));
+    }
+
+    #[test]
     fn removing_media_prunes_queue_and_cancels_active_generation() {
         let mut previews = PlaylistPreviews::default();
         let a = PathBuf::from("a.mp4");
         let b = PathBuf::from("b.mp4");
         let c = PathBuf::from("c.mp4");
         previews.generate_missing(a.clone(), Some(0));
-        let (path, stream) = previews.manual.pop_front().unwrap();
+        let (path, stream, single) = previews.manual.pop_front().unwrap();
         previews.missing_only.clear();
         let cancel = Arc::new(AtomicBool::new(false));
         let (_tx, result) = std::sync::mpsc::channel();
-        previews.worker = Some(Job { kind: JobKind::Generate(path, stream), cancel: cancel.clone(), progress: Some(Arc::new(GenerationProgress::new(20))), result });
+        previews.worker = Some(Job { kind: JobKind::Generate(path, stream, single), cancel: cancel.clone(), progress: Some(Arc::new(GenerationProgress::new(20))), result });
         previews.generate_missing(b.clone(), Some(0));
         previews.generate_missing(c.clone(), Some(0));
         assert!(previews.retain_generation(|p| p == c.as_path()));
         assert!(cancel.load(Ordering::Relaxed));
         assert!(previews.worker.is_some()); // Wait for acknowledgement before starting another job.
-        assert_eq!(previews.manual, VecDeque::from([(c.clone(), Some(0))]));
-        assert_eq!(previews.missing_only, vec![(c, Some(0))]);
+        assert_eq!(previews.manual, VecDeque::from([(c.clone(), Some(0), false)]));
+        assert_eq!(previews.missing_only, vec![(c, Some(0), false)]);
         assert!(previews.progress().is_none());
         previews.generate_missing(a, Some(0)); // Re-adding a cancelled file is allowed.
         assert_eq!(previews.manual.len(), 2);
@@ -618,17 +677,17 @@ mod tests {
         let b = PathBuf::from("second.mp4");
         let c = PathBuf::from("third.mp4");
         previews.regenerate(a.clone(), Some(0));
-        let (path, stream) = previews.manual.pop_front().unwrap();
+        let (path, stream, single) = previews.manual.pop_front().unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let (_tx, result) = std::sync::mpsc::channel();
-        previews.worker = Some(Job { kind: JobKind::Generate(path, stream), cancel: cancel.clone(), progress: Some(Arc::new(GenerationProgress::new(20))), result });
+        previews.worker = Some(Job { kind: JobKind::Generate(path, stream, single), cancel: cancel.clone(), progress: Some(Arc::new(GenerationProgress::new(20))), result });
         previews.regenerate(b.clone(), Some(0));
         previews.regenerate(c.clone(), Some(0));
         previews.regenerate(a, Some(0));
         previews.regenerate(b.clone(), Some(0));
         assert!(!cancel.load(Ordering::Relaxed));
         assert_eq!(previews.batch_total, 3);
-        assert_eq!(previews.manual.pop_front(), Some((b, Some(0))));
-        assert_eq!(previews.manual.pop_front(), Some((c, Some(0))));
+        assert_eq!(previews.manual.pop_front(), Some((b, Some(0), false)));
+        assert_eq!(previews.manual.pop_front(), Some((c, Some(0), false)));
     }
 }

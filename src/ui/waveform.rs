@@ -17,7 +17,7 @@ impl Request {
         Some(Self { path: path.clone(), stream: Some(stream), directory: settings.thumbnail_cache_dir() })
     }
     fn wanted(st: &PlaybackState, settings: &Settings, fullscreen: bool) -> Option<Self> {
-        let auto_audio = settings.waveform_auto_audio && st.media.as_ref().is_some_and(|m| !m.has_video());
+        let auto_audio = st.media.as_ref().is_some_and(|m| if m.has_video() { settings.waveform_auto_video } else { settings.waveform_auto_audio });
         if !auto_audio && !settings.timeline_visualization(fullscreen).uses_audio() { return None; }
         Self::media(st, settings)
     }
@@ -251,6 +251,14 @@ impl Waveform {
     }
     pub(super) fn ready(&self, st: &PlaybackState, settings: &Settings) -> bool {
         self.peaks.is_some() && self.request == Request::media(st, settings)
+    }
+    pub(super) fn pending(&self, st: &PlaybackState, settings: &Settings, fullscreen: bool) -> bool {
+        let Some(request) = Request::wanted(st, settings, fullscreen) else { return false; };
+        let matches = |job: &Job| job.request.path == request.path && job.request.directory == request.directory
+            && (job.request.stream.is_none() || job.request.stream == request.stream);
+        self.request.as_ref() != Some(&request) || !self.attempted
+            || self.queue.iter().any(matches)
+            || self.worker.as_ref().is_some_and(|w| !w.stop.load(Ordering::Relaxed) && matches(&w.job))
     }
     pub(super) fn take_retired_images(&self) -> Vec<ImageId> { std::mem::take(&mut self.display_image.borrow_mut().retired) }
     pub(super) fn element(&self, height: f32, top: f32, resizing: bool) -> AnyElement {

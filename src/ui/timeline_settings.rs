@@ -10,8 +10,8 @@ use crate::settings::TimelineVisualization as V;
 use gpui::{AnyElement, Bounds, ClickEvent, Context, Div, ElementId, MouseButton, SharedString, Stateful, Window,
     anchored, canvas, div, fill, point, prelude::*, px, rgb, size};
 
-const MAIN: [V; 4] = [V::None, V::Filmstrip, V::Waveform, V::FilmstripWaveform];
-const BARCODES: [V; 8] = [V::BarcodeAverage, V::BarcodeCompressed, V::DominantColors, V::Luma,
+pub(super) const MAIN: [V; 4] = [V::None, V::Filmstrip, V::Waveform, V::FilmstripWaveform];
+pub(super) const BARCODES: [V; 8] = [V::BarcodeAverage, V::BarcodeCompressed, V::DominantColors, V::Luma,
     V::LumaRange, V::Saturation, V::VisualComplexity, V::FrameDifference];
 
 fn label(mode: V) -> &'static str {
@@ -62,7 +62,17 @@ fn swatch(mode: V, t: Theme) -> AnyElement {
                 for (i, c) in colors.into_iter().enumerate() {
                     let x = w * i as f32 / 6.;
                     rect(x, 0., (w / 6. - 1.).max(0.), height, rgb(c).into());
-                    rect(x, height * 0.58, (w / 6. - 1.).max(0.), height * 0.42, rgb((c >> 1) & 0x7f7f7f).into());
+                    let fw = (w / 6. - 1.).max(0.);
+                    let dark = rgb((c >> 1) & 0x7f7f7f).into();
+                    rect(x, height * 0.58, fw, height * 0.42, dark);
+                    // Tiny illustrative landscapes and buildings with distinct silhouettes.
+                    rect(x + fw * 0.12, height * 0.12, fw * 0.18, height * 0.18, rgb(0xe4d5a4).into());
+                    for j in 0..9 {
+                        let ridge = (0.28 + ((j * 3 + i * 5) % 7) as f32 * 0.055) * height;
+                        rect(x + fw * j as f32 / 9., ridge, fw / 9., height * 0.76 - ridge, dark);
+                    }
+                    rect(x + fw * 0.54, height * 0.48, fw * 0.23, height * 0.38, rgb(0x433c32).into());
+                    rect(x + fw * 0.61, height * 0.56, fw * 0.08, height * 0.13, rgb(0xe4d5a4).into());
                 }
             }
             V::Waveform => {}
@@ -150,7 +160,7 @@ impl PlayerView {
             .when(enabled, |d| d.cursor_pointer().on_click(cx.listener(run)))
     }
 
-    fn timeline_cards(&self, choices: &[V], fullscreen: bool, cx: &mut Context<Self>) -> Div {
+    pub(super) fn timeline_cards(&self, choices: &[V], fullscreen: bool, cx: &mut Context<Self>) -> Div {
         let s = &self.settings;
         let t = self.theme;
         let current = s.timeline_visualization(fullscreen);
@@ -161,7 +171,7 @@ impl PlayerView {
             for (col, &mode) in pair.iter().enumerate() {
                 let selected = explicit && current == mode;
                 let enabled = mode == V::None || mode.available(s.timeline_thumbnails, s.timeline_waveform) != V::None;
-                line = line.child(div().id(SharedString::from(format!("timeline-card-{mode:?}-{row}-{col}")))
+                line = line.child(div().id(SharedString::from(format!("timeline-card-{fullscreen}-{mode:?}-{row}-{col}")))
                     .flex_1().min_w_0().flex().flex_col().gap_1().p_1().rounded(px(5.)).border_1()
                     .border_color(if selected { t.accent } else { t.border })
                     .bg(if selected { t.accent_soft } else { t.surface_alt })
@@ -191,8 +201,7 @@ impl PlayerView {
         let cursor = s.timeline_hover_playhead;
         let adaptive = s.timeline_adaptive;
         let viewport = window.viewport_size();
-        let bar = self.control_bounds.get();
-        let bottom = if bar.size.height > px(0.) { bar.top() } else { menu.pos.y };
+        let bottom = menu.pos.y;
         let width = px(370.).min((viewport.width - px(8.)).max(px(100.)));
         let available = (bottom - px(8.)).max(px(100.));
         let panel_height = px(600.).min(available).min((viewport.height - px(8.)).max(px(100.)));
@@ -228,7 +237,7 @@ impl PlayerView {
         }
         appearance = appearance.child(slider_label("Height", format!("{height} px")))
             .when(visible, |d| d.child(self.slider("timeline-height-slider", (height - 12) as f32 / 84., false, t, move |this, f, _, _| {
-                let n = 12 + 4 * (f * 21.).round() as u32;
+                let n = 12 + (f * 84.).round() as u32;
                 if fs { this.settings.timeline_fullscreen_height = Some(n); } else {
                     this.settings.timeline_filmstrip_height = n;
                     this.settings.timeline_filmstrip_min_height = this.settings.timeline_filmstrip_min_height.min(n);
@@ -240,7 +249,7 @@ impl PlayerView {
             if adaptive && visible {
                 appearance = appearance.child(slider_label("Minimum height", format!("{min_height} px")))
                     .when(height > 12, |d| d.child(self.slider("timeline-min-height-slider", (min_height - 12) as f32 / (height - 12) as f32, false, t, move |this, f, _, _| {
-                        this.settings.timeline_filmstrip_min_height = (12 + 4 * (f * (height - 12) as f32 / 4.).round() as u32).min(height);
+                        this.settings.timeline_filmstrip_min_height = (12 + (f * (height - 12) as f32).round() as u32).min(height);
                     }, cx)));
             }
         }
