@@ -188,6 +188,29 @@ pub fn apply(cx: &mut App, overrides: &BTreeMap<String, Vec<String>>) {
         current.insert(c.id, keys);
     }
     bindings.push(KeyBinding::new("escape", CloseOverlay, Some("Overlay")));
+    // Fixed navigation keys, scoped to the focused playlist rather than playback.
+    let playlist = Some(PLAYLIST_CTX);
+    bindings.extend([
+        KeyBinding::new("tab", PlaylistFocus, Some("PlaylistVisible")),
+        KeyBinding::new("shift-tab", PlaylistFocus, Some("PlaylistVisible")),
+        KeyBinding::new("tab", PlaylistFocus, Some("EditingText")),
+        KeyBinding::new("shift-tab", PlaylistFocusPlayer, Some("EditingText")),
+        KeyBinding::new("tab", PlaylistFocusPlayer, playlist),
+        KeyBinding::new("shift-tab", PlaylistFocusPlayer, playlist),
+        KeyBinding::new("escape", PlaylistFocusPlayer, playlist),
+        KeyBinding::new("up", PlaylistUp, playlist),
+        KeyBinding::new("down", PlaylistDown, playlist),
+        KeyBinding::new("shift-up", PlaylistExtendUp, playlist),
+        KeyBinding::new("shift-down", PlaylistExtendDown, playlist),
+        KeyBinding::new("home", PlaylistHome, playlist),
+        KeyBinding::new("end", PlaylistEnd, playlist),
+        KeyBinding::new("pageup", PlaylistPageUp, playlist),
+        KeyBinding::new("pagedown", PlaylistPageDown, playlist),
+        KeyBinding::new("delete", PlaylistDelete, playlist),
+        KeyBinding::new("enter", PlaylistPlay, playlist),
+        KeyBinding::new("secondary-a", PlaylistSelectAll, playlist),
+        KeyBinding::new("f3", PlaylistFilter, playlist),
+    ]);
     // A DVD menu's buttons take the arrow keys and Enter (after the rest,
     // so they win over seeking and volume while it shows).
     bindings.push(KeyBinding::new("up", DiscUp, Some(DVD_CTX)));

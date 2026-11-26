@@ -4,8 +4,10 @@ use crate::engine::thumbnails::{GenerationProgress, Thumbnail, ThumbnailSpec, ca
 use crate::engine::{MediaSource, PlaybackState, Player, Status, TrackId};
 use crate::settings::{Settings, TimelineVisualization};
 use gpui::{AnyElement, Bounds, ContentMask, Corners, Hsla, ImageId, RenderImage, canvas, div, point, prelude::*, px, relative, size};
+use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::rc::Rc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -46,6 +48,7 @@ impl Request {
 }
 
 struct Worker {
+    request: Request,
     cancel: Arc<AtomicBool>,
     generating: Arc<AtomicBool>,
     progress: Arc<GenerationProgress>,
@@ -91,16 +94,33 @@ impl Preview {
     }
 }
 
+type FilmstripSelection = Rc<RefCell<Option<(usize, f64, Vec<usize>)>>>;
+
+#[derive(Default)]
+struct BarcodeDisplay {
+    image: Option<(TimelineVisualization, u32, u32, Arc<RenderImage>)>,
+    retired: Vec<ImageId>,
+}
+
+impl BarcodeDisplay {
+    fn invalidate(&mut self) {
+        if let Some((_, _, _, image)) = self.image.take() { self.retired.push(image.id); }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct TimelineThumbnails {
     pub(super) waveform: super::waveform::Waveform,
     request: Option<Request>,
     worker: Option<Worker>,
     attempted: bool,
-    previews: Vec<Preview>,
+    previews: Arc<Vec<Preview>>,
+    filmstrip_selection: FilmstripSelection,
     samples: Option<Arc<Vec<Thumbnail>>>,
-    barcodes: Vec<(TimelineVisualization, Arc<RenderImage>)>,
-    barcode_worker: Option<(TimelineVisualization, Receiver<image::RgbaImage>)>,
+    barcodes: Vec<(TimelineVisualization, Arc<image::RgbaImage>)>,
+    barcode_display: Rc<RefCell<BarcodeDisplay>>,
+    barcode_worker: Option<(TimelineVisualization, Arc<AtomicBool>, Receiver<image::RgbaImage>)>,
+    barcode_fingerprint: Arc<OnceLock<u64>>,
     policy: Option<Policy>,
     maintenance: Option<Receiver<anyhow::Result<Stats>>>,
     maintenance_pending: bool,
@@ -115,17 +135,23 @@ impl TimelineThumbnails {
         if let Some(worker) = &self.worker {
             worker.cancel.store(true, Ordering::Relaxed);
         }
-        self.worker = None;
+        // Keep the worker until it acknowledges cancellation, so the playlist
+        // queue cannot start a second extractor for the same file and stream.
         self.request = None;
         self.attempted = false;
         self.take_images()
     }
 
     fn take_images(&mut self) -> Vec<ImageId> {
-        let mut retired: Vec<_> = self.previews.drain(..).map(|p| p.image.id).collect();
+        let mut retired: Vec<_> = self.previews.iter().map(|p| p.image.id).collect();
+        self.previews = Arc::default();
+        self.filmstrip_selection = Rc::default();
         self.samples = None;
-        self.barcode_worker = None;
-        retired.extend(self.barcodes.drain(..).map(|(_, image)| image.id));
+        if let Some((_, stop, _)) = self.barcode_worker.take() { stop.store(true, Ordering::Relaxed); }
+        self.barcode_fingerprint = Arc::default();
+        self.barcodes.clear();
+        self.barcode_display.borrow_mut().invalidate();
+        retired.extend(self.take_retired_barcode_images());
         retired
     }
 
@@ -142,11 +168,11 @@ impl TimelineThumbnails {
     }
 
     pub(super) fn busy_for(&self, path: &std::path::Path, stream: Option<usize>) -> bool {
-        self.worker.is_some() && self.request.as_ref().is_some_and(|r| r.path.as_path() == path && stream.is_none_or(|s| s == r.stream))
+        self.worker.as_ref().is_some_and(|w| w.request.path.as_path() == path && stream.is_none_or(|s| s == w.request.stream))
     }
 
     /// Called from the existing UI tick and engine events. Never blocks on extraction.
-    pub(super) fn update(&mut self, player: &Player, settings: &Settings, fullscreen: bool) -> (bool, Vec<ImageId>) {
+    pub(super) fn update(&mut self, player: &Player, settings: &Settings, fullscreen: bool, playlist_busy: bool) -> (bool, Vec<ImageId>) {
         let mut changed = self.update_cache(settings);
         let request = player.with_state(|st| Request::from_state(st, settings));
         let request_changed = self.request != request;
@@ -168,7 +194,7 @@ impl TimelineThumbnails {
                 match result {
                     Ok(images) => {
                         retired.extend(self.take_images());
-                        self.previews = images.thumbnails.iter().map(|t| {
+                        self.previews = Arc::new(images.thumbnails.iter().map(|t| {
                             let (width, height) = t.image.dimensions();
                             Preview {
                                 time: t.time,
@@ -176,7 +202,7 @@ impl TimelineThumbnails {
                                 width,
                                 height,
                             }
-                        }).collect();
+                        }).collect());
                         self.samples = Some(Arc::new(images.thumbnails));
                         self.maintenance_pending = true;
                         self.completed_path = self.request.as_ref().map(|r| (r.path.clone(), images.generated));
@@ -189,9 +215,11 @@ impl TimelineThumbnails {
         }
         if let Some(request) = &self.request
             && !self.attempted
+            && !playlist_busy
         {
             self.attempted = true;
             let request = request.clone();
+            let worker_request = request.clone();
             let config = settings.engine_config();
             let cancel = Arc::new(AtomicBool::new(false));
             let stop = cancel.clone();
@@ -202,12 +230,19 @@ impl TimelineThumbnails {
             let (tx, result) = std::sync::mpsc::channel();
             let auto_generate = settings.filmstrip_auto_video;
             match std::thread::Builder::new().name("timeline-thumbnails".into()).spawn(move || {
+                super::background_priority::lower();
                 let spec = ThumbnailSpec { stream: request.stream, count: request.count, width: 240, height: 135 };
                 let thumbnails = if auto_generate {
                     load_or_generate(&request.path, &config, spec, &request.directory, false, GenerationControl { stop: &stop, generating: &generation_flag, progress: &generation_progress })
                 } else {
                     load_cached(&request.path, spec, &request.directory, None)
                 }.map(|mut thumbnails| {
+                    // Use the persisted JPEG samples after a successful extraction,
+                    // so barcode keys are identical on the first and later opens.
+                    if generation_flag.load(Ordering::Relaxed)
+                        && !stop.load(Ordering::Relaxed)
+                        && let Ok(cached) = load_cached(&request.path, spec, &request.directory, None)
+                    { thumbnails = cached; }
                     // Extracted and cached images are RGBA; GPUI's RenderImage expects BGRA.
                     for thumbnail in &mut thumbnails {
                         let pixels: &mut [u8] = thumbnail.image.as_mut();
@@ -219,7 +254,7 @@ impl TimelineThumbnails {
                 });
                 let _ = tx.send(thumbnails);
             }) {
-                Ok(_) => self.worker = Some(Worker { cancel, generating, progress, result }),
+                Ok(_) => self.worker = Some(Worker { request: worker_request, cancel, generating, progress, result }),
                 Err(err) => { log::debug!("could not start thumbnail worker: {err}"); },
             }
         }
@@ -230,11 +265,12 @@ impl TimelineThumbnails {
 
     fn update_barcodes(&mut self, settings: &Settings, duration: f64, fullscreen: bool) -> bool {
         let mut changed = false;
-        if let Some((mode, receiver)) = &self.barcode_worker {
+        if let Some((mode, _, receiver)) = &self.barcode_worker {
             match receiver.try_recv() {
                 Ok(image) => {
-                    self.barcodes.push((*mode, Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(image)]))));
+                    self.barcodes.push((*mode, Arc::new(image)));
                     self.barcode_worker = None;
+                    self.maintenance_pending = true;
                     changed = true;
                 }
                 Err(TryRecvError::Empty) => return false,
@@ -249,10 +285,25 @@ impl TimelineThumbnails {
             && !self.barcodes.iter().any(|(existing, _)| *existing == mode)
         {
             let samples = samples.clone();
+            let fingerprint = self.barcode_fingerprint.clone();
+            let directory = settings.thumbnail_cache_dir();
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = stop.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             if std::thread::Builder::new().name("timeline-barcode".into()).spawn(move || {
-                let _ = tx.send(super::barcode::build(mode, &samples, duration));
-            }).is_ok() { self.barcode_worker = Some((mode, rx)); }
+                super::background_priority::lower();
+                use crate::engine::thumbnails::barcode_cache;
+                let id = *fingerprint.get_or_init(|| barcode_cache::fingerprint(&samples));
+                let Some(key) = super::barcode::cache_key(mode, id, duration) else { return; };
+                let image = barcode_cache::load(&directory, &key).unwrap_or_else(|_| {
+                    let image = super::barcode::build(mode, &samples, duration);
+                    if !worker_stop.load(Ordering::Relaxed)
+                        && let Err(err) = barcode_cache::save(&directory, &key, &image, &worker_stop)
+                    { log::debug!("barcode cache: {err}"); }
+                    image
+                });
+                let _ = tx.send(image);
+            }).is_ok() { self.barcode_worker = Some((mode, stop, rx)); }
         }
         changed
     }
@@ -307,6 +358,7 @@ impl TimelineThumbnails {
 
     pub(super) fn clear_cache(&mut self, settings: &Settings) {
         self.waveform.clear_pending();
+        if let Some((_, stop, _)) = &self.barcode_worker { stop.store(true, Ordering::Relaxed); }
         self.clear_pending = Some(Policy { directory: settings.thumbnail_cache_dir(), days: settings.thumbnail_cache_days, mb: settings.thumbnail_cache_mb });
         // Keep already loaded images; prevent an in-flight extraction from
         // writing the entry back after the user clears the cache.
@@ -342,16 +394,36 @@ impl TimelineThumbnails {
         self.available_visualization(st, settings, fullscreen) != TimelineVisualization::None
     }
 
-    pub(super) fn visualization(&self, mode: TimelineVisualization, duration: f64, height: f32, opacity: f32) -> AnyElement {
+    pub(super) fn take_retired_barcode_images(&self) -> Vec<ImageId> {
+        std::mem::take(&mut self.barcode_display.borrow_mut().retired)
+    }
+
+    pub(super) fn visualization(&self, mode: TimelineVisualization, duration: f64, height: f32, opacity: f32, resizing: bool) -> AnyElement {
         let element = match mode {
             TimelineVisualization::Filmstrip => self.filmstrip(duration, height),
-            TimelineVisualization::Waveform => self.waveform.element(height, 0.0),
-            TimelineVisualization::FilmstripWaveform => div().absolute().size_full().child(self.filmstrip(duration, height * 0.6)).child(self.waveform.element(height * 0.4, height * 0.6)).into_any_element(),
+            TimelineVisualization::Waveform => self.waveform.element(height, 0.0, resizing),
+            TimelineVisualization::FilmstripWaveform => div().absolute().size_full().child(self.filmstrip(duration, height * 0.6)).child(self.waveform.element(height * 0.4, height * 0.6, resizing)).into_any_element(),
             TimelineVisualization::None => div().into_any_element(),
             _ => {
                 let image = self.barcodes.iter().find(|(m, _)| *m == mode).map(|(_, image)| image.clone());
+                let display = self.barcode_display.clone();
                 canvas(|_, _, _| (), move |bounds, _, window, _| {
-                    if let Some(image) = &image {
+                    let Some(source) = &image else { return; };
+                    let w = f32::from(bounds.size.width);
+                    let h = f32::from(bounds.size.height);
+                    if w <= 0.0 || h <= 0.0 { return; }
+                    let scale = window.scale_factor();
+                    let width = (w * scale).round().clamp(1.0, 4096.0) as u32;
+                    let height = (h * scale).round().clamp(1.0, 1024.0) as u32;
+                    let mut display = display.borrow_mut();
+                    // Stretch the existing texture during panel drags; rebuild at
+                    // the final physical size when the slider is released.
+                    if display.image.as_ref().is_none_or(|(m, w, h, _)| *m != mode || (!resizing && (*w != width || *h != height))) {
+                        display.invalidate();
+                        let raster = super::barcode::display_raster(source, width, height);
+                        display.image = Some((mode, width, height, Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(raster)]))));
+                    }
+                    if let Some((_, _, _, image)) = &display.image {
                         let _ = window.paint_image(bounds, Corners::default(), image.clone(), 0, false);
                     }
                 }).absolute().top_0().left_0().w_full().h(px(height)).into_any_element()
@@ -362,6 +434,7 @@ impl TimelineThumbnails {
 
     fn filmstrip(&self, duration: f64, filmstrip_height: f32) -> AnyElement {
         let previews = self.previews.clone();
+        let selection = self.filmstrip_selection.clone();
         canvas(
             |_, _, _| (),
             move |clip, _, window, _| {
@@ -375,11 +448,19 @@ impl TimelineThumbnails {
                     let aspect = previews[0].width as f32 / previews[0].height as f32;
                     let count = ((width / (height * aspect)).round() as usize).clamp(1, 1024);
                     let cell = width / count as f32;
-                    for i in 0..count {
-                        let time = (i as f64 + 0.5) / count as f64 * duration;
-                        let Some(preview) = previews.iter().min_by(|a, b| {
-                            (a.time - time).abs().total_cmp(&(b.time - time).abs())
-                        }) else { continue };
+                    let mut selection = selection.borrow_mut();
+                    if selection.as_ref().is_none_or(|(n, d, _)| *n != count || *d != duration) {
+                        let indices = (0..count).filter_map(|i| {
+                            let time = (i as f64 + 0.5) / count as f64 * duration;
+                            previews.iter().enumerate().min_by(|(_, a), (_, b)| {
+                                (a.time - time).abs().total_cmp(&(b.time - time).abs())
+                            }).map(|(index, _)| index)
+                        }).collect();
+                        *selection = Some((count, duration, indices));
+                    }
+                    let Some((_, _, indices)) = selection.as_ref() else { return; };
+                    for (i, &index) in indices.iter().enumerate() {
+                        let preview = &previews[index];
                         let scale = ((cell - 1.0).max(0.0) / preview.width as f32).min(height / preview.height as f32);
                         let w = preview.width as f32 * scale;
                         let h = preview.height as f32 * scale;
@@ -415,8 +496,13 @@ impl TimelineThumbnails {
     }
 
     pub(super) fn nearest(&self, st: &PlaybackState, settings: &Settings, time: f64, fullscreen: bool) -> Option<&Preview> {
+        if !settings.timeline_hover_enabled(fullscreen) { return None; }
+        self.nearest_sample(st, settings, time)
+    }
+
+    pub(super) fn nearest_sample(&self, st: &PlaybackState, settings: &Settings, time: f64) -> Option<&Preview> {
         // Do not show the previous file's preview before the next UI tick.
-        if !settings.timeline_thumbnails || !settings.timeline_hover_enabled(fullscreen) || self.request != Request::from_state(st, settings) {
+        if !settings.timeline_thumbnails || self.request != Request::from_state(st, settings) {
             return None;
         }
         self.previews.iter().min_by(|a, b| (a.time - time).abs().total_cmp(&(b.time - time).abs()))
@@ -466,4 +552,26 @@ pub(super) fn hover_preview(fraction: f32, preview: &Preview, background: Hsla, 
         )
         .child(div().w_full().px_1().py(px(3.)).text_center().text_size(px(12.)).text_color(gpui::white()).child(label))
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelling_timeline_worker_keeps_its_media_reserved() {
+        let request = Request { path: "movie.mp4".into(), stream: 0, directory: "cache".into(), count: 20 };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_tx, result) = std::sync::mpsc::channel();
+        let mut timeline = TimelineThumbnails {
+            request: Some(request.clone()),
+            worker: Some(Worker { request: request.clone(), cancel: cancel.clone(), generating: Arc::new(AtomicBool::new(true)), progress: Arc::new(GenerationProgress::new(20)), result }),
+            ..Default::default()
+        };
+        assert!(timeline.reset().is_empty());
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(timeline.busy_for(&request.path, Some(0)));
+        assert!(!timeline.busy_for(&request.path, Some(1)));
+        assert!(!timeline.generating());
+    }
 }

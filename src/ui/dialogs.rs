@@ -204,7 +204,8 @@ impl PlayerView {
                 // Valid values were already applied by on_input_changed.
                 cx.notify();
             }
-            "shortcut_search" | "playlist_filter" => {}
+            "playlist_filter" => self.playlist_focus_list(window, cx),
+            "shortcut_search" => {}
             _ => self.close_dialog(window, cx),
         }
     }
@@ -214,6 +215,8 @@ impl PlayerView {
         match key {
             "playlist_filter" => {
                 self.pl_scroll.0.borrow().base_handle.set_offset(gpui::Point::default());
+                self.playlist_previews.hover = None;
+                self.refresh_playlist_hover(cx);
                 cx.notify();
                 return;
             }
@@ -602,13 +605,18 @@ impl PlayerView {
     fn visualization_number_row(&self, fullscreen: bool, height: bool, cx: &mut Context<Self>) -> AnyElement {
         let s = &self.settings;
         let mut options: Vec<_> = if height { (12..=96).step_by(4).map(|n| (format!("{n} px"), Some(n))).collect() } else { (50..=100).step_by(10).map(|n| (format!("{n}%"), Some(n))).collect() };
-        if fullscreen { options.insert(0, ("Same as in windowed mode".into(), None)); }
         let current = match (fullscreen, height) {
             (true, true) => s.timeline_fullscreen_height,
             (true, false) => s.timeline_fullscreen_opacity,
             (false, true) => Some(s.visualization_height(false)),
             (false, false) => Some(s.visualization_opacity(false)),
         };
+        // The timeline panel can set opacity in one-percent increments.
+        if let Some(n) = current && !options.iter().any(|(_, v)| *v == Some(n)) {
+            options.push((if height { format!("{n} px") } else { format!("{n}%") }, Some(n)));
+            options.sort_by_key(|(_, v)| *v);
+        }
+        if fullscreen { options.insert(0, ("Same as in windowed mode".into(), None)); }
         self.thumbnail_choice(if height { "thumb-fs-height" } else if fullscreen { "thumb-fs-opacity" } else { "thumb-opacity" }, if height { "Visualization height" } else { "Visualization opacity" }, options, current,
             s.visualization_enabled(fullscreen),
             move |t, v, _| match (fullscreen, height) {
@@ -1653,7 +1661,7 @@ impl PlayerView {
                         |t, _| t.settings.waveform_auto_audio = !t.settings.waveform_auto_audio, cx))
                     .child(self.thumbnail_toggle_row("filmstrip-auto-video", "Automatically create filmstrip thumbnails of video files", s.filmstrip_auto_video, s.timeline_thumbnails,
                         |t, _| t.settings.filmstrip_auto_video = !t.settings.filmstrip_auto_video, cx))
-                    .child(self.toggle_row("timeline-hover-playhead", "Show playhead on timeline hover", None, s.timeline_hover_playhead,
+                    .child(self.toggle_row("timeline-hover-playhead", "Show timeline preview cursor", Some("Mark the timestamp of the preview frame with a temporary vertical line while hovering."), s.timeline_hover_playhead,
                         |t, _| t.settings.timeline_hover_playhead = !t.settings.timeline_hover_playhead, cx))
                     .child(self.section("Windowed"))
                     .child(self.thumbnail_toggle_row(

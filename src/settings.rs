@@ -135,9 +135,9 @@ impl TimelineVisualization {
             Self::Filmstrip => "Filmstrip",
             Self::BarcodeAverage => "Barcode – average color",
             Self::BarcodeCompressed => "Barcode – compressed frames",
-            Self::Luma => "Luma",
-            Self::LumaRange => "Luma range",
-            Self::Saturation => "Saturation",
+            Self::Luma => "Average brightness",
+            Self::LumaRange => "Brightness range",
+            Self::Saturation => "Color saturation",
             Self::DominantColors => "Barcode – dominant colors",
             Self::VisualComplexity => "Visual complexity",
             Self::FrameDifference => "Frame difference",
@@ -153,7 +153,7 @@ pub enum PlaylistThumbnails { None, Hover, Inline, InlineSide }
 impl PlaylistThumbnails {
     pub const ALL: [Self; 4] = [Self::None, Self::Inline, Self::InlineSide, Self::Hover];
     pub fn label(self) -> &'static str {
-        match self { Self::None => "None", Self::Inline => "Inline", Self::InlineSide => "Inline + side on hover", Self::Hover => "Hover" }
+        match self { Self::None => "None", Self::Inline => "Inline preview", Self::InlineSide => "Inline + side preview", Self::Hover => "Side preview on hover" }
     }
     pub fn inline(self) -> bool { matches!(self, Self::Inline | Self::InlineSide) }
     pub fn side(self) -> bool { matches!(self, Self::Hover | Self::InlineSide) }

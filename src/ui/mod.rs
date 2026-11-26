@@ -3,6 +3,7 @@
 pub mod actions;
 mod activity;
 mod barcode;
+mod background_priority;
 mod cache_badges;
 pub mod bar;
 pub mod dialogs;
@@ -18,6 +19,7 @@ pub mod shell;
 pub mod text_input;
 pub mod theme;
 mod thumbnails;
+mod timeline_settings;
 pub mod tray;
 mod waveform;
 pub mod widgets;

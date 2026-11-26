@@ -293,7 +293,7 @@ pub struct Stats {
 pub fn maintain(policy: &Policy, clear: bool) -> anyhow::Result<Stats> {
     let _guard = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut entries = Vec::new();
-    for (version, magic) in [("v3", MAGIC), ("waveform-v1", crate::engine::waveform::MAGIC)] {
+    for (version, magic) in [("v3", MAGIC), ("waveform-v1", crate::engine::waveform::MAGIC), ("barcode-v1", super::barcode_cache::MAGIC)] {
         let dir = policy.directory.join(version);
         match fs::symlink_metadata(&dir) {
             Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}

@@ -99,6 +99,7 @@ impl MenuItem {
 }
 
 pub struct OpenMenu {
+    pub(super) timeline_settings: bool,
     pub items: Vec<MenuItem>,
     pub pos: Point<Pixels>,
     /// Which submenu is open at each nesting level.
@@ -115,7 +116,7 @@ pub struct OpenMenu {
 }
 
 impl OpenMenu {
-    fn scroll(&self, level: usize) -> ScrollHandle {
+    pub(super) fn scroll(&self, level: usize) -> ScrollHandle {
         let path: Vec<usize> = self.open_path.iter().take(level).copied().collect();
         let mut s = self.scrolls.borrow_mut();
         if s.len() <= level {
@@ -140,6 +141,7 @@ impl PlayerView {
         cx: &mut Context<Self>,
     ) {
         self.menu = Some(OpenMenu {
+            timeline_settings: false,
             items,
             pos,
             open_path: vec![],
@@ -152,7 +154,11 @@ impl PlayerView {
     }
 
     pub fn close_menu(&mut self, cx: &mut Context<Self>) {
-        if self.menu.take().is_some() {
+        if let Some(menu) = self.menu.take() {
+            if menu.timeline_settings {
+                self.settings.save();
+                self.drag = None;
+            }
             self.playlist_previews.resume_hover();
             self.note_activity(cx);
             cx.notify();
@@ -201,6 +207,13 @@ impl PlayerView {
                     }),
                 )
                 .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                .when(menu.timeline_settings, |d| d
+                    .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
+                        if this.handle_drag_move(ev, window, cx) { cx.stop_propagation(); }
+                    }))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                        if this.drag.is_some() { this.end_drag(window, cx); cx.stop_propagation(); }
+                    })))
         };
         let bar = self.menubar_bounds.get();
         let mut layer = div().absolute().top_0().left_0().size_full().on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, _, _| { this.playlist_previews.pointer = Some(ev.position); }));
@@ -211,6 +224,17 @@ impl PlayerView {
         } else {
             layer.child(backdrop("menu-backdrop").top_0().bottom_0())
         };
+        if menu.timeline_settings {
+            layer = layer
+                .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
+                    if this.handle_drag_move(ev, window, cx) { cx.stop_propagation(); }
+                }))
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                    if this.drag.is_some() { this.end_drag(window, cx); cx.stop_propagation(); }
+                }))
+                .child(self.timeline_settings_panel(menu, window, cx));
+            return Some(deferred(layer).with_priority(10).into_any_element());
+        }
         layer = layer.child(anchored().position(menu.pos).snap_to_window_with_margin(px(4.)).child(self.menu_panel(
             &menu.items,
             0,

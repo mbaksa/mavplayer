@@ -267,3 +267,4 @@ mod tests {
 
 /// Persistent JPEG cache shared by filmstrip and hover preview.
 pub mod cache;
+pub mod barcode_cache;

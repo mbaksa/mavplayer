@@ -64,6 +64,20 @@ actions!(
         ShowPreferences,
         ShowEffects,
         TogglePlaylist,
+        PlaylistFocus,
+        PlaylistFocusPlayer,
+        PlaylistUp,
+        PlaylistDown,
+        PlaylistExtendUp,
+        PlaylistExtendDown,
+        PlaylistHome,
+        PlaylistEnd,
+        PlaylistPageUp,
+        PlaylistPageDown,
+        PlaylistDelete,
+        PlaylistPlay,
+        PlaylistSelectAll,
+        PlaylistFilter,
         ToggleMenubar,
         JumpToTime,
         CycleAspect,
@@ -95,6 +109,8 @@ actions!(
 /// Key context of the player (everything but dialogs, menus and text fields).
 /// The key bindings themselves are in `keymap.rs`.
 pub const CTX: &str = "Player";
+/// Context of the focused playlist, excluding its text input.
+pub const PLAYLIST_CTX: &str = "Playlist";
 /// Added to the player's key context while a DVD menu shows buttons.
 pub const DVD_CTX: &str = "DvdMenu";
 

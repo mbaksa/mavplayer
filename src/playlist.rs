@@ -54,10 +54,12 @@ impl PlaylistItem {
 pub struct Selection {
     ids: HashSet<u64>,
     anchor: Option<u64>,
+    lead: Option<u64>,
 }
 
 impl Selection {
-    pub fn clear(&mut self) { self.ids.clear(); self.anchor = None; }
+    pub fn clear(&mut self) { self.ids.clear(); self.anchor = None; self.lead = None; }
+    pub fn lead(&self) -> Option<u64> { self.lead }
     pub fn contains(&self, id: u64) -> bool { self.ids.contains(&id) }
     pub fn ids(&self, items: &[PlaylistItem]) -> Vec<u64> {
         items.iter().filter(|it| self.contains(it.id)).map(|it| it.id).collect()
@@ -66,6 +68,7 @@ impl Selection {
         self.ids.clear();
         self.ids.insert(id);
         self.anchor = Some(id);
+        self.lead = Some(id);
     }
     pub fn select_if_empty(&mut self, items: &[PlaylistItem], index: usize) {
         if !items.iter().any(|it| self.contains(it.id)) && let Some(it) = items.get(index) { self.single(it.id); }
@@ -83,10 +86,25 @@ impl Selection {
         } else {
             self.single(item.id);
         }
+        self.lead = Some(item.id);
+    }
+    /// A range in a filtered playlist includes only the displayed rows.
+    pub fn click_visible(&mut self, items: &[PlaylistItem], visible: &[usize], index: usize, control: bool, shift: bool) {
+        if !shift || visible.len() == items.len() {
+            self.click(items, index, control, shift);
+            return;
+        }
+        let Some(end) = visible.iter().position(|&i| i == index) else { return; };
+        let start = self.anchor.and_then(|id| visible.iter().position(|&i| items[i].id == id)).unwrap_or(end);
+        if !control { self.ids.clear(); }
+        self.ids.extend(visible[start.min(end)..=start.max(end)].iter().map(|&i| items[i].id));
+        self.anchor = Some(items[visible[start]].id);
+        self.lead = Some(items[index].id);
     }
     pub fn remove(&mut self, ids: &[u64]) {
         self.ids.retain(|id| !ids.contains(id));
         if self.anchor.is_some_and(|id| ids.contains(&id)) { self.anchor = None; }
+        if self.lead.is_some_and(|id| ids.contains(&id)) { self.lead = None; }
     }
 }
 
@@ -565,6 +583,22 @@ mod tests {
 
     fn names(p: &Playlist) -> Vec<String> {
         p.items.iter().map(|i| i.source.display_name()).collect()
+    }
+
+    #[test]
+    fn playlist_filtered_range_tracks_lead_without_selecting_hidden_rows() {
+        let p = pl(&["a", "b", "c", "d", "e"]);
+        let visible = [0, 2, 4];
+        let mut selection = Selection::default();
+        selection.click_visible(&p.items, &visible, 0, false, false);
+        selection.click_visible(&p.items, &visible, 4, false, true);
+        assert_eq!(selection.ids(&p.items), vec![p.items[0].id, p.items[2].id, p.items[4].id]);
+        assert_eq!(selection.lead(), Some(p.items[4].id));
+        selection.click_visible(&p.items, &visible, 2, false, true);
+        assert_eq!(selection.ids(&p.items), vec![p.items[0].id, p.items[2].id]);
+        assert_eq!(selection.lead(), Some(p.items[2].id));
+        selection.remove(&[p.items[2].id]);
+        assert_eq!(selection.lead(), None);
     }
 
     #[test]

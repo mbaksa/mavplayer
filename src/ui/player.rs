@@ -120,6 +120,7 @@ pub struct PlayerView {
     playlist_save_at: Instant,
     pub theme: Theme,
     pub focus: FocusHandle,
+    pub(super) playlist_focus: FocusHandle,
     wake_pending: Arc<AtomicBool>,
 
     // Picture
@@ -134,6 +135,7 @@ pub struct PlayerView {
     pub outlined_sub_images: HashMap<u64, (Arc<RenderImage>, u32, u32, u32)>,
     pub subs: Vec<SubEvent>,
     pub video_bounds: Rc<Cell<Bounds<Pixels>>>,
+    pub(super) control_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// Last measured video-area geometry, including display scale.
     last_subtitle_geometry: Option<(f32, f32, f32, f32, f32)>,
     /// The menu bar row, left uncovered by an open menu-bar menu's backdrop
@@ -460,6 +462,9 @@ impl PlayerView {
 
         let theme = Theme::resolve(settings.theme, window);
         let focus = cx.focus_handle();
+        let playlist_focus = cx.focus_handle();
+        subs.push(cx.on_focus(&playlist_focus, window, |_, _, cx| cx.notify()));
+        subs.push(cx.on_blur(&playlist_focus, window, |_, _, cx| cx.notify()));
         window.focus(&focus);
         let video_bounds = Rc::new(Cell::new(Bounds::default()));
         let picture = cx.new(|_| super::picture::Picture {
@@ -481,6 +486,7 @@ impl PlayerView {
             resume,
             theme,
             focus,
+            playlist_focus,
             wake_pending,
             frame: None,
             frame_size: (0, 0),
@@ -489,6 +495,7 @@ impl PlayerView {
             outlined_sub_images: HashMap::new(),
             subs: Vec::new(),
             video_bounds,
+            control_bounds: Rc::new(Cell::new(Bounds::default())),
             last_subtitle_geometry: None,
             menubar_bounds: Default::default(),
             picture,
@@ -911,14 +918,27 @@ impl PlayerView {
     }
 
     fn update_thumbnails(&mut self, fullscreen: bool) -> bool {
-        let waveform_changed = self.thumbnails.waveform.update(&self.player, &self.settings, fullscreen);
+        let mut waveform_changed = false;
+        if self.playlist_previews.has_generation() || self.thumbnails.waveform.has_generation() {
+            let current = self.player.with_state(|st| match (&st.source, &st.status) {
+                (Some(MediaSource::File(path)), Status::Loading | Status::Playing | Status::Paused | Status::Ended) => Some(path.clone()),
+                _ => None,
+            });
+            // Do not hold the playback-state mutex while walking the playlist.
+            let paths: std::collections::HashSet<&Path> = self.playlist.items.iter().filter_map(|it| {
+                match &it.source { MediaSource::File(path) => Some(path.as_path()), _ => None }
+            }).collect();
+            let keep = |path: &Path| current.as_deref() == Some(path) || paths.contains(path);
+            waveform_changed = self.playlist_previews.retain_generation(&keep) | self.thumbnails.waveform.retain_generation(&keep);
+        }
+        waveform_changed |= self.thumbnails.waveform.update(&self.player, &self.settings, fullscreen);
         if self.thumbnails.waveform.take_maintenance() { self.thumbnails.refresh_cache_stats(); self.cache_badges.invalidate(); }
-        if self.settings.timeline_thumbnails && self.player.with_state(|st| {
+        let playlist_busy = self.settings.timeline_thumbnails && self.player.with_state(|st| {
             let Some(MediaSource::File(path)) = &st.source else { return false; };
             let stream = match st.selected.video { Some(TrackId::Stream(stream)) => Some(stream), _ => None };
             self.playlist_previews.generating_for(path, stream)
-        }) { return waveform_changed; }
-        let (changed, retired) = self.thumbnails.update(&self.player, &self.settings, fullscreen);
+        });
+        let (changed, retired) = self.thumbnails.update(&self.player, &self.settings, fullscreen, playlist_busy);
         self.retired.extend(retired.into_iter().map(|id| (id, RETIRE_AFTER)));
         if let Some((path, generated)) = self.thumbnails.take_completed_path() {
             if generated { self.playlist_previews.invalidate(&path); self.cache_badges.invalidate(); }
@@ -984,6 +1004,95 @@ impl PlayerView {
         }
         self.update_thumbnails(self.in_fullscreen);
         cx.notify();
+    }
+
+    /// The display indices are also used by keyboard navigation and selection.
+    pub(super) fn visible_playlist_indices(&self, cx: &App) -> Vec<usize> {
+        let query = if self.playlist_filter_open {
+            self.inputs.get("playlist_filter").map(|input| input.read(cx).text().trim().to_lowercase()).unwrap_or_default()
+        } else { String::new() };
+        if query.is_empty() {
+            (0..self.playlist.items.len()).collect()
+        } else {
+            self.playlist.items.iter().enumerate().filter_map(|(i, item)| {
+                item.source.display_name().to_lowercase().contains(&query).then_some(i)
+            }).collect()
+        }
+    }
+
+    pub(super) fn playlist_focus_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.playlist_shown() { return; }
+        window.focus(&self.playlist_focus);
+        let visible = self.visible_playlist_indices(cx);
+        if !visible.iter().any(|&i| self.playlist_selection.contains(self.playlist.items[i].id)) {
+            if let Some(&i) = visible.first() {
+                self.playlist_selection.single(self.playlist.items[i].id);
+                self.pl_scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+            }
+        }
+    }
+
+    fn playlist_focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.playlist_shown() { return; }
+        self.playlist_filter_open = true;
+        let input = self.input("playlist_filter", "Filter playlist…", window, cx);
+        window.focus(&input.focus_handle(cx));
+    }
+
+    fn playlist_key_move(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
+        let visible = self.visible_playlist_indices(cx);
+        let count = visible.len();
+        if count == 0 { return; }
+        let lead = self.playlist_selection.lead();
+        let pos = visible.iter().position(|&i| Some(self.playlist.items[i].id) == lead)
+            .or_else(|| visible.iter().position(|&i| self.playlist_selection.contains(self.playlist.items[i].id)));
+        let target = match pos {
+            Some(p) => p.saturating_add_signed(delta).min(count - 1),
+            None if delta < 0 => count - 1,
+            None => 0,
+        };
+        // Home/End use the same path even when nothing is selected.
+        let target = if delta == isize::MIN { 0 } else if delta == isize::MAX { count - 1 } else { target };
+        self.playlist_selection.click_visible(&self.playlist.items, &visible, visible[target], false, extend);
+        self.pl_scroll.scroll_to_item(target, if delta < 0 { gpui::ScrollStrategy::Top } else { gpui::ScrollStrategy::Bottom });
+        self.playlist_previews.hover = None;
+        self.refresh_playlist_hover(cx);
+    }
+
+    fn playlist_page_step(&self) -> isize {
+        let row_height = self.playlist_row_height();
+        (f32::from(self.pl_scroll.0.borrow().base_handle.bounds().size.height) / row_height).floor().max(1.0) as isize
+    }
+
+    fn playlist_key_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let visible = self.visible_playlist_indices(cx);
+        let ids: Vec<_> = visible.iter().map(|&i| self.playlist.items[i].id)
+            .filter(|&id| self.playlist_selection.contains(id)).collect();
+        if ids.is_empty() { return; }
+        let first = visible.iter().position(|&i| self.playlist_selection.contains(self.playlist.items[i].id)).unwrap_or(0);
+        self.remove_playlist_items(&ids, window, cx);
+        let visible = self.visible_playlist_indices(cx);
+        if let Some(&i) = visible.get(first.min(visible.len().saturating_sub(1))) {
+            self.playlist_selection.single(self.playlist.items[i].id);
+            self.pl_scroll.scroll_to_item(first.min(visible.len() - 1), gpui::ScrollStrategy::Bottom);
+        }
+    }
+
+    fn playlist_key_play(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let visible = self.visible_playlist_indices(cx);
+        let selected = |i: usize| self.playlist_selection.contains(self.playlist.items[i].id);
+        let lead = self.playlist_selection.lead();
+        let index = visible.iter().copied().find(|&i| selected(i) && Some(self.playlist.items[i].id) == lead)
+            .or_else(|| visible.iter().copied().find(|&i| selected(i)));
+        if let Some(i) = index { self.play_index(i, window, cx); }
+    }
+
+    fn playlist_key_select_all(&mut self, cx: &mut Context<Self>) {
+        let visible = self.visible_playlist_indices(cx);
+        if let (Some(&first), Some(&last)) = (visible.first(), visible.last()) {
+            self.playlist_selection.single(self.playlist.items[first].id);
+            self.playlist_selection.click_visible(&self.playlist.items, &visible, last, false, true);
+        }
     }
 
     pub(super) fn remove_playlist_items(&mut self, ids: &[u64], window: &mut Window, cx: &mut Context<Self>) {
@@ -1060,6 +1169,8 @@ impl PlayerView {
 
     pub fn retire_textures(&mut self, window: &mut Window) {
         self.last_render = Instant::now();
+        self.retired.extend(self.thumbnails.waveform.take_retired_images().into_iter().map(|id| (id, RETIRE_AFTER)));
+        self.retired.extend(self.thumbnails.take_retired_barcode_images().into_iter().map(|id| (id, RETIRE_AFTER)));
         if self.video_hidden && !self.hidden_to_tray {
             self.video_hidden = false;
             self.player.set_video_hidden(false);
@@ -1845,11 +1956,16 @@ impl PlayerView {
         let sub = cx.subscribe_in(&e, window, move |this, _, ev: &InputEvent, window, cx| match ev {
             InputEvent::Submit => this.on_input_submit(key, window, cx),
             InputEvent::Cancel if key == "volume" => this.finish_volume_edit(false, window, cx),
-            InputEvent::Cancel if key == "playlist_filter" => { this.playlist_filter_open = false; window.focus(&this.focus); cx.notify(); },
+            InputEvent::Cancel if key == "playlist_filter" => { this.playlist_filter_open = false; window.focus(&this.playlist_focus); cx.notify(); },
             InputEvent::Cancel => this.close_dialog(window, cx),
             InputEvent::Changed => this.on_input_changed(key, cx),
         });
         self._subs.push(sub);
+        if key == "playlist_filter" {
+            let focus = e.focus_handle(cx);
+            self._subs.push(cx.on_focus(&focus, window, |_, _, cx| cx.notify()));
+            self._subs.push(cx.on_blur(&focus, window, |_, _, cx| cx.notify()));
+        }
         self.inputs.insert(key, e.clone());
         e
     }
@@ -2546,6 +2662,20 @@ impl PlayerView {
             ShowPreferences => |this, w, cx| this.show_dialog(Dialog::Settings(0), w, cx),
             ShowEffects => |this, w, cx| this.show_dialog(Dialog::Effects(0), w, cx),
             TogglePlaylist => |this, w, cx| this.toggle_playlist(w, cx),
+            PlaylistFocus => |this, w, cx| this.playlist_focus_list(w, cx),
+            PlaylistFocusPlayer => |this, w, _cx| w.focus(&this.focus),
+            PlaylistUp => |this, _w, cx| this.playlist_key_move(-1, false, cx),
+            PlaylistDown => |this, _w, cx| this.playlist_key_move(1, false, cx),
+            PlaylistExtendUp => |this, _w, cx| this.playlist_key_move(-1, true, cx),
+            PlaylistExtendDown => |this, _w, cx| this.playlist_key_move(1, true, cx),
+            PlaylistHome => |this, _w, cx| this.playlist_key_move(isize::MIN, false, cx),
+            PlaylistEnd => |this, _w, cx| this.playlist_key_move(isize::MAX, false, cx),
+            PlaylistPageUp => |this, _w, cx| this.playlist_key_move(-this.playlist_page_step(), false, cx),
+            PlaylistPageDown => |this, _w, cx| this.playlist_key_move(this.playlist_page_step(), false, cx),
+            PlaylistDelete => |this, w, cx| this.playlist_key_delete(w, cx),
+            PlaylistPlay => |this, w, cx| this.playlist_key_play(w, cx),
+            PlaylistSelectAll => |this, _w, cx| this.playlist_key_select_all(cx),
+            PlaylistFilter => |this, w, cx| this.playlist_focus_filter(w, cx),
             ToggleMenubar => |this, _w, cx| {
                 this.settings.show_menubar = !this.settings.show_menubar;
                 this.settings.save();
@@ -2585,7 +2715,14 @@ impl PlayerView {
             FitWindow => |this, w, cx| this.fit_window(w, cx),
             ShowShortcuts => |this, w, cx| this.show_dialog(Dialog::Settings(super::dialogs::SHORTCUTS_TAB), w, cx),
             ShowAbout => |this, w, cx| this.show_dialog(Dialog::About, w, cx),
-            CloseOverlay => |this, w, cx| { this.close_menu(cx); this.close_dialog(w, cx) },
+            CloseOverlay => |this, w, cx| {
+                if this.menu.is_some() && this.dialog.is_none() && !this.editing_volume {
+                    this.close_menu(cx);
+                } else {
+                    this.close_menu(cx);
+                    this.close_dialog(w, cx);
+                }
+            },
             Quit => |this, _w, cx| { this.save_state(); super::shell::quit(cx) },
             HideToTray => |this, w, cx| this.hide_to_tray(w, cx),
             Seek0 => |this, _w, cx| this.seek_fraction(0.0, cx),

@@ -6,6 +6,22 @@ use image::{Rgba, RgbaImage};
 const WIDTH: u32 = 480;
 const HEIGHT: u32 = 32;
 
+/// Stable cache IDs, independent of enum order and user-facing labels.
+pub(super) fn cache_key(mode: Mode, samples: u64, duration: f64) -> Option<crate::engine::thumbnails::barcode_cache::Key> {
+    let (id, height) = match mode {
+        Mode::BarcodeAverage => (1, 1),
+        Mode::BarcodeCompressed => (2, HEIGHT),
+        Mode::Luma => (3, 1),
+        Mode::LumaRange => (4, HEIGHT),
+        Mode::Saturation => (5, 1),
+        Mode::DominantColors => (6, HEIGHT),
+        Mode::VisualComplexity => (7, 1),
+        Mode::FrameDifference => (8, 1),
+        _ => return None,
+    };
+    Some(crate::engine::thumbnails::barcode_cache::Key::new(samples, duration, id, WIDTH, height))
+}
+
 fn luma(p: &Rgba<u8>) -> u8 {
     ((722 * u32::from(p[0]) + 7152 * u32::from(p[1]) + 2126 * u32::from(p[2]) + 5000) / 10000) as u8
 }
@@ -117,9 +133,30 @@ pub(super) fn build(mode: Mode, thumbnails: &[Thumbnail], duration: f64) -> Rgba
     out
 }
 
+/// Scale the display raster without mixing neighboring analysis samples.
+pub(super) fn display_raster(image: &RgbaImage, width: u32, height: u32) -> RgbaImage {
+    image::imageops::resize(image, width, height, image::imageops::FilterType::Nearest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn display_raster_preserves_sample_colors() {
+        let colors = [Rgba([10, 20, 30, 255]), Rgba([200, 150, 100, 255])];
+        let source = RgbaImage::from_fn(2, 1, |x, _| colors[x as usize]);
+        let scaled = display_raster(&source, 7, 5);
+        assert_eq!(scaled.dimensions(), (7, 5));
+        assert_eq!(*scaled.get_pixel(0, 0), colors[0]);
+        assert_eq!(*scaled.get_pixel(6, 4), colors[1]);
+        assert!(scaled.pixels().all(|p| colors.contains(p)));
+        let vertical = RgbaImage::from_fn(1, 2, |_, y| colors[y as usize]);
+        let scaled = display_raster(&vertical, 5, 7);
+        assert_eq!(*scaled.get_pixel(0, 0), colors[0]);
+        assert_eq!(*scaled.get_pixel(4, 6), colors[1]);
+        assert!(scaled.pixels().all(|p| colors.contains(p)));
+    }
+
     #[test]
     fn barcode_uses_media_time_and_preserves_vertical_colors() {
         let mut image = RgbaImage::from_pixel(2, 32, Rgba([20, 40, 60, 255]));
@@ -127,6 +164,8 @@ mod tests {
         let samples = [Thumbnail { time: 1.0, image }, Thumbnail { time: 9.0, image: RgbaImage::from_pixel(2, 32, Rgba([200, 10, 5, 255])) }];
         let avg = build(Mode::BarcodeAverage, &samples, 10.0);
         let compressed = build(Mode::BarcodeCompressed, &samples, 10.0);
+        assert_eq!(avg.dimensions(), (480, 1));
+        assert_eq!(compressed.dimensions(), (480, 32));
         assert_eq!(*avg.get_pixel(0, 0), Rgba([60, 80, 100, 255]));
         assert_eq!(*avg.get_pixel(WIDTH - 1, 0), Rgba([200, 10, 5, 255]));
         assert_eq!(*compressed.get_pixel(0, 0), Rgba([20, 40, 60, 255]));
