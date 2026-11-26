@@ -195,6 +195,8 @@ pub fn apply(cx: &mut App, overrides: &BTreeMap<String, Vec<String>>) {
         KeyBinding::new("shift-tab", PlaylistFocus, Some("PlaylistVisible")),
         KeyBinding::new("tab", PlaylistFocus, Some("EditingText")),
         KeyBinding::new("shift-tab", PlaylistFocusPlayer, Some("EditingText")),
+        KeyBinding::new("up", PlaylistUp, Some("EditingText")),
+        KeyBinding::new("down", PlaylistDown, Some("EditingText")),
         KeyBinding::new("tab", PlaylistFocusPlayer, playlist),
         KeyBinding::new("shift-tab", PlaylistFocusPlayer, playlist),
         KeyBinding::new("escape", PlaylistFocusPlayer, playlist),

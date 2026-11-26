@@ -5,6 +5,7 @@ pub(crate) mod session;
 
 use crate::engine::MediaSource;
 use crate::engine::disc;
+use crate::fuzzy::{SearchField, SearchQuery};
 use crate::settings::RepeatMode;
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -48,6 +49,66 @@ impl PlaylistItem {
             (Some(t), None) => t.clone(),
             _ => self.source.display_name(),
         }
+    }
+}
+
+/// Cached searchable metadata and matching indices for the playlist filter.
+#[derive(Default)]
+pub(crate) struct FilterCache {
+    entries: Vec<FilterEntry>,
+    query: String,
+    visible: Vec<usize>,
+}
+
+struct FilterEntry {
+    id: u64,
+    source: MediaSource,
+    title: Option<String>,
+    artist: Option<String>,
+    fields: Vec<SearchField>,
+}
+
+impl FilterEntry {
+    fn new(item: &PlaylistItem) -> Self {
+        let mut fields = vec![
+            SearchField::new(&item.display_title()),
+            SearchField::new(&item.source.display_name()),
+            SearchField::new(&item.source.key()),
+        ];
+        if let Some(artist) = &item.artist {
+            fields.push(SearchField::new(artist));
+        }
+        Self { id: item.id, source: item.source.clone(), title: item.title.clone(), artist: item.artist.clone(), fields }
+    }
+
+    fn matches_item(&self, item: &PlaylistItem) -> bool {
+        self.id == item.id && self.source == item.source && self.title == item.title && self.artist == item.artist
+    }
+}
+
+impl FilterCache {
+    pub(crate) fn visible_indices(&mut self, items: &[PlaylistItem], text: &str) -> Vec<usize> {
+        let text = text.trim();
+        if text.is_empty() {
+            *self = Self::default();
+            return (0..items.len()).collect();
+        }
+
+        // Items can be reordered, replaced or updated by asynchronous metadata probes.
+        // Compare only searchable data, not playback status or duration.
+        let changed = self.entries.len() != items.len()
+            || !self.entries.iter().zip(items).all(|(entry, item)| entry.matches_item(item));
+        if changed {
+            self.entries = items.iter().map(FilterEntry::new).collect();
+        }
+        if changed || self.query != text {
+            let query = SearchQuery::new(text);
+            self.query = text.to_owned();
+            self.visible = self.entries.iter().enumerate()
+                .filter_map(|(i, entry)| (query.is_empty() || query.score(&entry.fields).is_some()).then_some(i))
+                .collect();
+        }
+        self.visible.clone()
     }
 }
 
@@ -584,6 +645,39 @@ mod tests {
 
     fn names(p: &Playlist) -> Vec<String> {
         p.items.iter().map(|i| i.source.display_name()).collect()
+    }
+
+    #[test]
+    fn playlist_fuzzy_filter_preserves_order_and_searches_metadata() {
+        let mut p = pl(&["/films/Mountain Landscape.mp4", "other.mp4", "mtn lnd.mp4"]);
+        p.items[1].title = Some("Landscape".into());
+        p.items[1].artist = Some("Mountain".into());
+        let mut cache = FilterCache::default();
+        assert_eq!(cache.visible_indices(&p.items, "MTN LND"), [0, 1, 2]);
+        assert_eq!(cache.visible_indices(&p.items, "films mtn"), [0]);
+        assert_eq!(cache.visible_indices(&p.items, "other mountain"), [1]);
+        assert!(cache.visible_indices(&p.items, "xyz").is_empty());
+        assert_eq!(cache.visible_indices(&p.items, "  "), [0, 1, 2]);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn playlist_fuzzy_filter_refreshes_when_searchable_data_changes() {
+        let mut p = pl(&["alpha.mp4", "beta.mp4"]);
+        let mut cache = FilterCache::default();
+        assert_eq!(cache.visible_indices(&p.items, "alpha"), [0]);
+        assert_eq!(cache.visible_indices(&p.items, "alpha"), [0]);
+        p.items.swap(0, 1);
+        assert_eq!(cache.visible_indices(&p.items, "alpha"), [1]);
+        p.items[0].title = Some("Alpha".into());
+        assert_eq!(cache.visible_indices(&p.items, "alpha"), [0, 1]);
+        p.items[0].title = None;
+        p.items[1].source = MediaSource::File("gamma.mp4".into());
+        assert!(cache.visible_indices(&p.items, "alpha").is_empty());
+        p.add(vec![MediaSource::File("alpha.mp4".into())]);
+        assert_eq!(cache.visible_indices(&p.items, "alpha"), [2]);
+        p.remove(2);
+        assert!(cache.visible_indices(&p.items, "alpha").is_empty());
     }
 
     #[test]

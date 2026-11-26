@@ -5,8 +5,6 @@
 mod engine;
 #[cfg(target_os = "linux")]
 mod font_prefetch;
-// The search engine is wired into the player in phase 11.2.
-#[cfg(test)]
 mod fuzzy;
 mod icons;
 mod instance;
