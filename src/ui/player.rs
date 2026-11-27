@@ -1761,7 +1761,7 @@ impl PlayerView {
         }
         // Avoid stopping playback before a move is confirmed durable.
         if self.playlist.current.is_some_and(|i| indices.contains(&i)) {
-            self.osd("Select another current item before moving this item", cx);
+            self.osd("Cannot move the selected items because one of them is currently open for playback.", cx);
             return;
         }
         let snapshot = self.playlist_snapshot();
@@ -1790,6 +1790,29 @@ impl PlayerView {
         match result {
             Ok(name) => self.osd(format!("Copied playlist: {name}"), cx),
             Err(err) => self.osd(format!("Could not confirm playlist copy: {err}"), cx),
+        }
+        cx.notify();
+    }
+
+    pub(super) fn move_playlist_to_collection(
+        &mut self,
+        id: crate::playlist::collections::CollectionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.playlist_library.collection_id() == Some(id) {
+            return;
+        }
+        let snapshot = self.playlist_snapshot();
+        let result = PlaylistLibrary::open_for_switch(id)
+            .and_then(|mut target| self.playlist_library.move_playlist_to(&mut target, &snapshot));
+        match result {
+            Ok(name) => {
+                self.stop_after_playlist_save(window, cx);
+                self.restore_playlist_workspace(window, cx);
+                self.osd(format!("Moved playlist: {name}"), cx);
+            }
+            Err(err) => self.osd(format!("Could not confirm playlist move: {err}"), cx),
         }
         cx.notify();
     }
@@ -3124,6 +3147,10 @@ impl PlayerView {
 
     pub fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_playlist_session(true, false);
+        self.stop_after_playlist_save(window, cx);
+    }
+
+    fn stop_after_playlist_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.thumbnails.waveform.reset();
         self.reset_thumbnails();
         self.save_current_position();

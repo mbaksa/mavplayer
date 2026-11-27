@@ -2907,7 +2907,9 @@ impl PlayerView {
                 this.show_dialog(super::dialogs::Dialog::NamePlaylist(false), w, cx)
             }),
             M::Header("TRANSFER".into()),
-            M::action("Copy playlist to collection…", |this, w, cx| this.open_copy_playlist(w, cx)),
+            M::action("Copy playlist to collection…", |this, w, cx| this.open_copy_playlist(false, w, cx)),
+            M::action("Move playlist to collection…", |this, w, cx| this.open_copy_playlist(true, w, cx))
+                .enabled(self.playlist_library.can_delete() && self.playlist_library.collection_id().is_some()),
             M::Header("SAVE".into()),
             M::action("Save current playlist state", |this, _, cx| this.save_playlist_workspace(cx))
                 .icon(Icon::Save)

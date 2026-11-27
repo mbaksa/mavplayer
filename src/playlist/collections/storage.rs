@@ -424,6 +424,222 @@ pub(crate) fn move_items_transaction(
     recover_move(paths, collection, false)
 }
 
+// A single cross-collection intent lives outside either participant. Both
+// collection locks must be held before publishing or replaying it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PlaylistMoveIntent {
+    version: u32,
+    transaction: Uuid,
+    source_before: super::CollectionManifest,
+    source_after: super::CollectionManifest,
+    destination_before: super::CollectionManifest,
+    destination_after: super::CollectionManifest,
+    playlist: PlaylistId,
+    source_json: Vec<u8>,
+    source_m3u: Vec<u8>,
+    destination_json: Vec<u8>,
+    destination_m3u: Vec<u8>,
+}
+
+fn playlist_move_path(paths: &CollectionPaths) -> PathBuf {
+    paths.index().with_file_name("playlist-move.pending.json")
+}
+
+fn playlist_move_lock(paths: &CollectionPaths) -> io::Result<fs::File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(paths.index().with_file_name("playlist-move.lock"))?;
+    file.try_lock().map_err(|err| io::Error::other(format!("Playlist transfer busy: {err}")))?;
+    Ok(file)
+}
+
+fn finish_playlist_move(paths: &CollectionPaths, intent: &PlaylistMoveIntent) -> io::Result<()> {
+    let source = intent.source_before.id;
+    let destination = intent.destination_before.id;
+    let id = intent.playlist;
+    if intent.version != 1
+        || intent.transaction.is_nil()
+        || source == destination
+        || intent.source_after.id != source
+        || intent.destination_after.id != destination
+        || !intent.source_before.playlist_order.contains(&id)
+        || intent.destination_before.playlist_order.contains(&id)
+    {
+        return Err(invalid("Invalid playlist transfer intent"));
+    }
+    let mut expected_source = intent.source_before.clone();
+    expected_source.playlist_order.retain(|entry| *entry != id);
+    if expected_source.active_playlist == Some(id) {
+        expected_source.active_playlist = expected_source.playlist_order.first().copied();
+    }
+    let mut expected_destination = intent.destination_before.clone();
+    expected_destination.playlist_order.push(id);
+    if expected_source.playlist_order.is_empty()
+        || expected_source != intent.source_after
+        || expected_destination != intent.destination_after
+    {
+        return Err(invalid("Invalid playlist transfer manifests"));
+    }
+    let src = PlaylistStore::new(paths, source, id);
+    let dst = PlaylistStore::new(paths, destination, id);
+    src.ensure_no_pending()?;
+    dst.ensure_no_pending()?;
+    let original = src.checked_manifest(&intent.source_json)?;
+    let moved = dst.checked_manifest(&intent.destination_json)?;
+    let mut expected = original.clone();
+    expected.name = moved.name.clone();
+    expected.revision = original.revision.checked_add(1).ok_or_else(|| invalid("Playlist revision overflow"))?;
+    if expected != moved || render_m3u(&moved)? != intent.destination_m3u {
+        return Err(conflict("Playlist transfer conflicts with source data"));
+    }
+    for (before, after) in
+        [(&intent.source_before, &intent.source_after), (&intent.destination_before, &intent.destination_after)]
+    {
+        before.validate().map_err(invalid)?;
+        after.validate().map_err(invalid)?;
+        let current: super::CollectionManifest =
+            serde_json::from_slice(&fs::read(paths.collection_manifest(before.id))?)?;
+        if current != *before && current != *after {
+            return Err(conflict("Playlist transfer conflicts with collection data"));
+        }
+    }
+    let source_current: super::CollectionManifest =
+        serde_json::from_slice(&fs::read(paths.collection_manifest(source))?)?;
+    for (path, bytes) in [(&src.json, &intent.source_json), (&src.m3u, &intent.source_m3u)] {
+        match read_optional(path)? {
+            Some(current) if current == *bytes => {}
+            None if source_current == intent.source_after => {}
+            _ => return Err(conflict("Playlist transfer conflicts with source files")),
+        }
+    }
+    for (path, bytes) in [(&dst.json, &intent.destination_json), (&dst.m3u, &intent.destination_m3u)] {
+        if let Some(current) = read_optional(path)?
+            && current != *bytes
+        {
+            return Err(conflict("Playlist transfer destination already exists"));
+        }
+    }
+    // Publish the destination pair and membership before removing source
+    // membership. Remove source files only after both manifests are durable.
+    for (path, bytes) in [(&dst.m3u, &intent.destination_m3u), (&dst.json, &intent.destination_json)] {
+        if read_optional(path)?.as_ref() != Some(bytes) {
+            write_atomic(path, bytes)?;
+        }
+    }
+    for manifest in [&intent.destination_after, &intent.source_after] {
+        write_atomic(&paths.collection_manifest(manifest.id), &serde_json::to_vec_pretty(manifest)?)?;
+    }
+    for path in [&src.json, &src.m3u] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    sync_directory(src.json.parent().unwrap_or(Path::new(".")))?;
+    let path = playlist_move_path(paths);
+    fs::remove_file(&path)?;
+    sync_directory(path.parent().unwrap_or(Path::new(".")))
+}
+
+pub(crate) fn recover_playlist_move(
+    paths: &CollectionPaths,
+    collection: CollectionId,
+    read_only: bool,
+) -> io::Result<()> {
+    let _guard = playlist_move_lock(paths)?;
+    let Some(bytes) = read_optional(&playlist_move_path(paths))? else { return Ok(()) };
+    let intent: PlaylistMoveIntent = serde_json::from_slice(&bytes)?;
+    let other = if collection == intent.source_before.id {
+        intent.destination_before.id
+    } else if collection == intent.destination_before.id {
+        intent.source_before.id
+    } else {
+        return Ok(());
+    };
+    if read_only {
+        return Err(conflict("Playlist transfer requires writable recovery"));
+    }
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(paths.collection_dir(other).join("collection.lock"))?;
+    lock.try_lock()
+        .map_err(|err| io::Error::other(format!("Playlist transfer recovery requires both collections: {err}")))?;
+    finish_playlist_move(paths, &intent)
+}
+
+pub(crate) fn move_playlist_transaction(
+    paths: &CollectionPaths,
+    source: &super::CollectionManifest,
+    destination: &super::CollectionManifest,
+    loaded: &LoadedPlaylist,
+    name: String,
+) -> io::Result<(super::CollectionManifest, super::CollectionManifest, LoadedPlaylist)> {
+    let _guard = playlist_move_lock(paths)?;
+    let path = playlist_move_path(paths);
+    if read_optional(&path)?.is_some() {
+        return Err(conflict("Previous playlist transfer requires recovery"));
+    }
+    let id = loaded.manifest.id;
+    let src = PlaylistStore::new(paths, source.id, id);
+    let dst = PlaylistStore::new(paths, destination.id, id);
+    src.ensure_no_pending()?;
+    dst.ensure_no_pending()?;
+    if fs::read(&src.json)? != loaded.original_json
+        || fs::read(&src.m3u)? != loaded.original_m3u
+        || loaded.externally_edited
+        || read_optional(&dst.json)?.is_some()
+        || read_optional(&dst.m3u)?.is_some()
+    {
+        return Err(conflict("Playlist changed on disk or destination files already exist"));
+    }
+    for manifest in [source, destination] {
+        let current: super::CollectionManifest =
+            serde_json::from_slice(&fs::read(paths.collection_manifest(manifest.id))?)?;
+        if current != *manifest {
+            return Err(conflict("Collection changed on disk; reopen before moving"));
+        }
+    }
+    let mut source_after = source.clone();
+    source_after.playlist_order.retain(|entry| *entry != id);
+    if source_after.active_playlist == Some(id) {
+        source_after.active_playlist = source_after.playlist_order.first().copied();
+    }
+    let mut destination_after = destination.clone();
+    destination_after.playlist_order.push(id);
+    source_after.validate().map_err(invalid)?;
+    destination_after.validate().map_err(invalid)?;
+    if source_after.playlist_order.is_empty() || !source.playlist_order.contains(&id) || source.id == destination.id {
+        return Err(invalid("Invalid playlist transfer"));
+    }
+    let mut manifest = loaded.manifest.clone();
+    manifest.name = name;
+    manifest.revision = manifest.revision.checked_add(1).ok_or_else(|| invalid("Playlist revision overflow"))?;
+    dst.validate(&manifest)?;
+    let intent = PlaylistMoveIntent {
+        version: 1,
+        transaction: Uuid::new_v4(),
+        source_before: source.clone(),
+        source_after,
+        destination_before: destination.clone(),
+        destination_after,
+        playlist: id,
+        source_json: loaded.original_json.clone(),
+        source_m3u: loaded.original_m3u.clone(),
+        destination_json: serde_json::to_vec_pretty(&manifest)?,
+        destination_m3u: render_m3u(&manifest)?,
+    };
+    write_atomic(&path, &serde_json::to_vec(&intent)?)?;
+    finish_playlist_move(paths, &intent)?;
+    Ok((intent.source_after, intent.destination_after, dst.load()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

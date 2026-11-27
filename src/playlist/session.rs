@@ -2,7 +2,8 @@
 //! explicitly saved (or autosaved) snapshot of each workspace.
 
 use super::collections::storage::{
-    LoadedPlaylist, PlaylistStore, move_items_transaction, recover_move, sync_directory, write_atomic,
+    LoadedPlaylist, PlaylistStore, move_items_transaction, move_playlist_transaction, recover_move,
+    recover_playlist_move, sync_directory, write_atomic,
 };
 use super::collections::{
     CollectionId, CollectionIndex, CollectionManifest, CollectionPaths, PlaylistEntry, PlaylistId, PlaylistItemId,
@@ -237,6 +238,9 @@ impl Library {
         temporary: bool,
     ) -> io::Result<Self> {
         let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
+        if !temporary {
+            recover_playlist_move(&paths, id, read_only)?;
+        }
         recover_move(&paths, id, read_only)?;
         let manifest_path = paths.collection_manifest(id);
         let manifest_bytes = fs::read(&manifest_path)?;
@@ -842,6 +846,59 @@ impl Library {
         Ok(indices.len())
     }
 
+    pub fn move_playlist_to(&mut self, target: &mut Self, snapshot: &Snapshot) -> io::Result<String> {
+        if !self.writable || !target.writable || self.temporary || target.temporary || self.slots.len() < 2 {
+            return Err(io::Error::other(
+                "Moving requires two writable permanent collections and another source playlist",
+            ));
+        }
+        let saved = &self.slots[self.active].saved;
+        if snapshot.sources != saved.sources
+            || snapshot.ids != saved.ids
+            || snapshot.custom_titles != saved.custom_titles
+        {
+            return Err(io::Error::other("Save source playlist edits before moving"));
+        }
+        self.capture(snapshot.clone(), true, true);
+        self.flush()?;
+        target.flush()?;
+        let source = self.storage.as_mut().ok_or_else(|| io::Error::other("Missing source storage"))?;
+        let destination = target.storage.as_mut().ok_or_else(|| io::Error::other("Missing destination storage"))?;
+        let slot = &self.slots[self.active];
+        let loaded = slot.stored.as_ref().ok_or_else(|| io::Error::other("Save source playlist first"))?;
+        // Reject collisions instead of silently merging identities.
+        if target.slots.iter().any(|other| other.id == slot.id) {
+            return Err(io::Error::other("Destination already contains this playlist ID"));
+        }
+        let name = if target.slots.iter().any(|other| other.name.eq_ignore_ascii_case(&slot.name)) {
+            (2..)
+                .map(|i| format!("{} {i}", slot.name))
+                .find(|name| !target.slots.iter().any(|other| other.name.eq_ignore_ascii_case(name)))
+                .unwrap()
+        } else {
+            slot.name.clone()
+        };
+        let result =
+            move_playlist_transaction(&source.paths, &source.collection, &destination.collection, loaded, name.clone());
+        let (source_next, destination_next, stored) = match result {
+            Ok(result) => result,
+            Err(err) => {
+                self.writable = false;
+                target.writable = false;
+                return Err(io::Error::other(format!("{err}; reopen collections before further writes")));
+            }
+        };
+        source.collection = source_next;
+        destination.collection = destination_next;
+        let mut slot = self.slots.remove(self.active);
+        slot.name = name.clone();
+        slot.stored = Some(stored);
+        slot.draft = None;
+        target.slots.push(slot);
+        self.active = 0;
+        Ok(name)
+    }
+
     /// Copy the live contents of a playlist into another, exclusively owned
     /// collection. The destination's active playlist is left unchanged.
     pub fn copy_playlist(&mut self, name: &str, autosave: bool, mut snapshot: Snapshot) -> io::Result<String> {
@@ -1204,6 +1261,36 @@ mod tests {
         assert_eq!(copied.position, original.position);
         drop(restored);
         drop(source);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn move_playlist_between_collections_preserves_ids_and_can_move_back() {
+        let root = std::env::temp_dir().join(format!("mavplayer-move-playlist-{}", uuid::Uuid::new_v4()));
+        let mut source = Library::open(&root).unwrap();
+        let source_id = source.collection_id().unwrap();
+        source.create("Transfer".into());
+        let original = snapshot("transfer.mp4", 12.5);
+        source.capture(original.clone(), true, true);
+        source.flush().unwrap();
+        let playlist_id = source.slots[source.active].id;
+        let target_id = Library::create_collection(&root, "Destination").unwrap();
+        let mut target = Library::open_selected(&root, Some(target_id), false).unwrap();
+        assert_eq!(source.move_playlist_to(&mut target, &original).unwrap(), "Transfer");
+        assert_eq!(source.slots.len(), 1);
+        assert_eq!(target.active, 0);
+        drop(source);
+        drop(target);
+        let mut source = Library::open_selected(&root, Some(source_id), false).unwrap();
+        let mut target = Library::open_selected(&root, Some(target_id), false).unwrap();
+        assert!(target.switch(1));
+        assert_eq!(target.slots[1].id, playlist_id);
+        assert_eq!(target.snapshot(), &original);
+        assert_eq!(target.move_playlist_to(&mut source, &original).unwrap(), "Transfer");
+        assert_eq!(source.slots[1].id, playlist_id);
+        assert_eq!(source.slots[1].snapshot(), &original);
+        drop(source);
+        drop(target);
         fs::remove_dir_all(root).unwrap();
     }
 

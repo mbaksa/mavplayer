@@ -102,6 +102,7 @@ pub(super) enum CopyChoice {
     Items(Vec<u64>),
     MoveItems(Vec<u64>),
     Playlist,
+    MovePlaylist,
 }
 
 pub struct OpenMenu {
@@ -544,7 +545,7 @@ impl PlayerView {
         self.open_copy_combo(combo, None, CopyChoice::MoveItems(ids), window, cx);
     }
 
-    pub(super) fn open_copy_playlist(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_copy_playlist(&mut self, moving: bool, window: &mut Window, cx: &mut Context<Self>) {
         let choices = match crate::playlist::session::Library::collection_choices(&crate::settings::config_dir()) {
             Ok(choices) => choices
                 .into_iter()
@@ -566,7 +567,7 @@ impl PlayerView {
         self.open_copy_combo(
             combo,
             Some(choices.into_iter().map(|(id, _)| id).collect()),
-            CopyChoice::Playlist,
+            if moving { CopyChoice::MovePlaylist } else { CopyChoice::Playlist },
             window,
             cx,
         );
@@ -610,6 +611,11 @@ impl PlayerView {
             match copy {
                 CopyChoice::Items(ids) => self.copy_playlist_items_to(index, &ids, cx),
                 CopyChoice::MoveItems(ids) => self.move_playlist_items_to(index, &ids, window, cx),
+                CopyChoice::MovePlaylist => {
+                    if let Some(Some(id)) = collection {
+                        self.move_playlist_to_collection(id, window, cx);
+                    }
+                }
                 CopyChoice::Playlist => {
                     if let Some(Some(id)) = collection {
                         self.copy_playlist_to_collection(id, cx);
