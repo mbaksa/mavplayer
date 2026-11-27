@@ -11,7 +11,10 @@ use unicode_segmentation::UnicodeSegmentation;
 
 actions!(
     text_input,
-    [Backspace, Delete, Left, Right, SelectLeft, SelectRight, SelectAll, Home, End, Paste, Cut, Copy, Submit, Cancel]
+    [
+        Backspace, Delete, Left, Right, WordLeft, WordRight, SelectLeft, SelectRight, SelectAll, Home, End, Paste, Cut,
+        Copy, Submit, Cancel
+    ]
 );
 
 pub fn bind_keys(cx: &mut App) {
@@ -21,6 +24,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("delete", Delete, ctx),
         KeyBinding::new("left", Left, ctx),
         KeyBinding::new("right", Right, ctx),
+        KeyBinding::new("ctrl-left", WordLeft, ctx),
+        KeyBinding::new("ctrl-right", WordRight, ctx),
         KeyBinding::new("shift-left", SelectLeft, ctx),
         KeyBinding::new("shift-right", SelectRight, ctx),
         KeyBinding::new("secondary-a", SelectAll, ctx),
@@ -96,6 +101,16 @@ impl TextInput {
         } else {
             self.move_to(self.selected_range.end, cx)
         }
+    }
+    fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let cursor = self.cursor_offset();
+        let target = self.content.unicode_word_indices().take_while(|(i, _)| *i < cursor).last().map_or(0, |(i, _)| i);
+        self.move_to(target, cx);
+    }
+    fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        let cursor = self.cursor_offset();
+        let target = self.content.unicode_word_indices().find(|(i, _)| *i > cursor).map_or(self.content.len(), |(i, _)| i);
+        self.move_to(target, cx);
     }
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.select_to(self.previous_boundary(self.cursor_offset()), cx);
@@ -480,6 +495,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
             .on_action(cx.listener(Self::select_all))

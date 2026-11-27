@@ -39,6 +39,7 @@ pub enum Dialog {
 const SETTINGS_TABS: &[&str] = &[
     "Interface",
     "Thumbnails",
+    "Playlist",
     "Playback",
     "Video",
     "Audio",
@@ -48,7 +49,7 @@ const SETTINGS_TABS: &[&str] = &[
     "Advanced",
 ];
 /// The Preferences category that lists (and edits) every keyboard shortcut.
-pub const SHORTCUTS_TAB: usize = 6;
+pub const SHORTCUTS_TAB: usize = 7;
 const EFFECT_TABS: &[&str] = &["Equalizer", "Audio Effects", "Picture", "Synchronization"];
 
 pub const EQ_PRESETS: &[(&str, [f32; 10])] = &[
@@ -95,7 +96,7 @@ impl PlayerView {
                     .items
                     .iter()
                     .find(|item| item.id == id)
-                    .and_then(|item| item.custom_title.clone())
+                    .map(|item| item.display_title())
                     .unwrap_or_default();
                 input.update(cx, |i, cx| i.set_text(title, cx));
                 window.focus(&input.focus_handle(cx));
@@ -250,6 +251,7 @@ impl PlayerView {
                     self.playlist_key_play(window, cx);
                 }
             }
+            "playlist_switch" => self.combo_submit(window, cx),
             "shortcut_search" => {}
             _ => self.close_dialog(window, cx),
         }
@@ -262,6 +264,16 @@ impl PlayerView {
                 self.pl_scroll.0.borrow().base_handle.set_offset(gpui::Point::default());
                 self.playlist_previews.hover = None;
                 self.refresh_playlist_hover(cx);
+                cx.notify();
+                return;
+            }
+            "playlist_switch" => {
+                if let Some(menu) = self.menu.as_mut() {
+                    if let Some(combo) = menu.playlist_switch.as_mut() {
+                        combo.filter(&text);
+                        menu.scroll(0).set_offset(gpui::Point::default());
+                    }
+                }
                 cx.notify();
                 return;
             }
@@ -1217,7 +1229,7 @@ impl PlayerView {
                     .into_any_element();
                 self.modal("Open URL", 560., body, Some(footer), cx)
             }
-            Dialog::EditPlaylistItemTitle(_) => {
+            Dialog::EditPlaylistItemTitle(id) => {
                 let body = div()
                     .p_4()
                     .flex()
@@ -1226,14 +1238,23 @@ impl PlayerView {
                     .child("Set a title for this playlist item without changing the media file. Leave empty to reset.")
                     .child(self.input_box("playlist_item_title"))
                     .into_any_element();
-                let footer = self
-                    .text_button(
+                let footer = div()
+                    .flex()
+                    .gap_2()
+                    .child(self.text_button(
+                        "playlist-item-title-reset",
+                        "Reset Title",
+                        false,
+                        move |this, _, w, cx| this.set_playlist_item_title(id, "", w, cx),
+                        cx,
+                    ))
+                    .child(self.text_button(
                         "playlist-item-title-confirm",
                         "Apply",
                         true,
                         |this, _, w, cx| this.on_input_submit("playlist_item_title", w, cx),
                         cx,
-                    )
+                    ))
                     .into_any_element();
                 self.modal("Edit item title", 420., body, Some(footer), cx)
             }
@@ -1803,41 +1824,6 @@ impl PlayerView {
                         |t, _| t.settings.start_fullscreen = !t.settings.start_fullscreen,
                         cx,
                     ))
-                    .child(self.toggle_row(
-                        "fsplaylist",
-                        "Hide the playlist in fullscreen",
-                        Some("Fullscreen starts without it (it can still be opened there); the window keeps its own"),
-                        s.hide_playlist_in_fullscreen,
-                        |t, _| t.settings.hide_playlist_in_fullscreen = !t.settings.hide_playlist_in_fullscreen,
-                        cx,
-                    ))
-                    .child(self.toggle_row(
-                        "playlist-autohide",
-                        "Automatically hide playlist",
-                        Some("Reveal an enabled playlist at the right edge without resizing the video."),
-                        s.playlist_autohide,
-                        |t, _| {
-                            t.settings.playlist_autohide = !t.settings.playlist_autohide;
-                            t.playlist_autohide_open = false;
-                        },
-                        cx,
-                    ))
-                    .child(self.section("Playlist labels"))
-                    .child(self.option_toggle(
-                        "playlist-compact-title", "Prefer media title without inline thumbnails",
-                        "Use the custom or embedded title instead of the file name when available.",
-                        s.playlist_compact_prefer_title, true, false,
-                        |t, _| t.settings.playlist_compact_prefer_title = !t.settings.playlist_compact_prefer_title, cx,
-                    ))
-                    .child(self.option_choice(
-                        "playlist-inline-labels", "Labels with inline thumbnails", "Show the title, file name or both.",
-                        vec![
-                            ("Title".into(), crate::settings::PlaylistLabels::Title),
-                            ("File name".into(), crate::settings::PlaylistLabels::FileName),
-                            ("Title and file name".into(), crate::settings::PlaylistLabels::Both),
-                        ],
-                        s.playlist_inline_labels, true, |t, v, _| t.settings.playlist_inline_labels = v, cx,
-                    ))
                     .child(self.section("Mouse"))
                     .child(self.toggle_row(
                         "clickpause",
@@ -1917,39 +1903,9 @@ impl PlayerView {
                 c = c.child(self.bar_controls_section(cx));
             }
             1 => {
-                use crate::settings::PlaylistThumbnails;
                 let video = s.timeline_thumbnails;
                 let audio = s.timeline_waveform;
-                let filmstrips_auto = video && s.filmstrip_auto_video;
-                let inline = s.playlist_thumbnails.inline();
                 let shown = s.visualization_enabled(false) || s.visualization_enabled(true);
-                let playlist_desc = match s.playlist_thumbnails {
-                    PlaylistThumbnails::None => "Show only an icon for each item.",
-                    PlaylistThumbnails::StaticInline => "Show one picture from each video next to its title.",
-                    PlaylistThumbnails::Inline => {
-                        "Show a picture next to each title. Moving the pointer across a row scrubs through its video thumbnails."
-                    }
-                    PlaylistThumbnails::InlineSide => {
-                        "Show a picture next to each title, and a larger preview beside the playlist while scrubbing across a row."
-                    }
-                    PlaylistThumbnails::Hover => {
-                        "Show a large preview beside the playlist while scrubbing across a row."
-                    }
-                };
-                let playlist_desc = if s.playlist_thumbnails.scrubbing() && !video {
-                    format!("{playlist_desc} Scrubbing needs video thumbnails, which are turned off.")
-                } else if s.playlist_thumbnails.scrubbing() {
-                    format!("{playlist_desc} Scrubbing works on videos that have video thumbnails.")
-                } else {
-                    playlist_desc.to_string()
-                };
-                let representative_desc = if !inline {
-                    "Only used when the playlist shows a picture next to each title."
-                } else if filmstrips_auto {
-                    "Already covered: video thumbnails are created automatically and include this picture."
-                } else {
-                    "Create one picture for each video added to the playlist, unless one is already cached."
-                };
                 c = c.w_full()
                     .child(self.section("Video thumbnails"))
                     .child(self.option_toggle(
@@ -1958,9 +1914,15 @@ impl PlayerView {
                         video, true, false, |t, _| t.settings.timeline_thumbnails = !t.settings.timeline_thumbnails, cx,
                     ))
                     .child(self.option_toggle(
-                        "filmstrip-auto-video", "Create automatically",
-                        "Sample a video when it plays or is added to the playlist. When off, only videos you create them for from the playlist's right-click menu get them.",
+                        "filmstrip-auto-video", "Create automatically for playlist items",
+                        "Sample videos as they are added or probed in the playlist, without waiting for playback.",
                         s.filmstrip_auto_video, video, true, |t, _| t.settings.filmstrip_auto_video = !t.settings.filmstrip_auto_video, cx,
+                    ))
+                    .child(self.option_toggle(
+                        "filmstrip-auto-playback", "Create automatically on playback",
+                        "Sample the current video when playback starts, unless a filmstrip is already cached.",
+                        s.filmstrip_auto_playback, video, true,
+                        |t, _| t.settings.filmstrip_auto_playback = !t.settings.filmstrip_auto_playback, cx,
                     ))
                     .child(self.option_toggle(
                         "chapter-thumbnails", "Show in the chapter list", "Show a picture from each chapter next to its title, once the video has video thumbnails.",
@@ -2010,15 +1972,6 @@ impl PlayerView {
                     .child(self.timeline_visualization_row(true, cx))
                     .child(self.visualization_number_row(true, false, cx))
                     .child(self.visualization_number_row(true, true, cx))
-                    .child(self.section("Playlist"))
-                    .child(self.option_choice("playlist-thumbnails", "Thumbnails", &playlist_desc,
-                        PlaylistThumbnails::ALL.into_iter().map(|mode| (mode.label().into(), mode)).collect(),
-                        s.playlist_thumbnails, true, |t, v, _| t.settings.playlist_thumbnails = v, cx))
-                    .child(self.option_toggle(
-                        "playlist-thumb-auto-video", "Create pictures automatically", representative_desc,
-                        s.playlist_thumbnail_auto_video || (inline && filmstrips_auto), inline && !filmstrips_auto, true,
-                        |t, _| t.settings.playlist_thumbnail_auto_video = !t.settings.playlist_thumbnail_auto_video, cx,
-                    ))
                     .child(self.section("Thumbnail and waveform cache"))
                     .child(self.row(
                         "Cache directory",
@@ -2072,6 +2025,99 @@ impl PlayerView {
                     ));
             }
             2 => {
+                use crate::settings::PlaylistThumbnails;
+                let video = s.timeline_thumbnails;
+                let filmstrips_auto = video && s.filmstrip_auto_video;
+                let inline = s.playlist_thumbnails.inline();
+                let playlist_desc = match s.playlist_thumbnails {
+                    PlaylistThumbnails::None => "Show only an icon for each item.",
+                    PlaylistThumbnails::StaticInline => "Show one picture from each video next to its title.",
+                    PlaylistThumbnails::Inline => {
+                        "Show a picture next to each title. Moving the pointer across a row scrubs through its video thumbnails."
+                    }
+                    PlaylistThumbnails::InlineSide => {
+                        "Show a picture next to each title, and a larger preview beside the playlist while scrubbing across a row."
+                    }
+                    PlaylistThumbnails::Hover => {
+                        "Show a large preview beside the playlist while scrubbing across a row."
+                    }
+                };
+                let playlist_desc = if s.playlist_thumbnails.scrubbing() && !video {
+                    format!("{playlist_desc} Scrubbing needs video thumbnails, which are turned off.")
+                } else if s.playlist_thumbnails.scrubbing() {
+                    format!("{playlist_desc} Scrubbing works on videos that have video thumbnails.")
+                } else {
+                    playlist_desc.to_string()
+                };
+                let representative_desc = if !inline {
+                    "Only used when the playlist shows a picture next to each title."
+                } else if filmstrips_auto {
+                    "Already covered: video thumbnails are created automatically and include this picture."
+                } else {
+                    "Create one picture for each video added to the playlist, unless one is already cached."
+                };
+                c = c
+                    .child(self.section("Windowed"))
+                    .child(self.toggle_row(
+                        "playlist-window-visible", "Show playlist", None, self.show_playlist,
+                        |t, _| {
+                            t.show_playlist = !t.show_playlist;
+                            t.settings.set_playlist_visibility(false, t.show_playlist);
+                            t.playlist_autohide_open = false;
+                        }, cx,
+                    ))
+                    .child(self.toggle_row(
+                        "playlist-window-autohide", "Autohide playlist", Some("Reveal the enabled playlist at the right edge."),
+                        s.playlist_autohide, |t, _| {
+                            t.settings.set_playlist_autohide_for(false, !t.settings.playlist_autohide);
+                            t.playlist_autohide_open = false;
+                        }, cx,
+                    ))
+                    .child(self.section("Fullscreen"))
+                    .child(self.toggle_row(
+                        "playlist-fs-visible", "Show playlist", None,
+                        s.fullscreen_playlist_initially_visible(),
+                        |t, _| {
+                            let visible = !t.settings.fullscreen_playlist_initially_visible();
+                            t.settings.set_playlist_visibility(true, visible);
+                            t.fs_playlist = visible;
+                            t.playlist_autohide_open = false;
+                        }, cx,
+                    ))
+                    .child(self.toggle_row(
+                        "playlist-fs-autohide", "Autohide playlist", Some("Reveal the enabled playlist at the right edge in fullscreen."),
+                        s.playlist_autohide_for(true), |t, _| {
+                            let enabled = t.settings.playlist_autohide_for(true);
+                            t.settings.set_playlist_autohide_for(true, !enabled);
+                            t.playlist_autohide_open = false;
+                        }, cx,
+                    ))
+                    .child(self.section("Playlist labels"))
+                    .child(self.option_toggle(
+                        "playlist-compact-title", "Prefer media title without inline thumbnails",
+                        "Use the custom or embedded title instead of the file name when available.",
+                        s.playlist_compact_prefer_title, true, false,
+                        |t, _| t.settings.playlist_compact_prefer_title = !t.settings.playlist_compact_prefer_title, cx,
+                    ))
+                    .child(self.option_choice(
+                        "playlist-inline-labels", "Labels with inline thumbnails", "Show the title, file name or both.",
+                        vec![
+                            ("Title".into(), crate::settings::PlaylistLabels::Title),
+                            ("File name".into(), crate::settings::PlaylistLabels::FileName),
+                            ("Title and file name".into(), crate::settings::PlaylistLabels::Both),
+                        ],
+                        s.playlist_inline_labels, true, |t, v, _| t.settings.playlist_inline_labels = v, cx,
+                    ))
+                    .child(self.section("Thumbnail display"))
+                    .child(self.playlist_mode_cards(PlaylistThumbnails::ALL.len(), cx))
+                    .child(div().text_size(px(12.)).text_color(self.theme.text_dim).child(playlist_desc))
+                    .child(self.option_toggle(
+                        "playlist-thumb-auto-video", "Create pictures automatically", representative_desc,
+                        s.playlist_thumbnail_auto_video || (inline && filmstrips_auto), inline && !filmstrips_auto, true,
+                        |t, _| t.settings.playlist_thumbnail_auto_video = !t.settings.playlist_thumbnail_auto_video, cx,
+                    ));
+            }
+            3 => {
                 c = c
                     .child(self.section("Playback"))
                     .child(self.toggle_row(
@@ -2252,7 +2298,7 @@ impl PlayerView {
                         ),
                     );
             }
-            3 => {
+            4 => {
                 c = c
                     .child(self.section("Decoding"))
                     .child(self.row("Hardware decoding", Some("Uses the GPU's video decoder (VA-API, NVDEC, D3D11, VideoToolbox); falls back to software automatically"), self.choice("hwdec", vec![("Automatic (above 1080p)".into(), HwDecode::Auto), ("Always".into(), HwDecode::Always), ("Off".into(), HwDecode::Off)], s.hwdec, |t, v, cx| {
@@ -2266,7 +2312,7 @@ impl PlayerView {
                     .child(self.row("Downscaling", Some("For pictures larger than the window"), self.choice("scale", vec![("Nearest neighbor".into(), ScaleQuality::Nearest), ("Linear".into(), ScaleQuality::Linear), ("Good (bicubic)".into(), ScaleQuality::Good), ("Best (Lanczos)".into(), ScaleQuality::Best)], s.scale_quality, |t, v, _| t.settings.scale_quality = v, cx)))
                     .children(self.upscaling_rows(cx));
             }
-            4 => {
+            5 => {
                 let mut devs: Vec<(String, Option<String>)> = vec![("System default".into(), None)];
                 devs.extend(self.audio_devices.iter().map(|d| (d.clone(), Some(d.clone()))));
                 c = c
@@ -2326,7 +2372,7 @@ impl PlayerView {
                         cx,
                     ));
             }
-            5 => {
+            6 => {
                 c = c
                     .child(self.section("Tracks"))
                     .child(self.row("Preferred subtitle languages", Some(&sub_langs_hint), self.input_box("sub_langs")))
@@ -2494,7 +2540,7 @@ impl PlayerView {
                         ),
                     ));
             }
-            7 => {
+            8 => {
                 c = c
                     .child(self.section("Network"))
                     .child(self.row(
@@ -2590,6 +2636,9 @@ impl PlayerView {
                                 |this, _, w, cx| {
                                     let recent = std::mem::take(&mut this.settings.recent);
                                     this.settings = crate::settings::Settings { recent, ..Default::default() };
+                                    this.show_playlist = this.settings.show_playlist;
+                                    this.fs_playlist = this.settings.fullscreen_playlist_initially_visible();
+                                    this.playlist_autohide_open = false;
                                     this.theme = super::theme::Theme::resolve(this.settings.theme, w);
                                     this.apply_settings(cx);
                                     this.osd("Preferences reset", cx);

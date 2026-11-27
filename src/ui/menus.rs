@@ -493,7 +493,7 @@ impl PlayerView {
             }
         }
         items.push(M::Separator);
-        items.push(M::action("Upscaling Settings…", |this, w, cx| this.show_dialog(Dialog::Settings(3), w, cx)));
+        items.push(M::action("Upscaling Settings…", |this, w, cx| this.show_dialog(Dialog::Settings(4), w, cx)));
         items
     }
 

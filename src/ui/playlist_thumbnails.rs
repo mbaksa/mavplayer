@@ -243,6 +243,15 @@ impl PlaylistPreviews {
             self.retired.push(id);
         }
     }
+    pub(super) fn cached_representative(&self, key: &Key, target: f64, default: f64) -> Option<&Preview> {
+        self.full_scrub(key, target).or_else(|| {
+            [target, default].into_iter().find_map(|time| {
+                self.entries.iter().find_map(|(k, t, p)| {
+                    if k == key && *t == time { p.as_ref() } else { None }
+                })
+            })
+        })
+    }
     pub fn scrub(&self, key: &Key, time: f64) -> Option<&Preview> {
         self.full_scrub(key, time).or_else(|| {
             if self.hover_worker.as_ref().is_some_and(|job| &job.key == key) {
@@ -489,13 +498,15 @@ impl PlaylistPreviews {
     }
 
     /// Called directly by pointer events and by worker wake-ups, not just the UI tick.
-    pub fn update_hover(&mut self, settings: &Settings, visible: bool, timeline: &TimelineThumbnails) -> bool {
+    pub fn update_hover(
+        &mut self, settings: &Settings, visible: bool, panel_item: Option<u64>, timeline: &TimelineThumbnails,
+    ) -> bool {
         let wanted = self
             .hover
             .as_ref()
             .filter(|h| {
                 visible
-                    && Self::mode(settings).scrubbing()
+                    && (Self::mode(settings).scrubbing() || panel_item == Some(h.id))
                     && h.key.directory == settings.thumbnail_cache_dir()
                     && timeline.for_playlist(&h.key.path, h.key.stream, h.key.count, 0.0).is_none()
                     && !timeline.busy_for(&h.key.path, Some(h.key.stream))
@@ -593,6 +604,7 @@ impl PlaylistPreviews {
         &mut self,
         settings: &Settings,
         visible: bool,
+        panel_item: Option<u64>,
         timeline: &TimelineThumbnails,
         current: &PlaybackState,
     ) -> (bool, Vec<ImageId>) {
@@ -632,8 +644,8 @@ impl PlaylistPreviews {
                 changed = true;
             }
         }
-        changed |= self.update_inline(visible && mode.inline());
-        changed |= self.update_hover(settings, visible, timeline);
+        changed |= self.update_inline(visible && (mode.inline() || panel_item.is_some()));
+        changed |= self.update_hover(settings, visible, panel_item, timeline);
         if let Some(worker) = &self.worker {
             let result = match worker.result.try_recv() {
                 Ok(result) => result,
@@ -851,6 +863,7 @@ mod tests {
         assert_eq!(PlaylistPreviews::mode(&settings), PlaylistThumbnails::StaticInline);
         assert!(settings.playlist_thumbnail_auto_video);
         assert!(!settings.filmstrip_auto_video);
+        assert!(!settings.filmstrip_auto_playback);
     }
 
     #[test]
@@ -871,10 +884,23 @@ mod tests {
         assert!(Arc::ptr_eq(&previews.inline_pair(&key, 35., 5.).unwrap().image, &chosen.image));
         previews.drop_full();
         settings.playlist_thumbnails = PlaylistThumbnails::InlineSide;
-        let (_, retired) = previews.update(&settings, true, &TimelineThumbnails::default(), &PlaybackState::default());
+        let (_, retired) = previews.update(&settings, true, None, &TimelineThumbnails::default(), &PlaybackState::default());
         assert!(retired.is_empty());
         assert!(Arc::ptr_eq(&previews.inline_pair(&key, 5., 5.).unwrap().image, &default.image));
         assert!(Arc::ptr_eq(&previews.inline_pair(&key, 35., 5.).unwrap().image, &chosen.image));
+        assert!(previews.pending.is_empty());
+    }
+
+    #[test]
+    fn panel_representative_lookup_prefers_selected_and_falls_back_to_default() {
+        let mut previews = PlaylistPreviews::default();
+        let key = Key { path: "movie.mp4".into(), stream: 0, count: 20, directory: "cache".into() };
+        let make = |time| Preview::from_bgra(Thumbnail { time, image: image::RgbaImage::new(2, 2) });
+        assert!(previews.cached_representative(&key, 35., 5.).is_none());
+        previews.remember_selection(key.clone(), 5., make(5.));
+        assert_eq!(previews.cached_representative(&key, 35., 5.).unwrap().time, 5.);
+        previews.remember_selection(key.clone(), 35., make(35.));
+        assert_eq!(previews.cached_representative(&key, 35., 5.).unwrap().time, 35.);
         assert!(previews.pending.is_empty());
     }
 

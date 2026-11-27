@@ -186,7 +186,7 @@ impl PlayerView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn timeline_panel_toggle(
+    pub(super) fn timeline_panel_toggle(
         &self,
         id: impl Into<ElementId>,
         text: &'static str,

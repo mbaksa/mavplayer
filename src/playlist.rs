@@ -1,6 +1,9 @@
 //! The play queue: ordering, shuffle/repeat, folder expansion and
 //! M3U / PLS import & export.
 
+// The collection model is exercised independently until storage is wired up.
+#[cfg(test)]
+pub(crate) mod collections;
 pub(crate) mod session;
 
 use crate::engine::MediaSource;

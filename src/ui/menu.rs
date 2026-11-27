@@ -5,7 +5,7 @@ use super::theme::Theme;
 use super::widgets::{icon, scrollbar_dragging, scrollbar_with_tolerance};
 use crate::icons::Icon;
 use gpui::{
-    AnyElement, Bounds, Context, Corner, MouseButton, Pixels, Point, ScrollHandle, SharedString, Window, anchored,
+    AnyElement, Bounds, Context, Corner, Focusable, MouseButton, Pixels, Point, ScrollHandle, SharedString, Window, anchored,
     canvas, deferred, div, point, prelude::*, px,
 };
 use std::cell::RefCell;
@@ -100,6 +100,11 @@ impl MenuItem {
 
 pub struct OpenMenu {
     pub(super) timeline_settings: bool,
+    pub(super) playlist_switch: Option<super::search_combo::SearchCombo>,
+    pub(super) playlist_context: bool,
+    pub(super) playlist_settings: bool,
+    pub(super) playlist_item: Option<u64>,
+    pub(super) panel_drag: Option<(Point<Pixels>, Pixels)>,
     pub items: Vec<MenuItem>,
     pub pos: Point<Pixels>,
     /// Which submenu is open at each nesting level.
@@ -142,6 +147,11 @@ impl PlayerView {
     ) {
         self.menu = Some(OpenMenu {
             timeline_settings: false,
+            playlist_switch: None,
+            playlist_context: false,
+            playlist_settings: false,
+            playlist_item: None,
+            panel_drag: None,
             items,
             pos,
             open_path: vec![],
@@ -160,7 +170,9 @@ impl PlayerView {
                 self.drag = None;
             }
             self.playlist_previews.resume_hover();
-            self.note_activity(cx);
+            if !menu.playlist_context {
+                self.note_activity(cx);
+            }
             cx.notify();
         }
     }
@@ -184,17 +196,46 @@ impl PlayerView {
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, ev: &gpui::MouseDownEvent, _, cx| {
+                    cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
                         this.playlist_previews.pointer = Some(ev.position);
-                        this.close_menu(cx);
+                        if this.menu.as_ref().is_some_and(|m| m.playlist_context && !m.playlist_settings)
+                            && let Some((id, _)) = this.playlist_item_at(ev.position)
+                        {
+                            if this.menu.as_ref().and_then(|m| m.playlist_item) == Some(id) {
+                                if this.scrub_playlist_panel_item(ev.position, cx) {
+                                    this.save_playlist_panel_thumbnail(id, cx);
+                                }
+                            } else {
+                                this.playlist_selection.single(id);
+                                this.open_playlist_item_actions(id, ev.position, window, cx);
+                            }
+                        } else {
+                            this.close_menu(cx);
+                        }
                         cx.stop_propagation();
                     }),
                 )
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(|this, ev: &gpui::MouseDownEvent, _, cx| {
+                    cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
                         this.playlist_previews.pointer = Some(ev.position);
-                        this.close_menu(cx);
+                        if this.menu.as_ref().is_some_and(|m| m.playlist_context)
+                            && this.playlist_shown() && this.playlist_bounds.get().contains(&ev.position)
+                        {
+                            if let Some((id, _)) = this.playlist_item_at(ev.position) {
+                                if this.menu.as_ref().and_then(|m| m.playlist_item) == Some(id) {
+                                    this.close_menu(cx);
+                                } else {
+                                    this.open_playlist_item_actions(id, ev.position, window, cx);
+                                }
+                            } else if this.menu.as_ref().is_some_and(|m| m.playlist_settings) {
+                                this.close_menu(cx);
+                            } else {
+                                this.open_playlist_settings(window, cx);
+                            }
+                        } else {
+                            this.close_menu(cx);
+                        }
                         cx.stop_propagation();
                     }),
                 )
@@ -206,6 +247,14 @@ impl PlayerView {
                         cx.stop_propagation();
                     }),
                 )
+                .when(menu.playlist_item.is_some(), |d| {
+                    d.on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, _, cx| {
+                        this.playlist_previews.pointer = Some(ev.position);
+                        if this.scrub_playlist_panel_item(ev.position, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
+                })
                 .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.stop_propagation()))
                 .when(menu.timeline_settings, |d| {
                     d.on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
@@ -226,8 +275,15 @@ impl PlayerView {
         };
         let bar = self.menubar_bounds.get();
         let mut layer = div().absolute().top_0().left_0().size_full().on_mouse_move(cx.listener(
-            |this, ev: &gpui::MouseMoveEvent, _, _| {
+            |this, ev: &gpui::MouseMoveEvent, _, cx| {
                 this.playlist_previews.pointer = Some(ev.position);
+                if this.menu.as_ref().and_then(|m| m.playlist_item).is_some()
+                    && this.playlist_previews.hover.as_ref().is_some_and(|h| !h.bounds.contains(&ev.position))
+                {
+                    this.playlist_previews.hover = None;
+                    this.refresh_playlist_hover(cx);
+                    cx.notify();
+                }
             },
         ));
         layer = if menu.menubar_index.is_some() && bar.size.height > px(0.) {
@@ -237,6 +293,10 @@ impl PlayerView {
         } else {
             layer.child(backdrop("menu-backdrop").top_0().bottom_0())
         };
+        if menu.playlist_switch.is_some() {
+            layer = layer.child(self.playlist_switch_panel(menu, window, cx));
+            return Some(deferred(layer).with_priority(10).into_any_element());
+        }
         if menu.timeline_settings {
             layer = layer
                 .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
@@ -254,6 +314,49 @@ impl PlayerView {
                     }),
                 )
                 .child(self.timeline_settings_panel(menu, window, cx));
+            return Some(deferred(layer).with_priority(10).into_any_element());
+        }
+        if menu.playlist_settings {
+            layer = layer
+                .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
+                    if let Some(menu) = this.menu.as_mut()
+                        && let Some((offset, height)) = menu.panel_drag
+                    {
+                        if ev.pressed_button == Some(MouseButton::Left) {
+                            let viewport = window.viewport_size();
+                            let width = menu.min_width.min((viewport.width - px(8.)).max(px(100.)));
+                            menu.pos = point(
+                                (ev.position.x - offset.x).clamp(px(4.), (viewport.width - width - px(4.)).max(px(4.))),
+                                (ev.position.y - offset.y).clamp(px(4.), (viewport.height - height - px(4.)).max(px(4.))),
+                            );
+                        } else {
+                            menu.panel_drag = None;
+                        }
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _cx| {
+                    if let Some(menu) = this.menu.as_mut() {
+                        menu.panel_drag = None;
+                    }
+                }));
+        }
+        if menu.playlist_context && menu.open_path.is_empty() {
+            layer = layer.child(self.playlist_context_panel(menu, window, cx));
+            return Some(deferred(layer).with_priority(10).into_any_element());
+        }
+        if menu.playlist_context {
+            let mut items = menu.items.as_slice();
+            let mut level = 0;
+            for &index in &menu.open_path {
+                let Some(MenuItem::Submenu { items: children, enabled: true, .. }) = items.get(index) else { break };
+                items = children;
+                level += 1;
+            }
+            let width = menu.min_width.min((win_w - px(8.)).max(px(100.)));
+            let panel = self.menu_panel(items, level, &menu.open_path, theme, width, (max_h, menu.scroll(level)), &menu.anchors, cx);
+            layer = layer.child(anchored().position(menu.pos).snap_to_window_with_margin(px(4.)).child(panel));
             return Some(deferred(layer).with_priority(10).into_any_element());
         }
         layer = layer.child(anchored().position(menu.pos).snap_to_window_with_margin(px(4.)).child(self.menu_panel(
@@ -294,6 +397,56 @@ impl PlayerView {
         Some(deferred(layer).with_priority(10).into_any_element())
     }
 
+    pub(super) fn open_playlist_switch(&mut self, pos: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let combo = super::search_combo::SearchCombo::new(
+            self.playlist_library.slots.iter().enumerate().map(|(i, slot)| (i, slot.name.clone())),
+            Some(self.playlist_library.active),
+        );
+        self.open_menu(Vec::new(), pos, None, cx);
+        if let Some(menu) = self.menu.as_mut() {
+            menu.playlist_switch = Some(combo);
+        }
+        let t = self.theme;
+        let input = self.input("playlist_switch", "Filter playlists…", window, cx);
+        input.update(cx, |input, cx| {
+            input.set_text("", cx);
+            input.colors = (t.text, t.text_disabled, t.accent_soft, t.accent);
+        });
+        window.focus(&input.focus_handle(cx));
+    }
+
+    pub(super) fn combo_page_step(&self) -> isize {
+        self.menu.as_ref().map_or(1, |menu| (f32::from(menu.scroll(0).bounds().size.height) / 42.).floor().max(1.) as isize)
+    }
+
+    pub(super) fn combo_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(menu) = self.menu.as_mut() else { return };
+        let scroll = menu.scroll(0);
+        if let Some(combo) = menu.playlist_switch.as_mut() {
+            combo.move_by(delta, &scroll);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn combo_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.menu.as_ref().and_then(|menu| menu.playlist_switch.as_ref()).and_then(|combo| combo.selected_id()) {
+            self.close_menu(cx);
+            window.focus(&self.playlist_focus);
+            self.switch_playlist_workspace(index, window, cx);
+        }
+    }
+
+    fn playlist_switch_panel(&self, menu: &OpenMenu, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(combo) = menu.playlist_switch.as_ref() else { return div().into_any_element() };
+        combo.render(
+            menu.pos, self.theme, menu.scroll(0), self.inputs.get("playlist_switch").cloned(), Icon::Playlist,
+            |this, id, w, cx| {
+                w.focus(&this.playlist_focus);
+                this.switch_playlist_workspace(id, w, cx);
+            }, window, cx,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn menu_panel(
         &self,
@@ -306,6 +459,8 @@ impl PlayerView {
         anchors: &Rc<RefCell<Vec<Bounds<Pixels>>>>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let roomy = self.menu.as_ref().is_some_and(|menu| menu.playlist_context);
+        let row_height = if roomy { 40. } else { ITEM_H };
         let has_checks = items.iter().any(|i| {
             matches!(i, MenuItem::Action { checked: Some(_), .. })
                 || matches!(i, MenuItem::Action { icon: Some(_), .. })
@@ -316,6 +471,7 @@ impl PlayerView {
             .flex()
             .flex_col()
             .min_w(min_width)
+            .when(roomy, |d| d.w(min_width))
             .max_h(max_h)
             .bg(theme.popup)
             .border_1()
@@ -325,7 +481,8 @@ impl PlayerView {
             .text_size(px(13.))
             .text_color(theme.text)
             .occlude()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .when(roomy, |d| d.on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation()));
         let mut panel = div()
             .id(SharedString::from(format!("menu-panel-{level}")))
             .flex()
@@ -368,7 +525,7 @@ impl PlayerView {
                     let pp = path_prefix.clone();
                     div()
                         .id(SharedString::from(format!("mi-{level}-{i}")))
-                        .h(px(if thumbnail.is_some() { 56.0 } else { ITEM_H }))
+                        .h(px(if thumbnail.is_some() { 56.0 } else { row_height }))
                         .flex_none()
                         .mx_1()
                         .px_2()
@@ -390,6 +547,7 @@ impl PlayerView {
                         .when_some(shortcut.clone(), |d, sc| d.child(div().text_size(px(11.)).opacity(0.65).child(sc)))
                         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                             if *hovered
+                                && !roomy
                                 && !scrollbar_dragging()
                                 && let Some(m) = this.menu.as_mut()
                                 && m.open_path.len() > pp.len()
@@ -418,7 +576,7 @@ impl PlayerView {
                     let mut row = div()
                         .id(SharedString::from(format!("ms-{level}-{i}")))
                         .relative()
-                        .h(px(ITEM_H))
+                        .h(px(row_height))
                         .flex_none()
                         .mx_1()
                         .px_2()
@@ -441,6 +599,7 @@ impl PlayerView {
                         row = row
                             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                                 if *hovered
+                                    && !roomy
                                     && !scrollbar_dragging()
                                     && let Some(m) = this.menu.as_mut()
                                     && m.open_path != pp
@@ -456,7 +615,7 @@ impl PlayerView {
                                 }
                             }));
                     }
-                    if open_here && enabled {
+                    if open_here && enabled && !roomy {
                         // Record where this row is so the submenu can be placed next to it.
                         let anchors = anchors.clone();
                         row = row.child(
@@ -487,6 +646,20 @@ impl PlayerView {
         // Fractional display scaling can leave a tiny apparent overflow even
         // when the menu content fits. Keep the normal tolerance in other UI.
         frame
+            .when(roomy, |d| {
+                d.child(div().flex_none().flex().items_center().justify_between().px_2().py_1()
+                    .border_b_1().border_color(theme.border)
+                    .when(level > 0, |d| d.child(div().id("playlist-menu-back").cursor_pointer().p_2()
+                        .hover(|s| s.bg(theme.hover)).child("‹ Back")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(menu) = this.menu.as_mut() { menu.open_path.pop(); }
+                            cx.notify();
+                        }))))
+                    .child(div().flex_1())
+                    .child(div().id("playlist-menu-close").cursor_pointer().p_2()
+                        .hover(|s| s.bg(theme.hover)).child(icon(Icon::WindowClose, px(16.), theme.text))
+                        .on_click(cx.listener(|this, _, _, cx| this.close_menu(cx)))))
+            })
             .child(panel)
             .child(scrollbar_with_tolerance(format!("menu-bar-{level}"), &scroll, theme, px(3.)))
             .into_any_element()

@@ -21,7 +21,7 @@ pub struct Tooltip {
 
 impl Render for Tooltip {
     fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let tooltip = div()
             .px_2()
             .py_1()
             .rounded(px(5.))
@@ -30,8 +30,12 @@ impl Render for Tooltip {
             .border_color(self.theme.border)
             .text_color(self.theme.text)
             .text_size(px(12.))
-            .shadow_md()
-            .child(self.text.clone())
+            .shadow_md();
+        if self.text.contains('\n') {
+            tooltip.flex().flex_col().children(self.text.split('\n').map(|line| div().child(line.to_owned())))
+        } else {
+            tooltip.child(self.text.clone())
+        }
     }
 }
 

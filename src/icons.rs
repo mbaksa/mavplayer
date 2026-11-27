@@ -60,6 +60,7 @@ pub enum Icon {
     Menu,
     More,
     Save,
+    Export,
     Delete,
     ZoomIn,
     ZoomOut,
@@ -121,6 +122,7 @@ impl Icon {
             Menu => "open-menu",
             More => "view-more",
             Save => "document-save",
+            Export => "document-export",
             Delete => "edit-delete",
             ZoomIn => "zoom-in",
             ZoomOut => "zoom-out",
@@ -240,6 +242,7 @@ const ALL: &[Icon] = &[
     Icon::Menu,
     Icon::More,
     Icon::Save,
+    Icon::Export,
     Icon::Delete,
     Icon::ZoomIn,
     Icon::ZoomOut,
@@ -424,7 +427,14 @@ impl AssetSource for Assets {
             return Ok(std::fs::read(p).ok().map(Cow::Owned));
         }
         if let Some(name) = path.strip_prefix("icons/").and_then(|n| n.strip_suffix(".svg")) {
-            return Ok(BUNDLED_ICONS.iter().find(|(n, _)| *n == name).map(|(_, d)| Cow::Borrowed(*d)));
+            if let Some((_, data)) = BUNDLED_ICONS.iter().find(|(n, _)| *n == name) {
+                return Ok(Some(Cow::Borrowed(*data)));
+            }
+            // Older bundled icon sets do not necessarily include document-export.
+            if name == "document-export" {
+                return Ok(Some(Cow::Borrowed(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 3H5v18h14v-7M13 3v6h6M13 3l6 6M11 13h11m-4-4 4 4-4 4"/></svg>"#)));
+            }
+            return Ok(None);
         }
         if path == "app-icon.svg" {
             return Ok(Some(Cow::Borrowed(include_bytes!("../assets/app-icon.svg"))));
@@ -433,10 +443,15 @@ impl AssetSource for Assets {
     }
 
     fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
-        Ok(BUNDLED_ICONS
+        let mut paths: Vec<SharedString> = BUNDLED_ICONS
             .iter()
             .map(|(n, _)| SharedString::from(format!("icons/{n}.svg")))
             .filter(|p| p.starts_with(path))
-            .collect())
+            .collect();
+        let export = "icons/document-export.svg";
+        if export.starts_with(path) && !BUNDLED_ICONS.iter().any(|(n, _)| *n == "document-export") {
+            paths.push(export.into());
+        }
+        Ok(paths)
     }
 }

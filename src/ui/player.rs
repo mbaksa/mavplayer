@@ -140,6 +140,8 @@ pub struct PlayerView {
     pub video_bounds: Rc<Cell<Bounds<Pixels>>>,
     pub(super) control_bounds: Rc<Cell<Bounds<Pixels>>>,
     pub(super) playlist_bounds: Rc<Cell<Bounds<Pixels>>>,
+    pub(super) playlist_row_bounds: Rc<RefCell<Vec<(u64, Bounds<Pixels>)>>>,
+    pub(super) playlist_scrub_bounds: Rc<RefCell<Vec<(u64, Bounds<Pixels>)>>>,
     /// Last measured video-area geometry, including display scale.
     last_subtitle_geometry: Option<(f32, f32, f32, f32, f32)>,
     /// The menu bar row, left uncovered by an open menu-bar menu's backdrop
@@ -190,8 +192,7 @@ pub struct PlayerView {
     /// The playlist beside the video in a window (saved in settings).
     pub show_playlist: bool,
     pub(super) playlist_autohide_open: bool,
-    /// The playlist in fullscreen, when "hide in fullscreen" gives fullscreen
-    /// its own state (it starts hidden every time).
+    /// Runtime fullscreen visibility, reset to the fullscreen preference on entry.
     pub fs_playlist: bool,
     /// Fullscreen as of the last render.
     pub in_fullscreen: bool,
@@ -528,7 +529,7 @@ impl PlayerView {
             playlist_save_at: Instant::now(),
             show_playlist: settings.show_playlist,
             playlist_autohide_open: false,
-            fs_playlist: false,
+            fs_playlist: settings.fullscreen_playlist_initially_visible(),
             in_fullscreen: window.is_fullscreen(),
             player,
             resume,
@@ -545,6 +546,8 @@ impl PlayerView {
             video_bounds,
             control_bounds: Rc::new(Cell::new(Bounds::default())),
             playlist_bounds: Rc::new(Cell::new(Bounds::default())),
+            playlist_row_bounds: Default::default(),
+            playlist_scrub_bounds: Default::default(),
             last_subtitle_geometry: None,
             menubar_bounds: Default::default(),
             picture,
@@ -731,7 +734,13 @@ impl PlayerView {
         if let Some(MediaSource::File(path)) = &st.source {
             self.playlist_previews.invalidate(path);
         }
-        let title = media.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| media.source_name.clone());
+        let title = self
+            .playlist
+            .current
+            .and_then(|i| self.playlist.items.get(i))
+            .and_then(|item| item.custom_title.clone())
+            .or_else(|| media.title.clone().filter(|t| !t.trim().is_empty()))
+            .unwrap_or_else(|| media.source_name.clone());
         window.set_window_title(&format!("{title} — MavPlayer"));
         if let Some(i) = self.playlist.current
             && let Some(it) = self.playlist.items.get_mut(i)
@@ -882,7 +891,8 @@ impl PlayerView {
 
     pub(super) fn refresh_playlist_hover(&mut self, cx: &mut Context<Self>) {
         let visible = self.playlist_shown();
-        if self.playlist_previews.update_hover(&self.settings, visible, &self.thumbnails) {
+        let panel_item = self.menu.as_ref().and_then(|m| m.playlist_item);
+        if self.playlist_previews.update_hover(&self.settings, visible, panel_item, &self.thumbnails) {
             cx.notify();
         }
     }
@@ -893,8 +903,29 @@ impl PlayerView {
         let current = self.player.state();
         let playlist_shown = self.playlist_shown();
         changed |= self.cache_badges.update(playlist_shown);
+        let panel_item = self.menu.as_ref().and_then(|m| m.playlist_item);
+        // An occluding popup can prevent delivery of the row's mouse-exit event.
+        if panel_item.is_some()
+            && self.playlist_previews.hover.as_ref().is_some_and(|h| {
+                !window.is_window_hovered() || !h.bounds.contains(&window.mouse_position())
+            })
+        {
+            self.clear_playlist_panel_scrub(cx);
+        }
+        if let Some(item) = panel_item.and_then(|id| self.playlist.items.iter().find(|it| it.id == id))
+            && let Some(key) = super::playlist_thumbnails::Key::new(item, &self.settings)
+        {
+            let duration = item.duration.unwrap_or_default();
+            let target = key.representative_time(&self.settings, duration);
+            let default = duration * crate::engine::thumbnails::representative_fraction(&key.path);
+            if self.thumbnails.for_playlist(&key.path, key.stream, key.count, target).is_none()
+                && self.playlist_previews.cached_representative(&key, target, default).is_none()
+            {
+                let _ = self.playlist_previews.inline_pair(&key, target, default);
+            }
+        }
         let (playlist_changed, retired) =
-            self.playlist_previews.update(&self.settings, playlist_shown, &self.thumbnails, &current);
+            self.playlist_previews.update(&self.settings, playlist_shown, panel_item, &self.thumbnails, &current);
         self.retired.extend(retired.into_iter().map(|id| (id, RETIRE_AFTER)));
         changed |= playlist_changed;
         if let Some(message) = self.playlist_previews.take_message() {
@@ -1206,6 +1237,12 @@ impl PlayerView {
     }
 
     fn playlist_focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.playlist_filter_open && self.playlist_shown() {
+            self.playlist_filter_open = false;
+            window.focus(&self.playlist_focus);
+            cx.notify();
+            return;
+        }
         if !self.playlist_enabled() {
             self.toggle_playlist(window, cx);
         }
@@ -1245,11 +1282,6 @@ impl PlayerView {
             .scroll_to_item(target, if delta < 0 { gpui::ScrollStrategy::Top } else { gpui::ScrollStrategy::Bottom });
         self.playlist_previews.hover = None;
         self.refresh_playlist_hover(cx);
-    }
-
-    fn playlist_page_step(&self) -> isize {
-        let row_height = self.playlist_row_height();
-        (f32::from(self.pl_scroll.0.borrow().base_handle.bounds().size.height) / row_height).floor().max(1.0) as isize
     }
 
     fn playlist_key_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1521,7 +1553,9 @@ impl PlayerView {
     ) {
         if let Some((index, item)) = self.playlist.items.iter_mut().enumerate().find(|(_, item)| item.id == id) {
             let title = title.trim();
-            item.custom_title = (!title.is_empty()).then(|| title.to_owned());
+            if item.custom_title.is_some() || title != item.display_title() {
+                item.custom_title = (!title.is_empty()).then(|| title.to_owned());
+            }
             if self.playlist.current == Some(index) {
                 window.set_window_title(&format!("{} — MavPlayer", item.display_title()));
             }
@@ -1556,15 +1590,6 @@ impl PlayerView {
         }
         self.stop(window, cx);
         self.playlist_library.switch(index);
-        self.restore_playlist_workspace(window, cx);
-    }
-
-    pub(super) fn close_playlist_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.playlist_library.can_close() {
-            return;
-        }
-        self.stop(window, cx);
-        self.playlist_library.close_active();
         self.restore_playlist_workspace(window, cx);
     }
 
@@ -1947,16 +1972,36 @@ impl PlayerView {
     }
 
     pub(super) fn prompt_playlist_add(&mut self, dirs_mode: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt_playlist_add_paths(dirs_mode, false, window, cx);
+    }
+
+    pub(super) fn prompt_playlist_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt_playlist_add_paths(false, true, window, cx);
+    }
+
+    fn prompt_playlist_add_paths(
+        &mut self, dirs_mode: bool, playlists_only: bool, window: &mut Window, cx: &mut Context<Self>,
+    ) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: !dirs_mode,
             directories: dirs_mode,
             multiple: true,
-            prompt: Some(if dirs_mode { "Add folder" } else { "Add files" }.into()),
+            prompt: Some(if playlists_only { "Import playlist from file" } else if dirs_mode { "Add folder" } else { "Add files" }.into()),
         });
         cx.spawn_in(window, async move |this, cx| match rx.await {
-            Ok(Ok(Some(paths))) => {
-                let _ =
-                    this.update_in(cx, |v, window, cx| v.enqueue_paths_at(v.playlist.items.len(), paths, window, cx));
+            Ok(Ok(Some(mut paths))) => {
+                let _ = this.update_in(cx, |v, window, cx| {
+                    if playlists_only {
+                        paths.retain(|p| p.extension().is_some_and(|e| {
+                            playlist::PLAYLIST_EXTS.contains(&e.to_string_lossy().to_ascii_lowercase().as_str())
+                        }));
+                        if paths.is_empty() {
+                            v.osd("No supported playlist files", cx);
+                            return;
+                        }
+                    }
+                    v.enqueue_paths_at(v.playlist.items.len(), paths, window, cx);
+                });
             }
             Ok(Err(e)) => {
                 let _ = this.update(cx, |v, cx| v.osd(format!("File dialog failed: {e}"), cx));
@@ -2172,7 +2217,7 @@ impl PlayerView {
                 self.player.load(src.clone(), LoadOptions { start_at, start_paused, ..Default::default() });
                 self.settings.add_recent(&src);
                 self.load_counter += 1;
-                window.set_window_title(&format!("DVD – Title {title} — MavPlayer"));
+                window.set_window_title(&format!("{} — MavPlayer", self.playlist.items[i].display_title()));
             }
             None => {
                 self.playlist.clear();
@@ -2231,7 +2276,7 @@ impl PlayerView {
         let (sw, sh) = (f32::from(screen.width) as f64 * 0.85, f32::from(screen.height) as f64 * 0.85);
         let chrome_h =
             f32::from(window.viewport_size().height) as f64 - f32::from(self.video_bounds.get().size.height) as f64;
-        let side = if self.show_playlist && !self.settings.playlist_autohide { 320.0 } else { 0.0 };
+        let side = if self.show_playlist && !self.settings.playlist_autohide_for(false) { 320.0 } else { 0.0 };
         let k = ((sw - side) / vw).min((sh - chrome_h) / vh).min(1.0);
         vw *= k;
         vh *= k;
@@ -2256,23 +2301,28 @@ impl PlayerView {
         window.is_fullscreen()
     }
 
-    /// Fullscreen has its own playlist state (starting hidden) when the
-    /// "hide in fullscreen" setting is on; otherwise it shares the window's.
-    fn fs_playlist_separate(&self, fullscreen: bool) -> bool {
-        fullscreen && self.settings.hide_playlist_in_fullscreen
+    pub(super) fn playlist_autohide(&self) -> bool {
+        self.settings.playlist_autohide_for(self.in_fullscreen)
     }
 
-    /// Whether the playlist is shown (as of the last render's fullscreen state).
+    pub(super) fn set_playlist_autohide(&mut self, enabled: bool) {
+        self.settings.set_playlist_autohide_for(self.in_fullscreen, enabled);
+        self.playlist_autohide_open = false;
+        self.playlist_previews.hover = None;
+        self.playlist_hovered = None;
+    }
+
+    /// Whether the playlist is enabled, even when temporarily autohidden.
     pub(super) fn playlist_enabled(&self) -> bool {
-        if self.fs_playlist_separate(self.in_fullscreen) { self.fs_playlist } else { self.show_playlist }
+        if self.in_fullscreen { self.fs_playlist } else { self.show_playlist }
     }
 
     pub fn playlist_shown(&self) -> bool {
-        self.playlist_enabled() && (!self.settings.playlist_autohide || self.playlist_autohide_open)
+        self.playlist_enabled() && (!self.playlist_autohide() || self.playlist_autohide_open)
     }
 
     pub(super) fn update_playlist_autohide(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if !self.settings.playlist_autohide || !self.playlist_enabled() {
+        if !self.playlist_autohide() || !self.playlist_enabled() {
             return;
         }
         if self.menu.is_some()
@@ -2315,25 +2365,25 @@ impl PlayerView {
 
     pub fn toggle_playlist(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.playlist_previews.hover = None;
-        if self.fs_playlist_separate(window.is_fullscreen()) {
+        self.track_fullscreen(window);
+        if self.in_fullscreen {
             self.fs_playlist = !self.fs_playlist;
         } else {
             self.show_playlist = !self.show_playlist;
-            self.settings.show_playlist = self.show_playlist;
+            self.settings.set_playlist_visibility(false, self.show_playlist);
         }
         self.playlist_autohide_open = self.playlist_enabled();
         cx.notify();
     }
 
-    /// Called every render: entering fullscreen starts with the playlist
-    /// hidden (if set so); leaving it brings back the window's layout.
+    /// Called every render: reset the transient reveal state when switching modes.
     pub fn track_fullscreen(&mut self, window: &Window) {
         let fs = window.is_fullscreen();
         if fs != self.in_fullscreen {
             self.in_fullscreen = fs;
             self.playlist_autohide_open = false;
             if fs {
-                self.fs_playlist = false;
+                self.fs_playlist = self.settings.fullscreen_playlist_initially_visible();
             }
         }
     }
@@ -2353,6 +2403,10 @@ impl PlayerView {
         let sub = cx.subscribe_in(&e, window, move |this, _, ev: &InputEvent, window, cx| match ev {
             InputEvent::Submit => this.on_input_submit(key, window, cx),
             InputEvent::Cancel if key == "volume" => this.finish_volume_edit(false, window, cx),
+            InputEvent::Cancel if key == "playlist_switch" => {
+                this.close_menu(cx);
+                window.focus(&this.playlist_focus);
+            }
             InputEvent::Cancel if key == "playlist_filter" => {
                 this.playlist_filter_open = false;
                 window.focus(&this.playlist_focus);
@@ -3080,10 +3134,14 @@ impl PlayerView {
             PlaylistDown => |this, _w, cx| this.playlist_key_move(1, false, cx),
             PlaylistExtendUp => |this, _w, cx| this.playlist_key_move(-1, true, cx),
             PlaylistExtendDown => |this, _w, cx| this.playlist_key_move(1, true, cx),
-            PlaylistHome => |this, _w, cx| this.playlist_key_move(isize::MIN, false, cx),
-            PlaylistEnd => |this, _w, cx| this.playlist_key_move(isize::MAX, false, cx),
-            PlaylistPageUp => |this, _w, cx| this.playlist_key_move(-this.playlist_page_step(), false, cx),
-            PlaylistPageDown => |this, _w, cx| this.playlist_key_move(this.playlist_page_step(), false, cx),
+            PlaylistExtendHome => |this, _w, cx| this.playlist_key_move(isize::MIN, true, cx),
+            PlaylistExtendEnd => |this, _w, cx| this.playlist_key_move(isize::MAX, true, cx),
+            ComboUp => |this, _w, cx| this.combo_move(-1, cx),
+            ComboDown => |this, _w, cx| this.combo_move(1, cx),
+            ComboPageUp => |this, _w, cx| this.combo_move(-this.combo_page_step(), cx),
+            ComboPageDown => |this, _w, cx| this.combo_move(this.combo_page_step(), cx),
+            ComboHome => |this, _w, cx| this.combo_move(isize::MIN, cx),
+            ComboEnd => |this, _w, cx| this.combo_move(isize::MAX, cx),
             PlaylistDelete => |this, w, cx| this.playlist_key_delete(w, cx),
             PlaylistPlay => |this, w, cx| this.playlist_key_play(w, cx),
             PlaylistSelectAll => |this, _w, cx| this.playlist_key_select_all(cx),
@@ -3177,6 +3235,13 @@ impl PlayerView {
     }
 
     pub fn controls_visible(&self) -> bool {
+        if self.in_fullscreen
+            && self.menu.as_ref().is_some_and(|m| m.playlist_context)
+            && self.player.is_active()
+            && !self.player.paused()
+        {
+            return false;
+        }
         self.last_activity.elapsed().as_secs_f64() < self.settings.controls_autohide_secs.max(0.5)
             || self.pointer_over_controls
             || self.menu.is_some()

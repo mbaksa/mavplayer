@@ -47,20 +47,14 @@ impl Snapshot {
 pub(crate) struct Slot {
     pub name: String,
     pub autosave: bool,
-    #[serde(default = "open_by_default")]
-    pub open: bool,
     saved: Snapshot,
     #[serde(skip)]
     draft: Option<Snapshot>,
 }
 
-fn open_by_default() -> bool {
-    true
-}
-
 impl Slot {
     fn new(name: String, autosave: bool) -> Self {
-        Self { name, autosave, open: true, saved: Snapshot::default(), draft: None }
+        Self { name, autosave, saved: Snapshot::default(), draft: None }
     }
 
     fn snapshot(&self) -> &Snapshot {
@@ -103,7 +97,6 @@ impl Library {
         for slot in &mut library.slots {
             slot.saved.normalize();
         }
-        library.slots[library.active].open = true;
         library.writable = true;
         library
     }
@@ -140,22 +133,6 @@ impl Library {
             return false;
         }
         self.active = index;
-        self.slots[index].open = true;
-        self.dirty = true;
-        true
-    }
-
-    pub fn can_close(&self) -> bool {
-        self.active != 0 || self.slots.iter().enumerate().any(|(i, s)| i != self.active && s.open)
-    }
-
-    pub fn close_active(&mut self) -> bool {
-        if !self.can_close() {
-            return false;
-        }
-        self.slots[self.active].open = false;
-        self.active = self.slots.iter().position(|s| s.open).unwrap_or(0);
-        self.slots[self.active].open = true;
         self.dirty = true;
         true
     }
@@ -169,9 +146,7 @@ impl Library {
             return false;
         }
         self.slots.remove(self.active);
-        let next = self.active.min(self.slots.len() - 1);
-        self.active = if self.slots[next].open { next } else { self.slots.iter().position(|s| s.open).unwrap_or(next) };
-        self.slots[self.active].open = true;
+        self.active = self.active.min(self.slots.len() - 1);
         self.dirty = true;
         true
     }
@@ -293,15 +268,16 @@ mod tests {
     }
 
     #[test]
-    fn closing_playlist_preserves_saved_contents() {
+    fn legacy_closed_playlist_preserves_saved_contents() {
         let mut lib = Library::empty(true);
         lib.create("Second".into());
         lib.capture(snapshot("movie.mp4", 42.), true, false);
-        assert!(lib.close_active());
-        assert_eq!(lib.active, 0);
-        assert!(!lib.slots[1].open);
-        let mut restored: Library = serde_json::from_str(&serde_json::to_string(&lib).unwrap()).unwrap();
-        assert!(!restored.slots[1].open);
+        assert!(lib.switch(0));
+        // Older versions could mark a saved playlist as closed. Ignore that flag.
+        let mut json = serde_json::to_value(&lib).unwrap();
+        json["slots"][1]["open"] = serde_json::Value::Bool(false);
+        let mut restored: Library = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.slots.len(), 2);
         assert!(restored.switch(1));
         assert_eq!(restored.snapshot(), &snapshot("movie.mp4", 42.));
     }

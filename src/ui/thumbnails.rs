@@ -23,12 +23,14 @@ struct Request {
     stream: usize,
     directory: PathBuf,
     count: u32,
+    auto_generate: bool,
 }
 
 impl Request {
     fn from_state(st: &PlaybackState, settings: &Settings) -> Option<Self> {
         if !settings.timeline_thumbnails
-            || (settings.playlist_thumbnails == crate::settings::PlaylistThumbnails::None
+            || (!settings.filmstrip_auto_playback
+                && settings.playlist_thumbnails == crate::settings::PlaylistThumbnails::None
                 && !settings.chapter_thumbnails
                 && ![false, true].into_iter().any(|fullscreen| {
                     settings.timeline_visualization(fullscreen).uses_video()
@@ -61,6 +63,7 @@ impl Request {
             stream,
             directory: settings.thumbnail_cache_dir(),
             count: crate::engine::thumbnails::sample_count(media.duration),
+            auto_generate: settings.filmstrip_auto_playback,
         })
     }
 }
@@ -297,7 +300,7 @@ impl TimelineThumbnails {
             let progress = Arc::new(GenerationProgress::new(request.count));
             let generation_progress = progress.clone();
             let (tx, result) = std::sync::mpsc::channel();
-            let auto_generate = settings.filmstrip_auto_video;
+            let auto_generate = request.auto_generate;
             match std::thread::Builder::new().name("timeline-thumbnails".into()).spawn(move || {
                 super::background_priority::lower();
                 let spec = ThumbnailSpec { stream: request.stream, count: request.count, width: 240, height: 135 };
@@ -863,7 +866,13 @@ mod tests {
 
     #[test]
     fn cancelling_timeline_worker_keeps_its_media_reserved() {
-        let request = Request { path: "movie.mp4".into(), stream: 0, directory: "cache".into(), count: 20 };
+        let request = Request {
+            path: "movie.mp4".into(),
+            stream: 0,
+            directory: "cache".into(),
+            count: 20,
+            auto_generate: false,
+        };
         let cancel = Arc::new(AtomicBool::new(false));
         let (_tx, result) = std::sync::mpsc::channel();
         let mut timeline = TimelineThumbnails {

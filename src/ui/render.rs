@@ -31,13 +31,27 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-fn waveform_badge(color: Hsla) -> AnyElement {
+pub(super) fn waveform_badge(color: Hsla) -> AnyElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
             for (i, h) in [3.0, 7.0, 11.0, 5.0, 8.0].into_iter().enumerate() {
                 let origin = point(bounds.origin.x + px(i as f32 * 2.4), bounds.origin.y + px((12.0 - h) * 0.5));
                 window.paint_quad(gpui::fill(Bounds::new(origin, size(px(1.5), px(h))), color));
+            }
+        },
+    )
+    .size(px(12.))
+    .into_any_element()
+}
+
+fn subtitle_badge(color: Hsla) -> AnyElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            for (x, y, w, h) in [(0., 1., 12., 1.), (0., 10., 12., 1.), (0., 2., 1., 8.), (11., 2., 1., 8.),
+                (2., 5., 3., 1.), (6., 5., 4., 1.), (2., 7., 5., 1.), (8., 7., 2., 1.)] {
+                window.paint_quad(gpui::fill(Bounds::new(point(bounds.left() + px(x), bounds.top() + px(y)), size(px(w), px(h))), color));
             }
         },
     )
@@ -104,7 +118,7 @@ fn waveform_thumbnail(peaks: Arc<crate::engine::waveform::Peaks>, color: Hsla) -
 const TITLEBAR_H: f32 = 34.0;
 /// Fullscreen control bar height: seek row (18) + gap (4) + buttons row (38)
 /// + vertical padding (6 + 8). The extra 40 px above it is only a gradient.
-const FULLSCREEN_CONTROL_BAR_H: f32 = 74.0;
+pub(super) const FULLSCREEN_CONTROL_BAR_H: f32 = 74.0;
 const RESIZE_EDGE: f32 = 6.0;
 /// Playlist row height and the list's vertical padding (`py_1`).
 const ROW_H: f32 = 34.0;
@@ -361,8 +375,13 @@ impl PlayerView {
         let t = self.theme;
         let controls = window.window_controls();
         let title: SharedString = self
-            .player
-            .with_state(|s| s.media.as_ref().map(|m| m.title.clone().unwrap_or_else(|| m.source_name.clone())))
+            .playlist
+            .current
+            .and_then(|i| self.playlist.items.get(i))
+            .and_then(|item| item.custom_title.clone())
+            .or_else(|| {
+                self.player.with_state(|s| s.media.as_ref().map(|m| m.title.clone().unwrap_or_else(|| m.source_name.clone())))
+            })
             .map(|n| format!("{n} — MavPlayer"))
             .unwrap_or_else(|| "MavPlayer".into())
             .into();
@@ -1492,10 +1511,12 @@ impl PlayerView {
             RepeatMode::One => Icon::RepeatOne,
         };
         let fullscreen = window.is_fullscreen();
-        let title = st
-            .media
-            .as_ref()
-            .map(|m| m.title.clone().unwrap_or_else(|| m.source_name.clone()))
+        let title = self
+            .playlist
+            .current
+            .and_then(|i| self.playlist.items.get(i))
+            .and_then(|item| item.custom_title.clone())
+            .or_else(|| st.media.as_ref().map(|m| m.title.clone().unwrap_or_else(|| m.source_name.clone())))
             .or_else(|| st.source.as_ref().map(|s| s.display_name()))
             .unwrap_or_default();
         let dim = t.text_dim;
@@ -1876,6 +1897,8 @@ impl PlayerView {
     }
 
     fn playlist_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.playlist_row_bounds.borrow_mut().clear();
+        self.playlist_scrub_bounds.borrow_mut().clear();
         let t = self.theme;
         let viewport = window.viewport_size();
         let max_width = (f32::from(viewport.width) - 120.).max(120.);
@@ -1938,12 +1961,12 @@ impl PlayerView {
                             ))),
                     )
                     .child(icon(Icon::DropDown, px(12.), t.text_dim))
-                    .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                    .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                         if ev.is_right_click() {
                             return;
                         }
-                        let items = this.playlist_switch_menu();
-                        this.open_menu(items, super::menu::below(switch_bounds.get()), None, cx);
+                        window.focus(&this.playlist_focus);
+                        this.open_playlist_switch(super::menu::below(switch_bounds.get()), window, cx);
                         cx.stop_propagation();
                     })),
             )
@@ -1985,25 +2008,11 @@ impl PlayerView {
                 cx,
             ))
             .child(self.icon_button(
-                "pl-save",
-                Icon::Save,
-                "Export playlist (M3U)",
+                "pl-settings",
+                Icon::Settings,
+                "Playlist settings",
                 t,
-                |this, _, w, cx| this.save_playlist(w, cx),
-                cx,
-            ))
-            .child(self.icon_button(
-                "pl-clear",
-                Icon::Clear,
-                "Clear playlist",
-                t,
-                |this, _, w, cx| {
-                    this.stop(w, cx);
-                    this.playlist.clear();
-                    this.playlist_selection.clear();
-                    this.playlist_hovered = None;
-                    cx.notify();
-                },
+                |this, _, w, cx| this.open_playlist_settings(w, cx),
                 cx,
             ));
 
@@ -2018,6 +2027,8 @@ impl PlayerView {
             "playlist-items",
             count,
             cx.processor(move |this, range: std::ops::Range<usize>, _w, cx| {
+                this.playlist_row_bounds.borrow_mut().clear();
+                this.playlist_scrub_bounds.borrow_mut().clear();
                 let t = this.theme;
                 let badge_entries = range
                     .clone()
@@ -2097,7 +2108,8 @@ impl PlayerView {
                         };
                         // Scrubbing reads cached filmstrip samples. Without them a row has
                         // nothing to scrub through, so it behaves like a static thumbnail.
-                        let can_scrub = mode.scrubbing()
+                        let panel_item = this.menu.as_ref().and_then(|m| m.playlist_item);
+                        let can_scrub = (mode.scrubbing() || panel_item == Some(item_id))
                             && key.as_ref().is_some_and(|key| {
                                 cached.video
                                     || this.thumbnails.for_playlist(&key.path, key.stream, key.count, 0.0).is_some()
@@ -2105,10 +2117,12 @@ impl PlayerView {
                             });
                         let bounds = Rc::new(Cell::new(Bounds::default()));
                         let measured = bounds.clone();
+                        let scrub_bounds = this.playlist_scrub_bounds.clone();
                         let image = if mode.inline() {
                             key.as_ref().and_then(|key| {
                                 let representative = key.representative_time(&this.settings, duration);
                                 let scrub = mode == PlaylistThumbnails::Inline
+                                    && (this.menu.is_none() || panel_item == Some(item_id))
                                     && this.playlist_previews.hover.as_ref().is_some_and(|h| h.id == item_id);
                                 let time = if scrub {
                                     this.playlist_previews
@@ -2141,8 +2155,17 @@ impl PlayerView {
                         // row hovered at once, so its remove button can be clicked right away.
                         let marked_hovered = this.playlist_hovered == Some(item_id);
                         let view = cx.entity().downgrade();
+                        let row_bounds = this.playlist_row_bounds.clone();
                         let hover_sync = canvas(
-                            |b, window, _| window.insert_hitbox(b, gpui::HitboxBehavior::Normal),
+                            move |b, window, _| {
+                                let mut rows = row_bounds.borrow_mut();
+                                if let Some((_, bounds)) = rows.iter_mut().find(|(id, _)| *id == item_id) {
+                                    *bounds = b;
+                                } else {
+                                    rows.push((item_id, b));
+                                }
+                                window.insert_hitbox(b, gpui::HitboxBehavior::Normal)
+                            },
                             move |_, hitbox, window, cx| {
                                 let over = hitbox.is_hovered(window) && !cx.has_active_drag();
                                 if over == marked_hovered {
@@ -2171,7 +2194,10 @@ impl PlayerView {
                             .playlist_previews
                             .hover
                             .as_ref()
-                            .filter(|h| hovered && mode.scrubbing() && this.dialog.is_none() && h.id == item_id)
+                            .filter(|h| {
+                                (hovered && mode.scrubbing() || panel_item == Some(item_id))
+                                    && this.dialog.is_none() && h.id == item_id
+                            })
                             .and_then(|h| {
                                 if h.duration <= 0.0 {
                                     return None;
@@ -2230,6 +2256,8 @@ impl PlayerView {
                             .when(is_cur, |d| d.bg(t.accent_soft))
                             .when(selected && !is_cur, |d| d.bg(t.pressed))
                             .when(selected && is_cur, |d| d.bg(t.accent_soft).border_1().border_color(t.accent))
+                            .when(this.menu.as_ref().and_then(|m| m.playlist_item) == Some(item_id), |d| d.border_1().border_color(t.accent))
+                            .when(this.menu.as_ref().and_then(|m| m.playlist_item).is_some_and(|id| id != item_id), |d| d.opacity(0.55))
                             .hover(|s| s.bg(t.hover))
                             .child(hover_sync)
                             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -2292,7 +2320,15 @@ impl PlayerView {
                                     .gap_2()
                                     .when(can_scrub, |d| {
                                         d.child(
-                                            canvas(move |b, _, _| measured.set(b), |_, _, _, _| {})
+                                            canvas(move |b, _, _| {
+                                                measured.set(b);
+                                                let mut rows = scrub_bounds.borrow_mut();
+                                                if let Some((_, bounds)) = rows.iter_mut().find(|(id, _)| *id == item_id) {
+                                                    *bounds = b;
+                                                } else {
+                                                    rows.push((item_id, b));
+                                                }
+                                            }, |_, _, _, _| {})
                                                 .absolute()
                                                 .size_full(),
                                         )
@@ -2356,6 +2392,18 @@ impl PlayerView {
                                                 .when_some(audio_preview, |d, peaks| {
                                                     d.child(waveform_thumbnail(peaks, t.accent))
                                                 })
+                                                .when(cached.video, |d| {
+                                                    d.child(
+                                                        div()
+                                                            .absolute()
+                                                            .bottom_0()
+                                                            .left_0()
+                                                            .rounded(px(2.))
+                                                            .bg(rgba(0x000000b0))
+                                                            .p(px(2.))
+                                                            .child(icon(Icon::Video, px(12.), gpui::white())),
+                                                    )
+                                                })
                                                 .when(cached.audio && it.video_stream.is_some(), |d| {
                                                     d.child(
                                                         div()
@@ -2413,7 +2461,7 @@ impl PlayerView {
                                                         d.child(waveform_badge(t.text_dim))
                                                     })
                                                     .when(it.video_stream.is_some() && it.has_subtitles, |d| {
-                                                        d.child(icon(Icon::Subtitles, px(12.), t.text_dim))
+                                                        d.child(subtitle_badge(t.text_dim))
                                                     }),
                                             )
                                         },
@@ -2488,19 +2536,7 @@ impl PlayerView {
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
-                                    w.focus(&this.playlist_focus);
-                                    if !this.playlist_selection.contains(item_id) {
-                                        this.playlist_selection.single(item_id);
-                                    }
-                                    this.playlist_previews.pointer = Some(ev.position);
-                                    if this.playlist_previews.hover.as_ref().is_some_and(|h| h.id != item_id) {
-                                        this.playlist_previews.hover = None;
-                                    }
-                                    let Some(index) = this.playlist.items.iter().position(|it| it.id == item_id) else {
-                                        return;
-                                    };
-                                    let items = this.playlist_item_menu(index);
-                                    this.open_menu(items, ev.position, None, cx);
+                                    this.open_playlist_item_actions(item_id, ev.position, w, cx);
                                     cx.stop_propagation();
                                 }),
                             )
@@ -2682,9 +2718,8 @@ impl PlayerView {
             )
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                    let items = this.playlist_panel_menu();
-                    this.open_menu(items, ev.position, None, cx);
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    this.open_playlist_settings(window, cx);
                     cx.stop_propagation();
                 }),
             )
@@ -2712,32 +2747,49 @@ impl PlayerView {
         }
     }
 
-    fn playlist_switch_menu(&self) -> Vec<M> {
-        self.playlist_library
-            .slots
-            .iter()
-            .enumerate()
-            .filter(|(_, slot)| slot.open)
-            .map(|(index, slot)| {
-                M::action(slot.name.clone(), move |this, w, cx| this.switch_playlist_workspace(index, w, cx))
-                    .selected(index == self.playlist_library.active)
+    pub(super) fn playlist_panel_menu(&self) -> Vec<M> {
+        vec![
+            M::Header("PLAYLIST".into()),
+            M::action("Rename playlist…", |this, w, cx| {
+                this.show_dialog(super::dialogs::Dialog::NamePlaylist(true), w, cx)
+            }),
+            M::action("Delete playlist…", |this, w, cx| {
+                this.show_dialog(super::dialogs::Dialog::DeletePlaylist, w, cx)
             })
-            .collect()
-    }
-
-    fn playlist_panel_menu(&self) -> Vec<M> {
-        let mut modes: Vec<_> = PlaylistThumbnails::ALL
-            .into_iter()
-            .map(|mode| {
-                M::action(mode.label(), move |this, _, cx| {
-                    this.settings.playlist_thumbnails = mode;
-                    this.apply_settings(cx);
-                })
-                .selected(self.settings.playlist_thumbnails == mode)
+            .icon(Icon::Delete)
+            .enabled(self.playlist_library.can_delete()),
+            M::action("Duplicate playlist as…", |this, w, cx| {
+                this.show_dialog(super::dialogs::Dialog::DuplicatePlaylist, w, cx)
             })
-            .collect();
-        modes.push(M::Separator);
-        modes.push(
+            .enabled(self.playlist_library.writable),
+            M::action("New playlist…", |this, w, cx| {
+                this.show_dialog(super::dialogs::Dialog::NamePlaylist(false), w, cx)
+            }),
+            M::Header("SAVE".into()),
+            M::action("Save current playlist state", |this, _, cx| this.save_playlist_workspace(cx))
+                .icon(Icon::Save)
+                .enabled(self.playlist_library.writable),
+            M::Header("CONTENTS".into()),
+            M::action("Add files", |this, w, cx| {
+                this.prompt_playlist_add(false, w, cx);
+            })
+            .icon(Icon::Add),
+            M::action("Add folder", |this, w, cx| {
+                this.prompt_playlist_add(true, w, cx);
+            })
+            .icon(Icon::OpenFolder),
+            M::action("Import playlist from file…", |this, w, cx| this.prompt_playlist_import(w, cx))
+                .icon(Icon::OpenFolder),
+            M::action("Export playlist (M3U)", |this, w, cx| this.save_playlist(w, cx)).icon(Icon::Export),
+            M::action("Clear playlist", |this, w, cx| {
+                this.stop(w, cx);
+                this.playlist.clear();
+                this.playlist_selection.clear();
+                this.playlist_hovered = None;
+                cx.notify();
+            })
+            .icon(Icon::Clear),
+            M::Header("GENERATE".into()),
             M::action("Generate missing playlist thumbnails", |this, _, cx| {
                 this.generate_playlist_representatives(None, cx)
             })
@@ -2745,8 +2797,6 @@ impl PlayerView {
                 matches!(it.source, MediaSource::File(_))
                     && (it.video_stream.is_some() || !it.probed || it.duration.is_none())
             })),
-        );
-        modes.push(
             M::action("Generate missing filmstrip thumbnails", |this, _, cx| {
                 this.generate_playlist_items(None, true, cx)
             })
@@ -2757,76 +2807,128 @@ impl PlayerView {
                             && (it.video_stream.is_some() || !it.probed || it.duration.is_none())
                     }),
             ),
-        );
-        let waveforms = vec![
-            M::action("Generate missing waveforms", |this, _, cx| this.generate_playlist_waveforms(None, true, cx)),
-            M::action("Regenerate audio waveforms", |this, _, cx| this.generate_playlist_waveforms(None, false, cx)),
-        ];
-        let playlists = self.playlist_switch_menu();
-        let closed = self
-            .playlist_library
-            .slots
-            .iter()
-            .enumerate()
-            .filter(|(_, slot)| !slot.open)
-            .map(|(index, slot)| {
-                M::action(slot.name.clone(), move |this, w, cx| this.switch_playlist_workspace(index, w, cx))
-            })
-            .collect();
-        vec![
-            M::submenu("Switch playlist", playlists),
-            M::submenu("Open saved playlist", closed),
-            M::action("Close playlist", |this, w, cx| this.close_playlist_workspace(w, cx))
-                .enabled(self.playlist_library.can_close()),
-            M::action("New playlist…", |this, w, cx| {
-                this.show_dialog(super::dialogs::Dialog::NamePlaylist(false), w, cx)
-            }),
-            M::action("Duplicate playlist as…", |this, w, cx| {
-                this.show_dialog(super::dialogs::Dialog::DuplicatePlaylist, w, cx)
-            })
-            .enabled(self.playlist_library.writable),
-            M::action("Rename playlist…", |this, w, cx| {
-                this.show_dialog(super::dialogs::Dialog::NamePlaylist(true), w, cx)
-            }),
-            M::action("Delete playlist…", |this, w, cx| {
-                this.show_dialog(super::dialogs::Dialog::DeletePlaylist, w, cx)
-            })
-            .icon(Icon::Delete)
-            .enabled(self.playlist_library.can_delete()),
-            M::action("Auto save playlist", |this, _, cx| this.toggle_playlist_autosave(cx))
-                .checked(self.playlist_library.autosave())
-                .enabled(self.playlist_library.writable),
-            M::action("Save playlist state", |this, _, cx| this.save_playlist_workspace(cx))
-                .icon(Icon::Save)
-                .enabled(self.playlist_library.writable),
-            M::Separator,
-            M::action("Add files", |this, w, cx| {
-                this.prompt_playlist_add(false, w, cx);
-            })
-            .icon(Icon::Add),
-            M::action("Add folder", |this, w, cx| {
-                this.prompt_playlist_add(true, w, cx);
-            })
-            .icon(Icon::OpenFolder),
-            M::action("Export playlist (M3U)", |this, w, cx| this.save_playlist(w, cx)).icon(Icon::Save),
-            M::action("Clear playlist", |this, w, cx| {
-                this.stop(w, cx);
-                this.playlist.clear();
-                this.playlist_selection.clear();
-                this.playlist_hovered = None;
-                cx.notify();
-            })
-            .icon(Icon::Clear),
-            M::Separator,
-            M::action("Autohide playlist", |this, _, cx| {
-                this.settings.playlist_autohide = !this.settings.playlist_autohide;
-                this.playlist_autohide_open = true;
-                this.apply_settings(cx);
-            })
-            .checked(self.settings.playlist_autohide),
-            M::submenu("Thumbnails", modes),
-            M::submenu("Waveforms", waveforms).enabled(self.settings.timeline_waveform),
+            M::action("Generate missing waveforms", |this, _, cx| this.generate_playlist_waveforms(None, true, cx))
+                .enabled(self.settings.timeline_waveform),
+            M::action("Regenerate audio waveforms", |this, _, cx| this.generate_playlist_waveforms(None, false, cx))
+                .enabled(self.settings.timeline_waveform),
         ]
+    }
+
+    /// Hit-test measured rows, including filtered and partially visible rows.
+    pub(super) fn playlist_item_at(&self, pos: Point<Pixels>) -> Option<(u64, Pixels)> {
+        if !self.playlist_shown() || !self.playlist_bounds.get().contains(&pos) {
+            return None;
+        }
+        let bounds = self.pl_scroll.0.borrow().base_handle.bounds();
+        if !bounds.contains(&pos) || pos.x >= bounds.right() - px(super::widgets::SCROLLBAR_W) {
+            return None;
+        }
+        self.playlist_row_bounds.borrow().iter().rev().find_map(|(id, row)| {
+            row.contains(&pos).then_some((*id, row.top().max(bounds.top())))
+        })
+    }
+
+    pub(super) fn open_playlist_item_actions(
+        &mut self, item_id: u64, pos: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.playlist.items.iter().position(|it| it.id == item_id) else { return };
+        let row_top = self.playlist_item_at(pos).filter(|(id, _)| *id == item_id).map_or(pos.y, |(_, y)| y);
+        window.focus(&self.playlist_focus);
+        if !self.playlist_selection.contains(item_id) {
+            self.playlist_selection.single(item_id);
+        }
+        self.playlist_previews.pointer = Some(pos);
+        if self.playlist_previews.hover.as_ref().is_some_and(|h| h.id != item_id) {
+            self.playlist_previews.hover = None;
+        }
+        let items = self.playlist_item_menu(index);
+        let width = px(400.).min((window.viewport_size().width - px(8.)).max(px(100.)));
+        let x = (self.playlist_bounds.get().left() - width - px(4.)).max(px(4.));
+        self.open_menu(items, point(x, row_top), None, cx);
+        if let Some(menu) = self.menu.as_mut() {
+            menu.playlist_context = true;
+            menu.playlist_item = Some(item_id);
+            menu.min_width = px(400.);
+        }
+        self.scrub_playlist_panel_item(pos, cx);
+    }
+
+    pub(super) fn scrub_playlist_panel_item(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.menu.as_ref().and_then(|m| m.playlist_item) else { return false };
+        if self.playlist_item_at(pos).is_none_or(|(row, _)| row != id) {
+            self.clear_playlist_panel_scrub(cx);
+            return false;
+        }
+        let bounds = self.playlist_scrub_bounds.borrow().iter()
+            .find(|(row, b)| *row == id && b.contains(&pos)).map(|(_, b)| *b);
+        let Some(bounds) = bounds else {
+            self.clear_playlist_panel_scrub(cx);
+            return false;
+        };
+        let Some(item) = self.playlist.items.iter().find(|it| it.id == id) else { return false };
+        let Some(key) = super::playlist_thumbnails::Key::new(item, &self.settings) else { return false };
+        let fraction = frac_in(bounds, pos, false);
+        if self.playlist_previews.hover.as_ref().is_some_and(|h| h.id == id && h.fraction == fraction && h.key == key) {
+            return true;
+        }
+        self.playlist_previews.hover = Some(super::playlist_thumbnails::Hover {
+            id,
+            key,
+            duration: item.duration.unwrap_or_default(),
+            fraction,
+            bounds,
+        });
+        self.refresh_playlist_hover(cx);
+        cx.notify();
+        true
+    }
+
+    pub(super) fn clear_playlist_panel_scrub(&mut self, cx: &mut Context<Self>) {
+        if self.menu.as_ref().and_then(|m| m.playlist_item).is_some() && self.playlist_previews.hover.take().is_some() {
+            self.refresh_playlist_hover(cx);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn playlist_panel_scrub_preview(&self, id: u64) -> Option<(super::playlist_thumbnails::Key, super::thumbnails::Preview)> {
+        let h = self.playlist_previews.hover.as_ref().filter(|h| h.id == id)?;
+        let time = h.duration * f64::from(h.fraction);
+        let preview = self.thumbnails.for_playlist(&h.key.path, h.key.stream, h.key.count, time)
+            .or_else(|| self.playlist_previews.scrub(&h.key, time))?;
+        Some((h.key.clone(), preview.clone()))
+    }
+
+    pub(super) fn save_playlist_panel_thumbnail(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some((key, preview)) = self.playlist_panel_scrub_preview(id) {
+            self.set_playlist_panel_thumbnail(key, preview, cx);
+        }
+    }
+
+    fn set_playlist_panel_thumbnail(
+        &mut self, key: super::playlist_thumbnails::Key, preview: super::thumbnails::Preview, cx: &mut Context<Self>,
+    ) {
+        self.settings.playlist_thumbnail_times.insert(key.selection_key(), preview.time);
+        self.playlist_previews.remember_selection(key, preview.time, preview);
+        self.settings.save();
+        cx.notify();
+    }
+
+    pub(super) fn playlist_panel_reset_action(&self, id: u64) -> Option<M> {
+        let item = self.playlist.items.iter().find(|it| it.id == id)?;
+        let key = super::playlist_thumbnails::Key::new(item, &self.settings)?;
+        let cached = super::cache_badges::Entry::new(item, &self.settings)
+            .is_some_and(|entry| self.cache_badges.get(&entry).video);
+        if !cached && self.thumbnails.for_playlist(&key.path, key.stream, key.count, 0.0).is_none()
+            && self.playlist_previews.scrub(&key, 0.0).is_none()
+        {
+            return None;
+        }
+        let has_override = self.settings.playlist_thumbnail_times.contains_key(&key.selection_key());
+        Some(M::action("Reset thumbnail", move |this, _, cx| {
+            this.settings.playlist_thumbnail_times.remove(&key.selection_key());
+            this.settings.save();
+            cx.notify();
+        }).icon(Icon::Reset).enabled(has_override))
     }
 
     fn playlist_item_menu(&self, i: usize) -> Vec<M> {
@@ -2850,10 +2952,11 @@ impl PlayerView {
                 }
             })
             .icon(Icon::Play),
-            M::action("Edit item title…", move |this, w, cx| {
+            M::action("Edit title", move |this, w, cx| {
                 this.show_dialog(super::dialogs::Dialog::EditPlaylistItemTitle(item_id), w, cx)
             })
             .enabled(count == 1),
+            M::Header("ORGANIZE".into()),
             M::action("Move Up", move |this, _, cx| this.move_playlist_items(&up, true, cx))
                 .icon(Icon::Up)
                 .enabled(self.playlist.can_move_selected(&ids, true)),
@@ -2892,7 +2995,7 @@ impl PlayerView {
         ];
         if count > 1 {
             let missing = ids.clone();
-            v.push(M::Separator);
+            v.push(M::Header("GENERATE".into()));
             let representatives = ids.clone();
             v.push(
                 M::action("Generate missing playlist thumbnails for selected items", move |this, _, cx| {
@@ -2916,9 +3019,10 @@ impl PlayerView {
             return v;
         }
         if let MediaSource::File(p) = &item.source {
-            v.push(M::Separator);
+            v.push(M::Header("SOURCE".into()));
             let p = p.clone();
             v.push(M::action("Show in File Manager", move |_, _, cx| cx.reveal_path(&p)).icon(Icon::OpenFolder));
+            v.push(M::Header("GENERATE".into()));
             let missing = ids.clone();
             let representatives = ids.clone();
             v.push(
@@ -2940,44 +3044,6 @@ impl PlayerView {
                 .enabled(can_generate),
             );
             v.append(&mut waveforms);
-            if let Some(key) =
-                self.playlist.items.get(i).and_then(|it| super::playlist_thumbnails::Key::new(it, &self.settings))
-            {
-                let time = self
-                    .playlist_previews
-                    .hover
-                    .as_ref()
-                    .filter(|h| h.key == key && self.playlist.items.get(i).is_some_and(|it| it.id == h.id))
-                    .and_then(|h| {
-                        let time = h.duration * f64::from(h.fraction);
-                        self.thumbnails
-                            .for_playlist(&key.path, key.stream, key.count, time)
-                            .or_else(|| self.playlist_previews.scrub(&key, time))
-                            .map(|p| p.time)
-                    });
-                let selection = key.selection_key();
-                let selected_key = key.clone();
-                v.push(
-                    M::action("Set current thumbnail as video thumbnail", move |this, _, cx| {
-                        if let Some(time) = time {
-                            this.settings.playlist_thumbnail_times.insert(selection.clone(), time);
-                            if let Some(preview) = this.playlist_previews.scrub(&selected_key, time).cloned() {
-                                this.playlist_previews.remember_selection(selected_key.clone(), time, preview);
-                            }
-                            this.settings.save();
-                            cx.notify();
-                        }
-                    })
-                    .enabled(time.is_some()),
-                );
-                if self.settings.playlist_thumbnail_times.contains_key(&key.selection_key()) {
-                    v.push(M::action("Reset video thumbnail", move |this, _, cx| {
-                        this.settings.playlist_thumbnail_times.remove(&key.selection_key());
-                        this.settings.save();
-                        cx.notify();
-                    }));
-                }
-            }
         }
         v
     }
@@ -3035,6 +3101,12 @@ impl PlayerView {
         let fullscreen = window.is_fullscreen();
         let client_decor = matches!(window.window_decorations(), Decorations::Client { .. }) && !fullscreen;
         let show_menubar = self.menubar_visible(window);
+        if self.menu.is_none()
+            && self.dialog.is_none()
+            && self.inputs.get("playlist_switch").is_some_and(|input| input.focus_handle(cx).is_focused(window))
+        {
+            window.focus(&self.playlist_focus);
+        }
         let overlay_open = self.dialog.is_some() || self.menu.is_some() || self.editing_volume;
         let playlist_filter_focused = self.playlist_shown()
             && self.playlist_filter_open
@@ -3047,7 +3119,7 @@ impl PlayerView {
             window.focus(&self.focus);
         }
 
-        let autohide = self.settings.playlist_autohide;
+        let autohide = self.playlist_autohide();
         let main = div().relative().flex_1().min_h_0().flex().child(self.video_area(window, cx)).when(
             self.playlist_shown(),
             |d| {
@@ -3076,7 +3148,9 @@ impl PlayerView {
         let mut root = div()
             .id("root")
             .key_context(if overlay_open {
-                if self.dialog == Some(super::dialogs::Dialog::MediaInfo) && self.menu.is_none() {
+                if self.menu.as_ref().is_some_and(|menu| menu.playlist_switch.is_some()) {
+                    "Overlay SearchCombo"
+                } else if self.dialog == Some(super::dialogs::Dialog::MediaInfo) && self.menu.is_none() {
                     "Overlay MediaInfo"
                 } else {
                     "Overlay"
@@ -3085,7 +3159,7 @@ impl PlayerView {
                 // Text input must not inherit playback or DVD shortcuts.
                 "EditingText"
             } else if playlist_focused {
-                PLAYLIST_CTX
+                "Player Playlist PlaylistVisible"
             } else if self.dvd_buttons() {
                 // Both: the player's shortcuts, with the disc's buttons on top.
                 if self.playlist_shown() { "Player DvdMenu PlaylistVisible" } else { "Player DvdMenu" }
@@ -3133,7 +3207,7 @@ impl PlayerView {
                     // control bar, its hover-exit event may not be delivered.
                     // Clear the stale state so the autohide timer can work.
                     // An occluding playlist overlay can also cause root hover exit.
-                    if this.settings.playlist_autohide
+                    if this.playlist_autohide()
                         && window.is_window_hovered()
                         && this.playlist_shown()
                         && this.playlist_bounds.get().contains(&window.mouse_position())
@@ -3142,7 +3216,12 @@ impl PlayerView {
                     }
                     this.playlist_previews.pointer = None;
                     this.update_playlist_autohide(window, cx);
-                    let had_playlist_hover = this.menu.is_none() && this.playlist_previews.hover.take().is_some();
+                    let item_panel = this.menu.as_ref().and_then(|m| m.playlist_item).is_some();
+                    let had_playlist_hover = (this.menu.is_none() || item_panel && !window.is_window_hovered())
+                        && this.playlist_previews.hover.take().is_some();
+                    if item_panel && had_playlist_hover {
+                        this.refresh_playlist_hover(cx);
+                    }
                     let had_hover = this.pointer_over_controls || had_playlist_hover;
                     let was_dropping = this.dropping;
                     this.pointer_over_controls = false;
@@ -3207,6 +3286,7 @@ impl PlayerView {
         }
         if self.playlist_shown()
             && self.dialog.is_none()
+            && self.menu.as_ref().is_none_or(|m| !m.playlist_context)
             && !self.editing_volume
             && !cx.has_active_drag()
             && super::playlist_thumbnails::PlaylistPreviews::mode(&self.settings).side()

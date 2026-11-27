@@ -280,8 +280,10 @@ pub struct Settings {
     pub show_playlist: bool,
     pub playlist_width: f32,
     pub playlist_autohide: bool,
-    /// Going fullscreen starts with the playlist hidden, whatever the window
-    /// showed (it can still be opened there; leaving restores the window's).
+    /// Independent fullscreen preferences; None preserves legacy settings.
+    pub playlist_fullscreen_autohide: Option<bool>,
+    pub show_playlist_fullscreen: Option<bool>,
+    /// Legacy fullscreen visibility preference, used when no explicit value exists.
     pub hide_playlist_in_fullscreen: bool,
     /// Keyboard shortcuts changed from the defaults: command id (see
     /// `ui::keymap::COMMANDS`) to its keystrokes. An empty list unbinds it.
@@ -316,6 +318,7 @@ pub struct Settings {
     pub waveform_auto_audio: bool,
     pub waveform_auto_video: bool,
     pub filmstrip_auto_video: bool,
+    pub filmstrip_auto_playback: bool,
     pub playlist_thumbnail_auto_video: bool,
     pub timeline_hover_playhead: bool,
     pub timeline_filmstrip: bool, // legacy setting, used when the new modes are unset
@@ -408,6 +411,8 @@ impl Default for Settings {
             show_playlist: false,
             playlist_width: 320.,
             playlist_autohide: false,
+            playlist_fullscreen_autohide: None,
+            show_playlist_fullscreen: None,
             hide_playlist_in_fullscreen: true,
             key_bindings: BTreeMap::new(),
             bar_controls: BarControl::ALL.to_vec(),
@@ -431,6 +436,7 @@ impl Default for Settings {
             waveform_auto_audio: true,
             waveform_auto_video: false,
             filmstrip_auto_video: false,
+            filmstrip_auto_playback: false,
             playlist_thumbnail_auto_video: true,
             timeline_hover_playhead: true,
             timeline_filmstrip: true,
@@ -510,6 +516,33 @@ fn sub_lang_prefs(own: &str) -> Vec<String> {
 }
 
 impl Settings {
+    pub fn playlist_autohide_for(&self, fullscreen: bool) -> bool {
+        if fullscreen { self.playlist_fullscreen_autohide.unwrap_or(self.playlist_autohide) } else { self.playlist_autohide }
+    }
+
+    pub fn fullscreen_playlist_initially_visible(&self) -> bool {
+        self.show_playlist_fullscreen.unwrap_or(!self.hide_playlist_in_fullscreen && self.show_playlist)
+    }
+
+    pub fn set_playlist_visibility(&mut self, fullscreen: bool, visible: bool) {
+        if fullscreen {
+            self.show_playlist_fullscreen = Some(visible);
+        } else {
+            let fullscreen_visible = self.fullscreen_playlist_initially_visible();
+            self.show_playlist_fullscreen.get_or_insert(fullscreen_visible);
+            self.show_playlist = visible;
+        }
+    }
+
+    pub fn set_playlist_autohide_for(&mut self, fullscreen: bool, enabled: bool) {
+        if fullscreen {
+            self.playlist_fullscreen_autohide = Some(enabled);
+        } else {
+            self.playlist_fullscreen_autohide.get_or_insert(self.playlist_autohide);
+            self.playlist_autohide = enabled;
+        }
+    }
+
     /// Either setting that needs a tray icon is on.
     pub fn wants_tray(&self) -> bool {
         self.keep_in_tray || self.tray_playback
@@ -769,6 +802,35 @@ mod tests {
         assert_eq!(restored.playlist_inline_labels, PlaylistLabels::FileName);
         assert_eq!(restored.playlist_thumbnail_times.get("0:example.mp4"), Some(&25.));
         assert_eq!(restored.playlist_thumbnails, PlaylistThumbnails::InlineSide);
+    }
+
+    #[test]
+    fn playlist_visibility_modes_preserve_legacy_preferences_and_are_independent() {
+        let mut s: Settings = serde_json::from_str(
+            r#"{"show_playlist":true,"hide_playlist_in_fullscreen":true,"playlist_autohide":false}"#,
+        )
+        .unwrap();
+        assert!(s.show_playlist);
+        assert!(!s.fullscreen_playlist_initially_visible());
+        s.set_playlist_visibility(true, true);
+        s.set_playlist_autohide_for(true, true);
+        assert!(!s.playlist_autohide_for(false));
+        assert!(s.playlist_autohide_for(true));
+        s.set_playlist_visibility(false, false);
+        assert!(s.fullscreen_playlist_initially_visible());
+        let restored: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(!restored.show_playlist);
+        assert!(restored.fullscreen_playlist_initially_visible());
+        assert!(restored.playlist_autohide_for(true));
+
+        let mut legacy: Settings = serde_json::from_str(
+            r#"{"show_playlist":true,"hide_playlist_in_fullscreen":false,"playlist_autohide":true}"#,
+        )
+        .unwrap();
+        legacy.set_playlist_visibility(false, false);
+        legacy.set_playlist_autohide_for(false, false);
+        assert!(legacy.fullscreen_playlist_initially_visible());
+        assert!(legacy.playlist_autohide_for(true));
     }
 
     #[test]
