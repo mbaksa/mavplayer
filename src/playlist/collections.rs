@@ -1,6 +1,8 @@
 //! Persistent identities and versioned manifests for local media collections.
 //! Storage, migration and cache management are deliberately separate from this model.
 
+pub(crate) mod storage;
+
 use crate::engine::MediaSource;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -133,6 +135,8 @@ pub(crate) struct PlaylistManifest {
     pub id: PlaylistId,
     pub name: String,
     pub autosave: bool,
+    #[serde(default)]
+    pub revision: u64,
     pub entries: Vec<PlaylistEntry>,
     pub current: Option<PlaylistItemId>,
     pub position: Option<f64>,
@@ -145,6 +149,7 @@ impl PlaylistManifest {
             id: PlaylistId::new(),
             name,
             autosave: false,
+            revision: 0,
             entries: Vec::new(),
             current: None,
             position: None,

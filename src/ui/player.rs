@@ -3172,7 +3172,8 @@ impl PlayerView {
             OpenSubtitle => |this, w, cx| {
                 if this.player.is_active() { this.prompt_open(false, true, w, cx) } else { this.osd("Open a video first", cx) }
             },
-            SavePlaylist => |this, w, cx| this.save_playlist(w, cx),
+            SavePlaylist => |this, _w, cx| this.save_playlist_workspace(cx),
+            ExportPlaylist => |this, w, cx| this.export_playlist(w, cx),
             ShowPreferences => |this, w, cx| this.show_dialog(Dialog::Settings(0), w, cx),
             ShowEffects => |this, w, cx| this.show_dialog(Dialog::Effects(0), w, cx),
             TogglePlaylist => |this, w, cx| this.toggle_playlist(w, cx),
@@ -3256,7 +3257,7 @@ impl PlayerView {
         )
     }
 
-    pub fn save_playlist(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn export_playlist(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.playlist.items.is_empty() {
             self.osd("The playlist is empty", cx);
             return;
@@ -3266,8 +3267,8 @@ impl PlayerView {
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
                 let _ = this.update(cx, |v, cx| match v.playlist.save_m3u(&path) {
-                    Ok(()) => v.osd(format!("Playlist saved: {}", path.display()), cx),
-                    Err(e) => v.osd(format!("Could not save playlist: {e}"), cx),
+                    Ok(()) => v.osd(format!("Playlist exported: {}", path.display()), cx),
+                    Err(e) => v.osd(format!("Could not export playlist: {e}"), cx),
                 });
             }
         })

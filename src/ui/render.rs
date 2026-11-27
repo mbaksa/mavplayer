@@ -2780,7 +2780,7 @@ impl PlayerView {
             .icon(Icon::OpenFolder),
             M::action("Import playlist from file…", |this, w, cx| this.prompt_playlist_import(w, cx))
                 .icon(Icon::OpenFolder),
-            M::action("Export playlist (M3U)", |this, w, cx| this.save_playlist(w, cx)).icon(Icon::Export),
+            M::action("Export playlist (M3U)", |this, w, cx| this.export_playlist(w, cx)).icon(Icon::Export),
             M::action("Clear playlist", |this, w, cx| {
                 this.stop(w, cx);
                 this.playlist.clear();

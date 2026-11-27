@@ -117,7 +117,8 @@ commands! {
         OpenDisc, "Open disc…", ["secondary-d"];
         DiscMenu, "Disc menu (DVD)", ["shift-m"];
         DiscTitleMenu, "Disc title menu (DVD)", ["shift-t"];
-        SavePlaylist, "Save playlist…", ["secondary-s"];
+        SavePlaylist, "Save playlist", ["secondary-s"];
+        ExportPlaylist, "Export playlist…", [];
         ShowMediaInfo, "Media information", ["i", "secondary-i"];
     ]
     "Window" => [

@@ -162,7 +162,8 @@ impl PlayerView {
             act("Open URL…", OpenUrl).icon(Icon::Url),
             M::submenu("Recent Media", recent).icon(Icon::Recent),
             M::Separator,
-            act("Save Playlist…", SavePlaylist).icon(Icon::Save).enabled(!self.playlist.items.is_empty()),
+            act("Save Playlist", SavePlaylist).icon(Icon::Save).enabled(self.playlist_library.writable),
+            act("Export Playlist…", ExportPlaylist).icon(Icon::Export).enabled(!self.playlist.items.is_empty()),
             M::Separator,
         ];
         if self.can_hide_to_tray(cx) {
