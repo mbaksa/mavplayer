@@ -98,10 +98,17 @@ impl MenuItem {
     }
 }
 
+pub(super) enum CopyChoice {
+    Items(Vec<u64>),
+    Playlist,
+}
+
 pub struct OpenMenu {
     pub(super) timeline_settings: bool,
     pub(super) playlist_switch: Option<super::search_combo::SearchCombo>,
     pub(super) collection_choices: Option<Vec<crate::playlist::collections::CollectionId>>,
+    pub(super) recovery_choices: bool,
+    pub(super) copy_choice: Option<CopyChoice>,
     pub(super) playlist_context: bool,
     pub(super) playlist_settings: bool,
     pub(super) collection_settings: bool,
@@ -151,6 +158,8 @@ impl PlayerView {
             timeline_settings: false,
             playlist_switch: None,
             collection_choices: None,
+            recovery_choices: false,
+            copy_choice: None,
             playlist_context: false,
             playlist_settings: false,
             collection_settings: false,
@@ -454,12 +463,116 @@ impl PlayerView {
         window.focus(&input.focus_handle(cx));
     }
 
+    pub(super) fn open_recovery_switch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let choices = match crate::playlist::session::Library::session_choices(&crate::settings::config_dir()) {
+            Ok(choices) => choices,
+            Err(err) => { self.osd(format!("Could not list sessions: {err}"), cx); return; }
+        };
+        if choices.is_empty() {
+            self.osd("No sessions available for recovery", cx);
+            return;
+        }
+        let combo = super::search_combo::SearchCombo::new(
+            choices.iter().enumerate().map(|(i, (_, label))| (i, label.clone())), None,
+        );
+        let pos = self.playlist_bounds.get().origin;
+        self.open_menu(Vec::new(), pos, None, cx);
+        if let Some(menu) = self.menu.as_mut() {
+            menu.playlist_switch = Some(combo);
+            menu.collection_choices = Some(choices.into_iter().map(|(id, _)| id).collect());
+            menu.recovery_choices = true;
+            menu.playlist_context = true;
+        }
+        let t = self.theme;
+        let input = self.input("playlist_switch", "Filter…", window, cx);
+        input.update(cx, |input, cx| {
+            input.set_text("", cx);
+            input.colors = (t.text, t.text_disabled, t.accent_soft, t.accent);
+        });
+        window.focus(&input.focus_handle(cx));
+    }
+
+    pub(super) fn open_copy_items(&mut self, ids: Vec<u64>, window: &mut Window, cx: &mut Context<Self>) {
+        let combo = super::search_combo::SearchCombo::new(
+            self.playlist_library
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != self.playlist_library.active)
+                .map(|(i, slot)| (i, slot.name.clone())),
+            None,
+        );
+        self.open_copy_combo(combo, None, CopyChoice::Items(ids), window, cx);
+    }
+
+    pub(super) fn open_copy_playlist(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let choices = match crate::playlist::session::Library::collection_choices(&crate::settings::config_dir()) {
+            Ok(choices) => choices
+                .into_iter()
+                .filter(|(id, _)| Some(*id) != self.playlist_library.collection_id())
+                .collect::<Vec<_>>(),
+            Err(err) => {
+                self.osd(format!("Could not list collections: {err}"), cx);
+                return;
+            }
+        };
+        if choices.is_empty() {
+            self.osd("No other collections available", cx);
+            return;
+        }
+        let combo = super::search_combo::SearchCombo::new(
+            choices.iter().enumerate().map(|(i, (_, name))| (i, name.clone())),
+            None,
+        );
+        self.open_copy_combo(
+            combo, Some(choices.into_iter().map(|(id, _)| id).collect()), CopyChoice::Playlist, window, cx,
+        );
+    }
+
+    fn open_copy_combo(
+        &mut self,
+        combo: super::search_combo::SearchCombo,
+        collections: Option<Vec<crate::playlist::collections::CollectionId>>,
+        choice: CopyChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_menu(Vec::new(), self.playlist_bounds.get().origin, None, cx);
+        if let Some(menu) = self.menu.as_mut() {
+            menu.playlist_switch = Some(combo);
+            menu.collection_choices = collections;
+            menu.copy_choice = Some(choice);
+            menu.playlist_context = true;
+        }
+        let t = self.theme;
+        let input = self.input("playlist_switch", "Filter…", window, cx);
+        input.update(cx, |input, cx| {
+            input.set_text("", cx);
+            input.colors = (t.text, t.text_disabled, t.accent_soft, t.accent);
+        });
+        window.focus(&input.focus_handle(cx));
+    }
+
     fn select_combo(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let recovering = self.menu.as_ref().is_some_and(|menu| menu.recovery_choices);
         let collection = self.menu.as_ref().and_then(|menu| menu.collection_choices.as_ref())
             .map(|choices| choices.get(index).copied());
+        let copy = self.menu.as_mut().and_then(|menu| menu.copy_choice.take());
         self.close_menu(cx);
         window.focus(&self.playlist_focus);
+        if let Some(copy) = copy {
+            match copy {
+                CopyChoice::Items(ids) => self.copy_playlist_items_to(index, &ids, cx),
+                CopyChoice::Playlist => {
+                    if let Some(Some(id)) = collection {
+                        self.copy_playlist_to_collection(id, cx);
+                    }
+                }
+            }
+            return;
+        }
         match collection {
+            Some(Some(id)) if recovering => self.switch_temporary_workspace(Some(id), window, cx),
             Some(Some(id)) => self.switch_collection_workspace(id, window, cx),
             Some(None) => self.show_dialog(super::dialogs::Dialog::NewCollection, window, cx),
             None => self.switch_playlist_workspace(index, window, cx),

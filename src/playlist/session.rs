@@ -107,6 +107,7 @@ pub(crate) struct Library {
     storage: Option<CollectionStorage>,
     collection_label: String,
     temporary: bool,
+    pub keep_session: bool,
     pub active: usize,
     pub slots: Vec<Slot>,
     pub writable: bool,
@@ -119,6 +120,7 @@ impl Library {
             storage: None,
             collection_label: "Temporary collection (memory only)".into(),
             temporary: false,
+            keep_session: false,
             active: 0,
             slots: vec![Slot::new("Default playlist".into(), false)],
             writable,
@@ -282,6 +284,7 @@ impl Library {
             storage: lock.map(|lock| CollectionStorage { paths, collection, _lock: lock }),
             collection_label,
             temporary,
+            keep_session: false,
             active,
             slots,
             writable: !read_only,
@@ -349,6 +352,84 @@ impl Library {
         Ok(lines.join("\n"))
     }
 
+    pub fn temporary_for_switch() -> io::Result<Self> {
+        Self::new_session(&config_dir())
+    }
+
+    pub fn recover_for_switch(id: CollectionId) -> io::Result<Self> {
+        Self::recover_session(&config_dir(), id)
+    }
+
+    pub fn session_choices(config: &Path) -> io::Result<Vec<(CollectionId, String)>> {
+        let paths = CollectionPaths::sessions(config);
+        Ok(Self::list_sessions(config)?.lines().filter_map(|line| {
+            let id = line.parse::<CollectionId>().ok()?;
+            let collection = Self::read_collection(&paths, id).ok()?;
+            Some((id, format!("{} · {} playlists · {}", collection.name, collection.playlist_order.len(), id)))
+        }).collect())
+    }
+
+    /// Keep a checkpoint on disk if requested, otherwise discard on normal exit.
+    pub fn finish_temporary(&mut self) -> io::Result<()> {
+        if self.temporary && self.keep_session {
+            self.flush()
+        } else {
+            self.close_temporary()
+        }
+    }
+
+    /// Publish a complete copy before retiring the original recovery session.
+    /// Keep playlist/item identities and leave the session intact on failure.
+    pub fn promote_session(&mut self, config: &Path, name: &str) -> io::Result<()> {
+        if !self.temporary {
+            return Err(io::Error::other("No temporary session to save"));
+        }
+        let name = name.trim();
+        if name.is_empty() || name.contains(['\r', '\n', '\0']) {
+            return Err(io::Error::other("Invalid collection name"));
+        }
+        self.flush()?;
+        let old = self.storage.as_ref().ok_or_else(|| io::Error::other("Missing session storage"))?;
+        let (paths, mut index, _index_lock) = Self::open_index(config, true)?;
+        for &id in &index.collection_order {
+            if Self::read_collection(&paths, id)?.name.eq_ignore_ascii_case(name) {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "Collection name already exists"));
+            }
+        }
+        let mut collection = old.collection.clone();
+        collection.id = CollectionId::new();
+        collection.name = name.to_owned();
+        let id = collection.id;
+        let stage = config.join(format!(".collections-promote-{id}"));
+        fs::create_dir(&stage)?;
+        let result = (|| -> io::Result<Self> {
+            let staged = CollectionPaths::new(&stage);
+            for slot in &self.slots {
+                let manifest = &slot.stored.as_ref().ok_or_else(|| io::Error::other("Missing saved playlist"))?.manifest;
+                PlaylistStore::new(&staged, id, slot.id).create(manifest.clone())?;
+            }
+            write_atomic(&staged.collection_manifest(id), &serde_json::to_vec_pretty(&collection)?)?;
+            sync_directory(&staged.collection_dir(id))?;
+            fs::rename(staged.collection_dir(id), paths.collection_dir(id))?;
+            let lock = Self::session_lock(&paths, id)?;
+            let next = Self::open_storage(CollectionPaths::new(config), id, Some(lock), false, false)?;
+            sync_directory(paths.index().parent().ok_or_else(|| io::Error::other("Missing index directory"))?)?;
+            index.collection_order.push(id);
+            if index.default_collection.is_none() {
+                index.default_collection = Some(id);
+            }
+            write_atomic(&paths.index(), &serde_json::to_vec_pretty(&index)?)?;
+            Ok(next)
+        })();
+        let _ = fs::remove_dir_all(&stage);
+        let next = result?;
+        if let Err(err) = self.close_temporary() {
+            log::warn!("Collection saved; could not retire recovery session: {err}");
+        }
+        *self = next;
+        Ok(())
+    }
+
     pub fn is_temporary(&self) -> bool {
         self.temporary
     }
@@ -394,8 +475,8 @@ impl Library {
     /// Do not silently discard unsaved drafts or a recoverable temporary session.
     pub fn can_leave(&self) -> bool {
         if self.temporary {
-            return self.slots.len() == 1 && self.slots[0].name == "Default playlist"
-                && self.slots[0].snapshot().sources.is_empty();
+            return self.keep_session || (self.slots.len() == 1 && self.slots[0].name == "Default playlist"
+                && self.slots[0].snapshot().sources.is_empty());
         }
         self.slots.iter().all(|slot| {
             let draft = slot.snapshot();
@@ -625,6 +706,71 @@ impl Library {
         true
     }
 
+    /// Append independent copies to an inactive playlist without changing the
+    /// active workspace or committing unrelated unsaved destination edits.
+    pub fn copy_items(&mut self, target: usize, source: &Snapshot, indices: &[usize]) -> io::Result<usize> {
+        if !self.writable || target == self.active || target >= self.slots.len() {
+            return Err(io::Error::other("Destination playlist is not writable"));
+        }
+        if indices.is_empty() || indices.iter().any(|&i| i >= source.sources.len()) {
+            return Err(io::Error::other("Invalid playlist selection"));
+        }
+        let slot = &self.slots[target];
+        if slot.snapshot().sources != slot.saved.sources
+            || slot.snapshot().ids != slot.saved.ids
+            || slot.snapshot().custom_titles != slot.saved.custom_titles
+        {
+            return Err(io::Error::other("Save destination playlist edits before copying"));
+        }
+        // Finish earlier writes before changing the destination.
+        self.flush()?;
+        let slot = &mut self.slots[target];
+        let copies: Vec<_> = indices
+            .iter()
+            .map(|&i| PlaylistEntry {
+                id: PlaylistItemId::new(),
+                source: source.sources[i].clone(),
+                custom_title: source.custom_titles.get(&i).cloned(),
+            })
+            .collect();
+        fn append(snapshot: &mut Snapshot, entries: &[PlaylistEntry]) {
+            for entry in entries {
+                let index = snapshot.sources.len();
+                snapshot.sources.push(entry.source.clone());
+                snapshot.ids.push(entry.id);
+                if let Some(title) = &entry.custom_title {
+                    snapshot.custom_titles.insert(index, title.clone());
+                }
+            }
+        }
+        append(&mut slot.saved, &copies);
+        if let Some(draft) = &mut slot.draft {
+            append(draft, &copies);
+        }
+        slot.dirty = true;
+        self.dirty = true;
+        self.flush()?;
+        Ok(copies.len())
+    }
+
+    /// Copy the live contents of a playlist into another, exclusively owned
+    /// collection. The destination's active playlist is left unchanged.
+    pub fn copy_playlist(&mut self, name: &str, autosave: bool, mut snapshot: Snapshot) -> io::Result<String> {
+        if !self.writable || snapshot.ids.len() != snapshot.sources.len() {
+            return Err(io::Error::other("Destination is not writable or source playlist is invalid"));
+        }
+        snapshot.normalize();
+        self.flush()?;
+        let name = self.suggested_name(name);
+        let mut slot = Slot::new(name.clone(), autosave);
+        snapshot.ids = snapshot.sources.iter().map(|_| PlaylistItemId::new()).collect();
+        slot.saved = snapshot;
+        self.slots.push(slot);
+        self.dirty = true;
+        self.flush()?;
+        Ok(name)
+    }
+
     pub fn rename(&mut self, name: String) {
         self.slots[self.active].name = name;
         self.slots[self.active].dirty = true;
@@ -740,6 +886,43 @@ mod tests {
     }
 
     #[test]
+    fn temporary_promotion_preserves_playlist_and_item_ids() {
+        let root = std::env::temp_dir().join(format!("mavplayer-promote-{}", uuid::Uuid::new_v4()));
+        let mut session = Library::new_session(&root).unwrap();
+        let original = snapshot("first.mp4", 12.5);
+        session.capture(original.clone(), true, false);
+        let playlist_id = session.slots[0].id;
+        session.promote_session(&root, "Saved session").unwrap();
+        assert!(!session.is_temporary());
+        assert_eq!(session.snapshot(), &original);
+        assert_eq!(session.slots[0].id, playlist_id);
+        assert!(Library::list_sessions(&root).unwrap().is_empty());
+        let id = session.collection_id().unwrap();
+        drop(session);
+        let saved = Library::open_selected(&root, Some(id), false).unwrap();
+        assert_eq!(saved.snapshot(), &original);
+        drop(saved);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn kept_session_can_be_recovered_after_normal_exit() {
+        let root = std::env::temp_dir().join(format!("mavplayer-keep-{}", uuid::Uuid::new_v4()));
+        let mut session = Library::new_session(&root).unwrap();
+        let id = session.storage.as_ref().unwrap().collection.id;
+        let original = snapshot("kept.mp4", 10.0);
+        session.capture(original.clone(), true, false);
+        session.keep_session = true;
+        assert!(session.can_leave());
+        session.finish_temporary().unwrap();
+        drop(session);
+        let mut recovered = Library::recover_session(&root, id).unwrap();
+        assert_eq!(recovered.snapshot(), &original);
+        recovered.close_temporary().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn collection_management_keeps_ids_and_removed_files() {
         let root = std::env::temp_dir().join(format!("mavplayer-manage-{}", uuid::Uuid::new_v4()));
         let mut first = Library::open(&root).unwrap();
@@ -838,6 +1021,100 @@ mod tests {
         assert_eq!(fs::read(&pending).unwrap(), b"unfinished transaction");
         drop(reader);
         drop(writer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn copy_items_preserves_order_titles_and_destination_position() {
+        let root = std::env::temp_dir().join(format!("mavplayer-copy-items-{}", uuid::Uuid::new_v4()));
+        let mut library = Library::open(&root).unwrap();
+        let mut source = snapshot("duplicate.mp4", 12.5);
+        source.sources.push(source.sources[0].clone());
+        source.ids.push(PlaylistItemId::new());
+        source.custom_titles.insert(0, "First occurrence".into());
+        source.custom_titles.insert(1, "Second occurrence".into());
+        library.capture(source.clone(), true, true);
+        library.create("Destination".into());
+        let destination = snapshot("existing.mp4", 42.0);
+        library.capture(destination.clone(), true, true);
+        assert!(library.switch(0));
+        assert_eq!(library.copy_items(1, &source, &[0, 1]).unwrap(), 2);
+        assert_eq!(library.active, 0);
+        assert_eq!(library.snapshot(), &source);
+        assert!(library.copy_items(0, &source, &[0]).is_err());
+        assert!(library.switch(1));
+        let copied = library.snapshot().clone();
+        assert_eq!(copied.sources, [destination.sources.clone(), source.sources.clone()].concat());
+        assert_eq!(copied.ids[0], destination.ids[0]);
+        assert_ne!(copied.ids[1], copied.ids[2]);
+        assert!(copied.ids[1..].iter().all(|id| !source.ids.contains(id)));
+        assert_eq!(copied.custom_titles.get(&1).map(String::as_str), Some("First occurrence"));
+        assert_eq!(copied.custom_titles.get(&2).map(String::as_str), Some("Second occurrence"));
+        assert_eq!(copied.current, destination.current);
+        assert_eq!(copied.position, destination.position);
+        library.flush().unwrap();
+        drop(library);
+        let restored = Library::open(&root).unwrap();
+        assert_eq!(restored.snapshot(), &copied);
+        drop(restored);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn copy_items_does_not_commit_unsaved_destination_draft() {
+        let root = std::env::temp_dir().join(format!("mavplayer-copy-draft-{}", uuid::Uuid::new_v4()));
+        let mut library = Library::open(&root).unwrap();
+        let source = snapshot("source.mp4", 0.0);
+        library.capture(source.clone(), true, true);
+        library.create("Destination".into());
+        let saved = snapshot("saved.mp4", 0.0);
+        library.capture(saved.clone(), true, true);
+        library.set_autosave(false);
+        let draft = snapshot("unsaved.mp4", 0.0);
+        library.capture(draft.clone(), true, false);
+        assert!(library.switch(0));
+        assert!(library.copy_items(1, &source, &[0]).is_err());
+        assert_eq!(library.slots[1].snapshot(), &draft);
+        library.flush().unwrap();
+        drop(library);
+        let mut restored = Library::open(&root).unwrap();
+        assert!(restored.switch(1));
+        assert_eq!(restored.snapshot(), &saved);
+        drop(restored);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn copy_playlist_to_other_collection_preserves_source_and_allocates_new_ids() {
+        let root = std::env::temp_dir().join(format!("mavplayer-copy-playlist-{}", uuid::Uuid::new_v4()));
+        let mut source = Library::open(&root).unwrap();
+        let mut original = snapshot("source.mp4", 10.0);
+        original.custom_titles.insert(0, "Custom title".into());
+        source.capture(original.clone(), true, true);
+        source.flush().unwrap();
+        let original_id = source.slots[0].id;
+        let target_id = Library::create_collection(&root, "Destination").unwrap();
+        let mut target = Library::open_selected(&root, Some(target_id), false).unwrap();
+        assert!(Library::open_selected(&root, Some(target_id), false).is_err());
+        let name = target.copy_playlist(source.name(), source.autosave(), original.clone()).unwrap();
+        assert_eq!(name, "Default playlist 2");
+        assert_eq!(target.active, 0);
+        assert_eq!(source.snapshot(), &original);
+        assert_ne!(target.slots[1].id, original_id);
+        let copied_id = target.slots[1].id;
+        drop(target);
+        let mut restored = Library::open_selected(&root, Some(target_id), false).unwrap();
+        assert_eq!(restored.active, 0);
+        assert_eq!(restored.slots[1].id, copied_id);
+        assert!(restored.switch(1));
+        let copied = restored.snapshot();
+        assert_ne!(copied.ids, original.ids);
+        assert_eq!(copied.sources, original.sources);
+        assert_eq!(copied.custom_titles, original.custom_titles);
+        assert_eq!(copied.current, original.current);
+        assert_eq!(copied.position, original.position);
+        drop(restored);
+        drop(source);
         fs::remove_dir_all(root).unwrap();
     }
 

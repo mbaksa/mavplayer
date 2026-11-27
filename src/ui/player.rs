@@ -1604,7 +1604,7 @@ impl PlayerView {
         let snapshot = self.playlist_snapshot();
         self.playlist_library.capture(snapshot, true, false);
         if !self.playlist_library.can_leave() {
-            return Err(std::io::Error::other("Save unsaved playlists before switching; nonempty temporary or read-only collections must remain open"));
+            return Err(std::io::Error::other("Save unsaved playlists before switching; save or keep a nonempty temporary session first"));
         }
         self.playlist_library.flush()
     }
@@ -1619,7 +1619,7 @@ impl PlayerView {
         match result {
             Ok(next) => {
                 self.stop(window, cx);
-                if let Err(err) = self.playlist_library.close_temporary() {
+                if let Err(err) = self.playlist_library.finish_temporary() {
                     self.osd(format!("Could not close temporary collection: {err}"), cx);
                     return;
                 }
@@ -1627,6 +1627,39 @@ impl PlayerView {
                 self.restore_playlist_workspace(window, cx);
             }
             Err(err) => self.osd(format!("Could not switch collection: {err}"), cx),
+        }
+    }
+
+    pub(super) fn switch_temporary_workspace(
+        &mut self, recover: Option<crate::playlist::collections::CollectionId>, window: &mut Window, cx: &mut Context<Self>,
+    ) {
+        let result = self.prepare_collection_switch().and_then(|()| match recover {
+            Some(id) => PlaylistLibrary::recover_for_switch(id),
+            None => PlaylistLibrary::temporary_for_switch(),
+        });
+        match result {
+            Ok(mut next) => {
+                self.stop(window, cx);
+                if let Err(err) = self.playlist_library.finish_temporary() {
+                    if recover.is_none() {
+                        let _ = next.close_temporary();
+                    }
+                    self.osd(format!("Could not close temporary collection: {err}"), cx);
+                    return;
+                }
+                self.playlist_library = next;
+                self.restore_playlist_workspace(window, cx);
+            }
+            Err(err) => self.osd(format!("Could not open temporary collection: {err}"), cx),
+        }
+    }
+
+    pub(super) fn promote_collection_workspace(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let snapshot = self.playlist_snapshot();
+        self.playlist_library.capture(snapshot, true, true);
+        match self.playlist_library.promote_session(&crate::settings::config_dir(), name) {
+            Ok(()) => self.close_dialog(window, cx),
+            Err(err) => self.osd(format!("Could not save temporary collection: {err}"), cx),
         }
     }
 
@@ -1668,6 +1701,44 @@ impl PlayerView {
             }
             Err(err) => self.osd(format!("Could not delete collection: {err}"), cx),
         }
+    }
+
+    pub(super) fn copy_playlist_items_to(&mut self, target: usize, ids: &[u64], cx: &mut Context<Self>) {
+        let ids: std::collections::HashSet<_> = ids.iter().copied().collect();
+        let indices: Vec<_> = self
+            .playlist
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| ids.contains(&item.id).then_some(i))
+            .collect();
+        if indices.len() != ids.len() {
+            self.osd("Playlist selection changed; retry copying", cx);
+            return;
+        }
+        let snapshot = self.playlist_snapshot();
+        match self.playlist_library.copy_items(target, &snapshot, &indices) {
+            Ok(count) => self.osd(format!("Copied {count} playlist items"), cx),
+            Err(err) => self.osd(format!("Could not confirm playlist copy: {err}"), cx),
+        }
+        cx.notify();
+    }
+
+    pub(super) fn copy_playlist_to_collection(
+        &mut self, id: crate::playlist::collections::CollectionId, cx: &mut Context<Self>,
+    ) {
+        if self.playlist_library.collection_id() == Some(id) {
+            return;
+        }
+        let snapshot = self.playlist_snapshot();
+        let result = PlaylistLibrary::open_for_switch(id).and_then(|mut target| {
+            target.copy_playlist(self.playlist_library.name(), self.playlist_library.autosave(), snapshot)
+        });
+        match result {
+            Ok(name) => self.osd(format!("Copied playlist: {name}"), cx),
+            Err(err) => self.osd(format!("Could not confirm playlist copy: {err}"), cx),
+        }
+        cx.notify();
     }
 
     pub(super) fn switch_playlist_workspace(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1767,7 +1838,7 @@ impl PlayerView {
 
     pub fn close_state(&mut self) {
         self.save_state();
-        if let Err(err) = self.playlist_library.close_temporary() {
+        if let Err(err) = self.playlist_library.finish_temporary() {
             eprintln!("Could not close temporary session: {err}");
         }
     }

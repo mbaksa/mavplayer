@@ -2786,7 +2786,7 @@ impl PlayerView {
         let writable = self.playlist_library.collection_id().is_some();
         let (up, down, default, delete) = self.playlist_library
             .collection_management_state(&crate::settings::config_dir()).unwrap_or_default();
-        vec![
+        let mut items = vec![
             M::Header(self.playlist_library.collection_label().to_owned().into()),
             M::action("Rename collection…", |this, w, cx| {
                 this.show_dialog(super::dialogs::Dialog::RenameCollection, w, cx)
@@ -2804,7 +2804,20 @@ impl PlayerView {
             M::action("Delete collection…", |this, w, cx| {
                 this.show_dialog(super::dialogs::Dialog::DeleteCollection, w, cx)
             }).icon(Icon::Delete).enabled(delete),
-        ]
+            M::Header("SESSIONS".into()),
+            M::action("New temporary collection", |this, w, cx| this.switch_temporary_workspace(None, w, cx)),
+            M::action("Recover session…", |this, w, cx| this.open_recovery_switch(w, cx)),
+        ];
+        if self.playlist_library.is_temporary() {
+            items.push(M::action("Save as permanent collection…", |this, w, cx| {
+                this.show_dialog(super::dialogs::Dialog::PromoteCollection, w, cx)
+            }));
+            items.push(M::action(if self.playlist_library.keep_session { "Discard session on exit" } else { "Keep session on exit" }, |this, _, cx| {
+                this.playlist_library.keep_session = !this.playlist_library.keep_session;
+                this.osd(if this.playlist_library.keep_session { "Session will be kept for recovery" } else { "Session will be discarded on normal exit" }, cx);
+            }));
+        }
+        items
     }
 
     pub(super) fn playlist_panel_menu(&self) -> Vec<M> {
@@ -2825,6 +2838,8 @@ impl PlayerView {
             M::action("New playlist…", |this, w, cx| {
                 this.show_dialog(super::dialogs::Dialog::NamePlaylist(false), w, cx)
             }),
+            M::Header("TRANSFER".into()),
+            M::action("Copy playlist to collection…", |this, w, cx| this.open_copy_playlist(w, cx)),
             M::Header("SAVE".into()),
             M::action("Save current playlist state", |this, _, cx| this.save_playlist_workspace(cx))
                 .icon(Icon::Save)
@@ -3028,6 +3043,12 @@ impl PlayerView {
             })
             .icon(Icon::Remove),
         ];
+        let copy = ids.clone();
+        v.push(M::Header("TRANSFER".into()));
+        v.push(
+            M::action("Copy to playlist…", move |this, w, cx| this.open_copy_items(copy.clone(), w, cx))
+                .enabled(self.playlist_library.writable && self.playlist_library.slots.len() > 1),
+        );
         let can_representative = self.playlist.items.iter().any(|it| {
             ids.contains(&it.id)
                 && matches!(it.source, MediaSource::File(_))
