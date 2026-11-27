@@ -27,6 +27,8 @@ pub enum Dialog {
     OpenUrl,
     NamePlaylist(bool),
     NewCollection,
+    RenameCollection,
+    DeleteCollection,
     EditPlaylistItemTitle(u64),
     DuplicatePlaylist,
     DeletePlaylist,
@@ -102,9 +104,10 @@ impl PlayerView {
                 input.update(cx, |i, cx| i.set_text(title, cx));
                 window.focus(&input.focus_handle(cx));
             }
-            Dialog::NewCollection => {
+            Dialog::NewCollection | Dialog::RenameCollection => {
+                let name = if d == Dialog::RenameCollection { self.playlist_library.collection_label().to_owned() } else { String::new() };
                 let input = self.input("collection_name", "Collection name", window, cx);
-                input.update(cx, |i, cx| i.set_text("", cx));
+                input.update(cx, |i, cx| i.set_text(name, cx));
                 window.focus(&input.focus_handle(cx));
             }
             Dialog::NamePlaylist(rename) => {
@@ -234,6 +237,8 @@ impl PlayerView {
             "collection_name" => {
                 if self.dialog == Some(Dialog::NewCollection) {
                     self.create_collection_workspace(text.trim(), window, cx);
+                } else if self.dialog == Some(Dialog::RenameCollection) {
+                    self.rename_collection_workspace(text.trim(), window, cx);
                 }
             }
             "playlist_name" => {
@@ -1269,13 +1274,14 @@ impl PlayerView {
                     .into_any_element();
                 self.modal("Edit item title", 420., body, Some(footer), cx)
             }
-            Dialog::NewCollection => {
+            Dialog::NewCollection | Dialog::RenameCollection => {
+                let rename = self.dialog == Some(Dialog::RenameCollection);
                 let body = div().p_4().child(self.input_box("collection_name")).into_any_element();
                 let footer = self.text_button(
-                    "collection-name-confirm", "Create", true,
+                    "collection-name-confirm", if rename { "Rename" } else { "Create" }, true,
                     |this, _, w, cx| this.on_input_submit("collection_name", w, cx), cx,
                 ).into_any_element();
-                self.modal("New collection", 380., body, Some(footer), cx)
+                self.modal(if rename { "Rename collection" } else { "New collection" }, 380., body, Some(footer), cx)
             }
             Dialog::NamePlaylist(rename) => {
                 let body = div().p_4().child(self.input_box("playlist_name")).into_any_element();
@@ -1302,6 +1308,17 @@ impl PlayerView {
                     )
                     .into_any_element();
                 self.modal("Duplicate playlist as…", 380., body, Some(footer), cx)
+            }
+            Dialog::DeleteCollection => {
+                let body = div().p_4().child(format!(
+                    "Remove collection ‘{}’ from the collection list? Its saved files will be retained for recovery. No media files will be deleted.",
+                    self.playlist_library.collection_label()
+                )).into_any_element();
+                let footer = div().flex().gap_2()
+                    .child(self.text_button("collection-delete-cancel", "Cancel", false, |this, _, w, cx| this.close_dialog(w, cx), cx))
+                    .child(self.text_button("collection-delete-confirm", "Delete", true, |this, _, w, cx| this.delete_collection_workspace(w, cx), cx))
+                    .into_any_element();
+                self.modal("Delete collection", 420., body, Some(footer), cx)
             }
             Dialog::DeletePlaylist => {
                 let body = div()

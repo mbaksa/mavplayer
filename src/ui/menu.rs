@@ -104,6 +104,7 @@ pub struct OpenMenu {
     pub(super) collection_choices: Option<Vec<crate::playlist::collections::CollectionId>>,
     pub(super) playlist_context: bool,
     pub(super) playlist_settings: bool,
+    pub(super) collection_settings: bool,
     pub(super) playlist_item: Option<u64>,
     pub(super) panel_drag: Option<(Point<Pixels>, Pixels)>,
     pub items: Vec<MenuItem>,
@@ -152,6 +153,7 @@ impl PlayerView {
             collection_choices: None,
             playlist_context: false,
             playlist_settings: false,
+            collection_settings: false,
             playlist_item: None,
             panel_drag: None,
             items,
@@ -200,7 +202,7 @@ impl PlayerView {
                     MouseButton::Left,
                     cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
                         this.playlist_previews.pointer = Some(ev.position);
-                        if this.menu.as_ref().is_some_and(|m| m.playlist_context && !m.playlist_settings && m.collection_choices.is_none())
+                        if this.menu.as_ref().is_some_and(|m| m.playlist_context && !m.playlist_settings && !m.collection_settings && m.collection_choices.is_none())
                             && let Some((id, _)) = this.playlist_item_at(ev.position)
                         {
                             if this.menu.as_ref().and_then(|m| m.playlist_item) == Some(id) {
@@ -224,7 +226,13 @@ impl PlayerView {
                         if this.menu.as_ref().is_some_and(|m| m.playlist_context && m.collection_choices.is_none())
                             && this.playlist_shown() && this.playlist_bounds.get().contains(&ev.position)
                         {
-                            if let Some((id, _)) = this.playlist_item_at(ev.position) {
+                            if this.collection_header_contains(ev.position) {
+                                if this.menu.as_ref().is_some_and(|m| m.collection_settings) {
+                                    this.close_menu(cx);
+                                } else {
+                                    this.open_collection_settings(window, cx);
+                                }
+                            } else if let Some((id, _)) = this.playlist_item_at(ev.position) {
                                 if this.menu.as_ref().and_then(|m| m.playlist_item) == Some(id) {
                                     this.close_menu(cx);
                                 } else {
@@ -318,7 +326,7 @@ impl PlayerView {
                 .child(self.timeline_settings_panel(menu, window, cx));
             return Some(deferred(layer).with_priority(10).into_any_element());
         }
-        if menu.playlist_settings {
+        if menu.playlist_settings || menu.collection_settings {
             layer = layer
                 .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
                     if let Some(menu) = this.menu.as_mut()

@@ -404,6 +404,76 @@ impl Library {
         })
     }
 
+    pub fn rename_collection(&mut self, config: &Path, name: &str) -> io::Result<()> {
+        let name = name.trim();
+        if name.is_empty() || name.contains(['\r', '\n', '\0']) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid collection name"));
+        }
+        let id = self.collection_id().ok_or_else(|| io::Error::other("No writable permanent collection"))?;
+        let (paths, index, _lock) = Self::open_index(config, false)?;
+        for &other in &index.collection_order {
+            if other != id && Self::read_collection(&paths, other)?.name.eq_ignore_ascii_case(name) {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "Collection name already exists"));
+            }
+        }
+        let storage = self.storage.as_mut().unwrap();
+        let mut collection = storage.collection.clone();
+        collection.name = name.to_owned();
+        write_atomic(&paths.collection_manifest(id), &serde_json::to_vec_pretty(&collection)?)?;
+        storage.collection = collection;
+        self.collection_label = name.to_owned();
+        Ok(())
+    }
+
+    pub fn edit_collection_index(&self, config: &Path, move_by: Option<isize>) -> io::Result<()> {
+        let id = self.collection_id().ok_or_else(|| io::Error::other("No writable permanent collection"))?;
+        let (paths, mut index, _lock) = Self::open_index(config, false)?;
+        let pos = index.collection_order.iter().position(|&other| other == id)
+            .ok_or_else(|| io::Error::other("Collection is not in the index"))?;
+        if let Some(delta) = move_by {
+            let next = pos.saturating_add_signed(delta).min(index.collection_order.len() - 1);
+            index.collection_order.swap(pos, next);
+        } else {
+            index.default_collection = Some(id);
+        }
+        write_atomic(&paths.index(), &serde_json::to_vec_pretty(&index)?)
+    }
+
+    pub fn collection_management_state(&self, config: &Path) -> io::Result<(bool, bool, bool, bool)> {
+        let id = self.collection_id().ok_or_else(|| io::Error::other("No writable permanent collection"))?;
+        let (_, index, _lock) = Self::open_index(config, false)?;
+        let pos = index.collection_order.iter().position(|&other| other == id)
+            .ok_or_else(|| io::Error::other("Collection is not in the index"))?;
+        Ok((pos > 0, pos + 1 < index.collection_order.len(), index.default_collection == Some(id), index.collection_order.len() > 1))
+    }
+
+    /// Acquire a replacement before removing the current collection from the index.
+    /// Keep its files intact for later recovery; never delete media files.
+    pub fn remove_collection(&self, config: &Path) -> io::Result<Self> {
+        let id = self.collection_id().ok_or_else(|| io::Error::other("No writable permanent collection"))?;
+        if !self.can_leave() {
+            return Err(io::Error::other("Save unsaved playlists before deleting the collection"));
+        }
+        let (paths, mut index, _lock) = Self::open_index(config, false)?;
+        let mut replacement = None;
+        for other in index.collection_order.iter().copied().filter(|&other| other != id) {
+            let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+                .open(paths.collection_dir(other).join("collection.lock"))?;
+            if lock.try_lock().is_err() {
+                continue;
+            }
+            replacement = Some((other, Self::open_storage(CollectionPaths::new(config), other, Some(lock), false, false)?));
+            break;
+        }
+        let (other, next) = replacement.ok_or_else(|| io::Error::other("No other writable collection is available"))?;
+        index.collection_order.retain(|&entry| entry != id);
+        if index.default_collection == Some(id) {
+            index.default_collection = Some(other);
+        }
+        write_atomic(&paths.index(), &serde_json::to_vec_pretty(&index)?)?;
+        Ok(next)
+    }
+
     /// Administrative entry points also used by the collection UI.
     pub fn list_collections(config: &Path) -> io::Result<String> {
         let (paths, index, _index_lock) = Self::open_index(config, false)?;
@@ -666,6 +736,33 @@ mod tests {
         assert!(Library::list_sessions(&root).unwrap().is_empty());
         assert!(Library::recover_session(&root, id).is_err());
         assert!(!root.join("collections").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn collection_management_keeps_ids_and_removed_files() {
+        let root = std::env::temp_dir().join(format!("mavplayer-manage-{}", uuid::Uuid::new_v4()));
+        let mut first = Library::open(&root).unwrap();
+        let id = first.collection_id().unwrap();
+        let second_id = Library::create_collection(&root, "Second").unwrap();
+        assert!(first.rename_collection(&root, "second").is_err());
+        first.rename_collection(&root, "Renamed").unwrap();
+        assert_eq!(first.collection_id(), Some(id));
+        assert_eq!(first.collection_label(), "Renamed");
+        first.edit_collection_index(&root, Some(1)).unwrap();
+        assert_eq!(Library::collection_choices(&root).unwrap()[0].0, second_id);
+        assert_eq!(first.collection_management_state(&root).unwrap(), (true, false, true, true));
+        let second = Library::open_selected(&root, Some(second_id), false).unwrap();
+        second.edit_collection_index(&root, None).unwrap();
+        assert!(first.remove_collection(&root).is_err());
+        drop(second);
+        let next = first.remove_collection(&root).unwrap();
+        assert_eq!(next.collection_id(), Some(second_id));
+        assert_eq!(Library::collection_choices(&root).unwrap().len(), 1);
+        assert!(CollectionPaths::new(&root).collection_manifest(id).exists());
+        assert!(next.remove_collection(&root).is_err());
+        drop(first);
+        drop(next);
         fs::remove_dir_all(root).unwrap();
     }
 

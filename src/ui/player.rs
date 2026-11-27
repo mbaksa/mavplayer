@@ -1642,6 +1642,34 @@ impl PlayerView {
         }
     }
 
+    pub(super) fn rename_collection_workspace(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.playlist_library.rename_collection(&crate::settings::config_dir(), name) {
+            Ok(()) => self.close_dialog(window, cx),
+            Err(err) => self.osd(format!("Could not rename collection: {err}"), cx),
+        }
+    }
+
+    pub(super) fn edit_collection_order(&mut self, delta: Option<isize>, cx: &mut Context<Self>) {
+        if let Err(err) = self.playlist_library.edit_collection_index(&crate::settings::config_dir(), delta) {
+            self.osd(format!("Could not update collection index: {err}"), cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn delete_collection_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let result = self.prepare_collection_switch()
+            .and_then(|()| self.playlist_library.remove_collection(&crate::settings::config_dir()));
+        match result {
+            Ok(next) => {
+                self.close_dialog(window, cx);
+                self.stop(window, cx);
+                self.playlist_library = next;
+                self.restore_playlist_workspace(window, cx);
+            }
+            Err(err) => self.osd(format!("Could not delete collection: {err}"), cx),
+        }
+    }
+
     pub(super) fn switch_playlist_workspace(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index == self.playlist_library.active || index >= self.playlist_library.slots.len() {
             return;

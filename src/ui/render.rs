@@ -1934,6 +1934,10 @@ impl PlayerView {
             .child(icon(Icon::OpenFolder, px(16.), t.text_dim))
             .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).child(self.playlist_library.collection_label().to_owned()))
             .child(icon(Icon::DropDown, px(12.), t.text_dim))
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                this.open_collection_settings(window, cx);
+                cx.stop_propagation();
+            }))
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                 if !ev.is_right_click() {
                     this.open_collection_switch(super::menu::below(collection_bounds.get()), window, cx);
@@ -2771,6 +2775,36 @@ impl PlayerView {
             self.pl_drop = at;
             cx.notify();
         }
+    }
+
+    pub(super) fn collection_header_contains(&self, pos: Point<Pixels>) -> bool {
+        let bounds = self.playlist_bounds.get();
+        bounds.contains(&pos) && pos.y < bounds.top() + px(30.)
+    }
+
+    pub(super) fn collection_panel_menu(&self) -> Vec<M> {
+        let writable = self.playlist_library.collection_id().is_some();
+        let (up, down, default, delete) = self.playlist_library
+            .collection_management_state(&crate::settings::config_dir()).unwrap_or_default();
+        vec![
+            M::Header(self.playlist_library.collection_label().to_owned().into()),
+            M::action("Rename collection…", |this, w, cx| {
+                this.show_dialog(super::dialogs::Dialog::RenameCollection, w, cx)
+            }).enabled(writable),
+            M::action("New collection…", |this, w, cx| {
+                this.show_dialog(super::dialogs::Dialog::NewCollection, w, cx)
+            }),
+            M::Header("ORGANIZE".into()),
+            M::action("Move up", |this, _, cx| this.edit_collection_order(Some(-1), cx)).enabled(up),
+            M::action("Move down", |this, _, cx| this.edit_collection_order(Some(1), cx)).enabled(down),
+            M::action(if default { "Default collection" } else { "Set as default" }, |this, _, cx| {
+                this.edit_collection_order(None, cx)
+            }).enabled(writable && !default),
+            M::Header("MANAGEMENT".into()),
+            M::action("Delete collection…", |this, w, cx| {
+                this.show_dialog(super::dialogs::Dialog::DeleteCollection, w, cx)
+            }).icon(Icon::Delete).enabled(delete),
+        ]
     }
 
     pub(super) fn playlist_panel_menu(&self) -> Vec<M> {

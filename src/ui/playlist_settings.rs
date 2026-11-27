@@ -247,6 +247,19 @@ impl PlayerView {
         }
     }
 
+    pub(super) fn open_collection_settings(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let bounds = self.playlist_bounds.get();
+        let width = px(400.).min((window.viewport_size().width - px(8.)).max(px(100.)));
+        let pos = point((bounds.left() - width - px(4.)).max(px(4.)), bounds.top().max(px(4.)));
+        let items = self.collection_panel_menu();
+        self.open_menu(items, pos, None, cx);
+        if let Some(menu) = self.menu.as_mut() {
+            menu.playlist_context = true;
+            menu.collection_settings = true;
+            menu.min_width = px(400.);
+        }
+    }
+
     pub(super) fn playlist_context_panel(&self, menu: &OpenMenu, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let mut items = menu.items.clone();
@@ -258,7 +271,7 @@ impl PlayerView {
         }
         let viewport = window.viewport_size();
         let mut width = menu.min_width.min((viewport.width - px(8.)).max(px(100.)));
-        if !menu.playlist_settings {
+        if !menu.playlist_settings && !menu.collection_settings {
             let left_space = self.playlist_bounds.get().left() - px(8.);
             if left_space >= px(180.) {
                 width = width.min(left_space);
@@ -267,7 +280,7 @@ impl PlayerView {
         let columns = if width >= px(300.) { 2 } else { 1 };
         let mut pos = menu.pos;
         let mut max_h = (viewport.height - px(8.)).clamp(px(100.), px(680.));
-        if !menu.playlist_settings {
+        if !menu.playlist_settings && !menu.collection_settings {
             // Keep the item panel above the controls, including fullscreen visualizations.
             let playlist = self.playlist_bounds.get();
             let controls = self.control_bounds.get();
@@ -408,14 +421,14 @@ impl PlayerView {
             .py_1()
             .border_b_1()
             .border_color(t.border)
-            .when(menu.playlist_settings, |d| d.cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+            .when(menu.playlist_settings || menu.collection_settings, |d| d.cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
                 if let Some(menu) = this.menu.as_mut() {
                     let bounds = drag_bounds.get();
                     menu.panel_drag = Some((point(ev.position.x - bounds.left(), ev.position.y - bounds.top()), bounds.size.height));
                 }
                 cx.stop_propagation();
             })))
-            .child(if menu.playlist_settings { "Playlist settings" } else { "Playlist item actions" })
+            .child(if menu.collection_settings { "Collection settings" } else if menu.playlist_settings { "Playlist settings" } else { "Playlist item actions" })
             .child(
                 div()
                     .id("playlist-panel-close")
