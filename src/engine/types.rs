@@ -258,6 +258,16 @@ pub struct CameraMetadata {
     pub model: Option<String>,
     pub capture_gamma: Option<String>,
     pub capture_gamut: Option<String>,
+    #[serde(default)]
+    pub coding_equations: Option<String>,
+    #[serde(default)]
+    pub capture_fps: Option<String>,
+    #[serde(default)]
+    pub codec: Option<String>,
+    #[serde(default)]
+    pub lens_model: Option<String>,
+    #[serde(default)]
+    pub embedded: bool,
     pub source: PathBuf,
 }
 

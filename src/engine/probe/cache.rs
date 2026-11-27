@@ -189,6 +189,7 @@ mod tests {
             sidecars: None,
             video_formats: vec![],
             camera_sidecars: None,
+            camera_reader_version: 0,
         }
     }
 
@@ -198,11 +199,11 @@ mod tests {
         let sidecar = f.source.with_file_name("videoM01.XML");
         f.load(true, || Some(metadata(42.0))).unwrap();
         fs::write(&sidecar, r#"<NonRealTimeMeta><Device manufacturer="Sony" modelName="ILCE-7M4"/>
-            <Item name="CaptureGammaEquation" value="s-log3-cine"/></NonRealTimeMeta>"#).unwrap();
+            <AcquisitionRecord><Group name="CameraUnitMetadataSet"><Item name="CaptureGammaEquation" value="s-log3-cine"/></Group></AcquisitionRecord></NonRealTimeMeta>"#).unwrap();
         let (m, _) = f.load(true, || panic!("unexpected probe")).unwrap();
         assert_eq!(m.info.camera.unwrap().capture_gamma.as_deref(), Some("s-log3-cine"));
         fs::write(&sidecar, r#"<NonRealTimeMeta><Device manufacturer="Sony" modelName="ILCE-7M4"/>
-            <Item name="CaptureGammaEquation" value="hlg"/></NonRealTimeMeta>"#).unwrap();
+            <AcquisitionRecord><Group name="CameraUnitMetadataSet"><Item name="CaptureGammaEquation" value="hlg"/></Group></AcquisitionRecord></NonRealTimeMeta>"#).unwrap();
         let (m, _) = f.load(true, || panic!("unexpected probe")).unwrap();
         assert_eq!(m.info.camera.unwrap().capture_gamma.as_deref(), Some("hlg"));
         fs::remove_file(sidecar).unwrap();

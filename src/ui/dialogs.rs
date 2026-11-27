@@ -3159,12 +3159,21 @@ impl PlayerView {
                 ("Camera model", &camera.model),
                 ("Capture gamma", &camera.capture_gamma),
                 ("Capture gamut", &camera.capture_gamut),
+                ("Coding equations", &camera.coding_equations),
+                ("Capture FPS", &camera.capture_fps),
+                ("Recording codec", &camera.codec),
+                ("Lens model", &camera.lens_model),
             ] {
                 if let Some(value) = value {
                     c = c.child(kv(label, value.clone()));
                 }
             }
-            c = c.child(kv("Metadata source", camera.source.display().to_string()));
+            let source = if camera.embedded {
+                format!("Embedded MP4 XML: {}", camera.source.display())
+            } else {
+                camera.source.display().to_string()
+            };
+            c = c.child(kv("Metadata source", source));
         }
         c = c.child(self.section("Playback"));
         if let Some(v) = &st.video {

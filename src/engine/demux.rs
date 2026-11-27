@@ -444,7 +444,7 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
     }
     let mut info = build_media_info(&ic, &source);
     if let MediaSource::File(path) = &source {
-        info.camera = super::camera_metadata::read(&super::camera_metadata::candidates(path));
+        info.camera = super::camera_metadata::read_for_media(path, &super::camera_metadata::candidates(path));
     }
     let info = Arc::new(info);
     ctx.start_time.set(info.start_time);

@@ -32,6 +32,8 @@ struct Metadata {
     video_formats: Vec<VideoFormat>,
     #[serde(default)]
     camera_sidecars: Option<Vec<super::camera_metadata::SidecarStamp>>,
+    #[serde(default)]
+    camera_reader_version: u8,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -54,10 +56,11 @@ struct VideoFormat {
 impl Metadata {
     fn refresh_camera(&mut self, path: &Path) -> bool {
         let stamps = super::camera_metadata::candidates(path);
-        if self.camera_sidecars.as_ref() == Some(&stamps) {
+        if self.camera_reader_version == 1 && self.camera_sidecars.as_ref() == Some(&stamps) {
             return false;
         }
-        self.info.camera = super::camera_metadata::read(&stamps);
+        self.info.camera = super::camera_metadata::read_for_media(path, &stamps);
+        self.camera_reader_version = 1;
         self.camera_sidecars = Some(stamps);
         true
     }
@@ -194,5 +197,5 @@ fn read_metadata(source: &MediaSource, cfg: &EngineConfig) -> Option<Metadata> {
             }
         })
         .collect();
-    Some(Metadata { info, video_stream, default_audio_stream, sidecars: None, video_formats, camera_sidecars: None })
+    Some(Metadata { info, video_stream, default_audio_stream, sidecars: None, video_formats, camera_sidecars: None, camera_reader_version: 0 })
 }
