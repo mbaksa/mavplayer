@@ -94,6 +94,7 @@ pub(crate) enum CollectionRequest {
     Temporary,
     Writable(CollectionId),
     ReadOnly(CollectionId),
+    Recover(CollectionId),
 }
 
 impl CollectionRequest {
@@ -105,6 +106,7 @@ impl CollectionRequest {
 pub(crate) struct Library {
     storage: Option<CollectionStorage>,
     collection_label: String,
+    temporary: bool,
     pub active: usize,
     pub slots: Vec<Slot>,
     pub writable: bool,
@@ -115,7 +117,8 @@ impl Library {
     fn empty(writable: bool) -> Self {
         Self {
             storage: None,
-            collection_label: "Temporary collection".into(),
+            collection_label: "Temporary collection (memory only)".into(),
+            temporary: false,
             active: 0,
             slots: vec![Slot::new("Default playlist".into(), false)],
             writable,
@@ -127,7 +130,8 @@ impl Library {
         let config = config_dir();
         let result = match request {
             CollectionRequest::Default => Self::open(&config),
-            CollectionRequest::Temporary => return Self::empty(false),
+            CollectionRequest::Temporary => Self::new_session(&config),
+            CollectionRequest::Recover(id) => Self::recover_session(&config, id),
             CollectionRequest::Writable(id) => Self::open_selected(&config, Some(id), false),
             CollectionRequest::ReadOnly(id) => Self::open_selected(&config, Some(id), true),
         };
@@ -135,7 +139,13 @@ impl Library {
             Ok(library) => library,
             Err(err) => {
                 eprintln!("Could not open collection; using a temporary collection: {err}");
-                Self::empty(false)
+                if matches!(request, CollectionRequest::Recover(_)) {
+                    return Self::empty(false);
+                }
+                Self::new_session(&config).unwrap_or_else(|err| {
+                    eprintln!("Could not create temporary session: {err}");
+                    Self::empty(false)
+                })
             }
         }
     }
@@ -212,6 +222,13 @@ impl Library {
             Some(lock)
         };
         drop(index_lock);
+        Self::open_storage(paths, id, lock, read_only, false)
+    }
+
+    fn open_storage(
+        paths: CollectionPaths, id: CollectionId, lock: Option<File>, read_only: bool, temporary: bool,
+    ) -> io::Result<Self> {
+        let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
         let manifest_path = paths.collection_manifest(id);
         let manifest_bytes = fs::read(&manifest_path)?;
         let collection: CollectionManifest = serde_json::from_slice(&manifest_bytes)?;
@@ -264,11 +281,95 @@ impl Library {
         Ok(Self {
             storage: lock.map(|lock| CollectionStorage { paths, collection, _lock: lock }),
             collection_label,
+            temporary,
             active,
             slots,
             writable: !read_only,
             dirty,
         })
+    }
+
+    fn new_session(config: &Path) -> io::Result<Self> {
+        let paths = CollectionPaths::sessions(config);
+        let mut collection = CollectionManifest::new("Temporary collection".into());
+        let id = collection.id;
+        let dir = paths.collection_dir(id);
+        fs::create_dir_all(dir.parent().ok_or_else(|| io::Error::other("Missing sessions directory"))?)?;
+        fs::create_dir(&dir)?;
+        let lock = Self::session_lock(&paths, id)?;
+        let playlist = PlaylistManifest::new("Default playlist".into());
+        collection.playlist_order.push(playlist.id);
+        collection.active_playlist = Some(playlist.id);
+        PlaylistStore::new(&paths, id, playlist.id).create(playlist)?;
+        write_atomic(&paths.collection_manifest(id), &serde_json::to_vec_pretty(&collection)?)?;
+        sync_directory(&dir)?;
+        Self::open_storage(paths, id, Some(lock), false, true)
+    }
+
+    fn session_lock(paths: &CollectionPaths, id: CollectionId) -> io::Result<File> {
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(paths.collection_dir(id).join("collection.lock"))?;
+        lock.try_lock().map_err(|err| io::Error::other(format!("Session {id} lock unavailable: {err}")))?;
+        Ok(lock)
+    }
+
+    fn recover_session(config: &Path, id: CollectionId) -> io::Result<Self> {
+        let paths = CollectionPaths::sessions(config);
+        let lock = Self::session_lock(&paths, id)?;
+        if paths.collection_dir(id).join("closed").try_exists()? {
+            return Err(io::Error::other("Session was closed normally"));
+        }
+        Self::open_storage(paths, id, Some(lock), false, true)
+    }
+
+    pub fn list_sessions(config: &Path) -> io::Result<String> {
+        let paths = CollectionPaths::sessions(config);
+        let entries = match fs::read_dir(config.join("sessions")) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
+            Err(err) => return Err(err),
+        };
+        let mut lines = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Ok(id) = entry.file_name().to_string_lossy().parse::<CollectionId>() else { continue };
+            let Ok(_lock) = Self::session_lock(&paths, id) else { continue };
+            if !entry.path().join("closed").try_exists()? && Self::read_collection(&paths, id).is_ok() {
+                lines.push(id.to_string());
+            }
+        }
+        lines.sort();
+        Ok(lines.join("\n"))
+    }
+
+    pub fn is_temporary(&self) -> bool {
+        self.temporary
+    }
+
+    /// Mark a normally closed session only after its last checkpoint succeeds.
+    pub fn close_temporary(&mut self) -> io::Result<()> {
+        if !self.temporary {
+            return Ok(());
+        }
+        self.flush()?;
+        let Some(storage) = &self.storage else { return Ok(()) };
+        let dir = storage.paths.collection_dir(storage.collection.id);
+        write_atomic(&dir.join("closed"), b"closed\n")?;
+        // Release the OS lock before deletion (required on Windows). The marker
+        // prevents a racing recovery from opening a normally closed session.
+        self.storage = None;
+        self.writable = false;
+        self.temporary = false;
+        let discarded = dir.with_file_name(format!(".closed-{}", uuid::Uuid::new_v4()));
+        fs::rename(&dir, &discarded)?;
+        fs::remove_dir_all(discarded)
     }
 
     pub fn collection_label(&self) -> &str {
@@ -346,7 +447,9 @@ impl Library {
     pub fn capture(&mut self, mut snapshot: Snapshot, exact: bool, manual: bool) {
         snapshot.normalize();
         let slot = &mut self.slots[self.active];
-        if (manual || (slot.autosave && (exact || snapshot.needs_autosave(&slot.saved)))) && slot.saved != snapshot {
+        if (manual || ((self.temporary || slot.autosave) && (exact || snapshot.needs_autosave(&slot.saved))))
+            && slot.saved != snapshot
+        {
             slot.saved = snapshot.clone();
             slot.dirty = true;
             self.dirty = true;
@@ -506,6 +609,36 @@ mod tests {
             position: Some(position),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn temporary_session_recovers_even_with_autosave_disabled() {
+        let root = std::env::temp_dir().join(format!("mavplayer-session-{}", uuid::Uuid::new_v4()));
+        let mut session = Library::new_session(&root).unwrap();
+        let id = session.storage.as_ref().unwrap().collection.id;
+        assert!(session.is_temporary());
+        assert!(!session.autosave());
+        let first = snapshot("first.mp4", 12.5);
+        session.capture(first.clone(), false, false);
+        session.flush().unwrap();
+        session.create("Second".into());
+        let second = snapshot("second.mp4", 25.0);
+        session.capture(second.clone(), false, false);
+        session.flush().unwrap();
+        assert!(Library::list_sessions(&root).unwrap().is_empty());
+        assert!(Library::recover_session(&root, id).is_err());
+        // Dropping without a normal close models an interrupted process.
+        drop(session);
+        assert_eq!(Library::list_sessions(&root).unwrap(), id.to_string());
+        let mut session = Library::recover_session(&root, id).unwrap();
+        assert_eq!(session.snapshot(), &second);
+        assert!(session.switch(0));
+        assert_eq!(session.snapshot(), &first);
+        session.close_temporary().unwrap();
+        assert!(Library::list_sessions(&root).unwrap().is_empty());
+        assert!(Library::recover_session(&root, id).is_err());
+        assert!(!root.join("collections").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

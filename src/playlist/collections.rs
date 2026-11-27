@@ -193,6 +193,10 @@ impl CollectionPaths {
         Self { root: config_dir.join("collections") }
     }
 
+    pub fn sessions(config_dir: &Path) -> Self {
+        Self { root: config_dir.join("sessions") }
+    }
+
     pub fn index(&self) -> PathBuf {
         self.root.join("index.json")
     }

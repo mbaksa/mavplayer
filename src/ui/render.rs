@@ -443,7 +443,7 @@ impl PlayerView {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, w, _| {
                         // Like the compositor's close button: quits, or waits in the tray.
-                        this.save_state();
+                        this.close_state();
                         w.remove_window();
                     })),
             )

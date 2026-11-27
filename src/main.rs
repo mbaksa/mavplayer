@@ -39,7 +39,10 @@ OPTIONS:
         --read-only-collection=UUID
                               Open a read-only snapshot of a collection
         --temporary-collection
-                              Open an unsaved temporary collection
+                              Open a temporary collection with crash recovery
+        --list-sessions       List recoverable temporary session UUIDs
+        --recover-session=UUID
+                              Recover a temporary session in a separate window
         --list-collections    List collection UUIDs and names, then exit
         --create-collection=NAME
                               Create an empty collection, print its UUID, then exit
@@ -98,6 +101,14 @@ fn parse_args() -> Args {
                     exit_with(integration::unintegrate().map(|_| "Removed desktop integration".to_string()))
                 }
                 "--temporary-collection" => args.collection = CollectionRequest::Temporary,
+                "--list-sessions" => exit_with(Library::list_sessions(&settings::config_dir()).map_err(Into::into)),
+                _ if a.starts_with("--recover-session=") => {
+                    let id = a["--recover-session=".len()..].parse().unwrap_or_else(|_| {
+                        eprintln!("mavplayer: invalid session UUID");
+                        std::process::exit(1);
+                    });
+                    args.collection = CollectionRequest::Recover(id);
+                }
                 "--list-collections" => exit_with(Library::list_collections(&settings::config_dir()).map_err(Into::into)),
                 _ if a.starts_with("--create-collection=") => exit_with(
                     Library::create_collection(&settings::config_dir(), &a["--create-collection=".len()..])

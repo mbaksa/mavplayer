@@ -240,7 +240,7 @@ fn handle(msg: Incoming, cx: &mut App) {
         }
         Incoming::Tray(TrayEvent::Quit) => {
             if let Some(w) = open {
-                let _ = w.update(cx, |v, _, _| v.save_state());
+                let _ = w.update(cx, |v, _, _| v.close_state());
             }
             quit(cx);
         }

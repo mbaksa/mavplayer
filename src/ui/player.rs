@@ -484,7 +484,7 @@ impl PlayerView {
             cx.notify();
         }));
         subs.push(cx.on_app_quit(|v, _| {
-            v.save_state();
+            v.close_state();
             async {}
         }));
         // Closing from the window frame (the compositor's close button,
@@ -497,7 +497,7 @@ impl PlayerView {
                     v.hide_to_tray(window, cx);
                     return false;
                 }
-                v.save_state();
+                v.close_state();
                 true
             })
             .unwrap_or(true)
@@ -985,7 +985,7 @@ impl PlayerView {
         self.save_volume_soon();
         if self.playlist_save_at.elapsed() >= Duration::from_secs(1) {
             self.playlist_save_at = Instant::now();
-            if self.playlist_library.autosave() {
+            if self.playlist_library.autosave() || self.playlist_library.is_temporary() {
                 self.save_playlist_session(false, false);
             }
         }
@@ -1693,6 +1693,13 @@ impl PlayerView {
             self.osd(format!("Could not save playlists: {err}"), cx);
         }
         cx.notify();
+    }
+
+    pub fn close_state(&mut self) {
+        self.save_state();
+        if let Err(err) = self.playlist_library.close_temporary() {
+            eprintln!("Could not close temporary session: {err}");
+        }
     }
 
     pub fn save_state(&mut self) {
@@ -3261,7 +3268,7 @@ impl PlayerView {
                     this.close_dialog(w, cx);
                 }
             },
-            Quit => |this, _w, cx| { this.save_state(); super::shell::quit(cx) },
+            Quit => |this, _w, cx| { this.close_state(); super::shell::quit(cx) },
             HideToTray => |this, w, cx| this.hide_to_tray(w, cx),
             Seek0 => |this, _w, cx| this.seek_fraction(0.0, cx),
             Seek1 => |this, _w, cx| this.seek_fraction(0.1, cx),
