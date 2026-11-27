@@ -759,7 +759,7 @@ impl PlayerView {
                 }
                 _ => None,
             };
-            if it.title.is_none() {
+            if matches!(it.source, MediaSource::File(_)) || it.title.is_none() {
                 it.title = media.title.clone();
                 it.artist = media.artist.clone();
             }
@@ -847,6 +847,10 @@ impl PlayerView {
         {
             let st = self.player.state();
             if let Some(media) = st.media.as_ref() {
+                if matches!(it.source, MediaSource::File(_)) {
+                    it.title = media.title.clone();
+                    it.artist = media.artist.clone();
+                }
                 it.duration = Some(media.duration).filter(|d| *d > 0.0);
                 it.has_subtitles |= media.tracks.iter().any(|t| t.kind == TrackKind::Subtitle);
                 it.audio_stream = match st.selected.audio {
@@ -1876,26 +1880,54 @@ impl PlayerView {
         // A few workers (probing is mostly waiting on the disk), with results
         // shown as they arrive rather than after the whole list.
         let cfg = self.engine_config();
-        let queue = Arc::new(parking_lot::Mutex::new(VecDeque::from(todo)));
+        // One probe per source in this batch, even when it occurs multiple times.
+        let mut jobs: Vec<(Vec<u64>, MediaSource)> = Vec::new();
+        let mut indices = HashMap::new();
+        for (id, source) in todo {
+            let index = *indices.entry(source.clone()).or_insert_with(|| {
+                jobs.push((Vec::new(), source));
+                jobs.len() - 1
+            });
+            jobs[index].0.push(id);
+        }
+        drop(indices);
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let workers = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(1, 4));
-        for _ in 0..workers {
-            let (queue, tx, cfg) = (queue.clone(), tx.clone(), cfg.clone());
-            cx.background_executor()
-                .spawn(async move {
-                    loop {
-                        let job = queue.lock().pop_front();
-                        let Some((id, s)) = job else {
-                            break;
-                        };
-                        if tx.unbounded_send((id, engine::probe::probe(&s, &cfg))).is_err() {
-                            break; // the window closed
+        let executor = cx.background_executor().clone();
+        cx.background_executor()
+            .spawn(async move {
+                // Publish all available local cache records before any source
+                // checks. A slow or disconnected NAS must not delay browsing
+                // cached entries elsewhere in the list.
+                for (ids, source) in &jobs {
+                    if let Some(result) = engine::probe::cached_playlist(source, &cfg) {
+                        for &id in ids {
+                            if tx.unbounded_send((id, Some(result.clone()))).is_err() {
+                                return;
+                            }
                         }
                     }
-                })
-                .detach();
-        }
-        drop(tx);
+                }
+                let queue = Arc::new(parking_lot::Mutex::new(VecDeque::from(jobs)));
+                for _ in 0..workers {
+                    let (queue, tx, cfg) = (queue.clone(), tx.clone(), cfg.clone());
+                    executor
+                        .spawn(async move {
+                            loop {
+                                let job = queue.lock().pop_front();
+                                let Some((ids, source)) = job else { break };
+                                let result = engine::probe::probe_playlist(&source, &cfg);
+                                for id in ids {
+                                    if tx.unbounded_send((id, result.clone())).is_err() {
+                                        return; // the window closed
+                                    }
+                                }
+                            }
+                        })
+                        .detach();
+                }
+            })
+            .detach();
         cx.spawn(async move |this, cx| {
             while let Some(first) = rx.next().await {
                 let mut batch = vec![first];
@@ -1903,19 +1935,34 @@ impl PlayerView {
                     batch.push(r);
                 }
                 let applied = this.update(cx, |v, cx| {
+                    let state = v.player.state();
+                    let loaded_id = v
+                        .playlist
+                        .current
+                        .and_then(|i| v.playlist.items.get(i))
+                        .filter(|it| state.media.is_some() && state.source.as_ref() == Some(&it.source))
+                        .map(|it| it.id);
                     for (id, r) in batch {
                         if let (Some(it), Some(r)) = (v.playlist.items.iter_mut().find(|i| i.id == id), r) {
-                            it.duration = Some(r.duration).filter(|d| *d > 0.0);
-                            if it.video_stream.is_none() {
+                            // The live engine is authoritative for the loaded item.
+                            // Other items may replace provisional cached values.
+                            if loaded_id != Some(id) {
+                                it.duration = Some(r.duration).filter(|d| *d > 0.0);
                                 it.video_stream = r.video_stream;
-                            }
-                            if it.audio_stream.is_none() {
                                 it.audio_stream = r.audio_stream;
+                                it.has_subtitles = r.has_subtitles;
+                                it.title = r.title;
+                                it.artist = r.artist;
+                            } else if r.source_validated {
+                                it.has_subtitles = r.has_subtitles
+                                    || state.media.as_ref().is_some_and(|media| {
+                                        media.tracks.iter().any(|t| t.kind == TrackKind::Subtitle)
+                                    });
+                            } else {
+                                it.has_subtitles |= r.has_subtitles;
                             }
-                            it.has_subtitles |= r.has_subtitles;
-                            it.title = it.title.take().or(r.title);
-                            it.artist = it.artist.take().or(r.artist);
-                            if let MediaSource::File(path) = &it.source
+                            if r.source_validated
+                                && let MediaSource::File(path) = &it.source
                                 && let Some(stream) = it.audio_stream
                                 && it.duration.is_some_and(|d| d.is_finite() && d > 0.0)
                                 && (if it.video_stream.is_some() {
@@ -1926,7 +1973,8 @@ impl PlayerView {
                             {
                                 v.thumbnails.waveform.enqueue(path.clone(), Some(stream), &v.settings, false);
                             }
-                            if let MediaSource::File(path) = &it.source
+                            if r.source_validated
+                                && let MediaSource::File(path) = &it.source
                                 && let Some(stream) = it.video_stream
                                 && it.duration.is_some_and(|d| d.is_finite() && d > 0.0)
                             {

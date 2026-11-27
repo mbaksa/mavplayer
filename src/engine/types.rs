@@ -91,13 +91,13 @@ pub enum TrackKind {
 
 /// Identifies a track. Embedded tracks use the container stream index,
 /// external subtitle files get their own id space.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TrackId {
     Stream(usize),
     External(usize),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Track {
     pub id: TrackId,
     pub kind: TrackKind,
@@ -244,14 +244,14 @@ pub fn pick_subtitle(info: &MediaInfo, langs: &[String]) -> Option<TrackId> {
         .map(|t| t.id)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Chapter {
     pub start: f64,
     pub end: f64,
     pub title: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MediaInfo {
     pub source_name: String,
     pub format_name: String,
