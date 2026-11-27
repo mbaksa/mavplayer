@@ -349,6 +349,7 @@ pub(crate) fn recover_move(paths: &CollectionPaths, collection: CollectionId, re
         return Err(invalid("Invalid move intent"));
     }
     // Validate every participant before touching either one.
+    let mut manifests = Vec::with_capacity(2);
     for pair in &intent.pairs {
         let store = PlaylistStore::new(paths, collection, pair.id);
         store.ensure_no_pending()?;
@@ -357,6 +358,7 @@ pub(crate) fn recover_move(paths: &CollectionPaths, collection: CollectionId, re
         if before.revision.checked_add(1) != Some(after.revision) || render_m3u(&after)? != pair.after_m3u {
             return Err(invalid("Invalid move revision or M3U"));
         }
+        manifests.push((before, after));
         for (file, before, after) in
             [(&store.json, &pair.before_json, &pair.after_json), (&store.m3u, &pair.before_m3u, &pair.after_m3u)]
         {
@@ -366,6 +368,21 @@ pub(crate) fn recover_move(paths: &CollectionPaths, collection: CollectionId, re
             }
         }
     }
+    let (dst_before, dst_after) = &manifests[0];
+    let (src_before, src_after) = &manifests[1];
+    let remaining: std::collections::HashSet<_> = src_after.entries.iter().map(|entry| entry.id).collect();
+    let mut expected_dst = dst_before.clone();
+    expected_dst.revision = dst_after.revision;
+    expected_dst.entries.extend(src_before.entries.iter().filter(|entry| !remaining.contains(&entry.id)).cloned());
+    let mut expected_src = src_before.clone();
+    expected_src.revision = src_after.revision;
+    expected_src.entries.retain(|entry| remaining.contains(&entry.id));
+    // Playback position may have been updated since the source was saved.
+    expected_src.current = src_after.current;
+    expected_src.position = src_after.position;
+    if expected_dst != *dst_after || expected_src != *src_after || src_before.entries.len() == src_after.entries.len() {
+        return Err(invalid("Move intent does not preserve playlist items"));
+    }
     // Destination is always first. Source removal follows durable publication.
     for pair in &intent.pairs {
         let store = PlaylistStore::new(paths, collection, pair.id);
@@ -374,6 +391,8 @@ pub(crate) fn recover_move(paths: &CollectionPaths, collection: CollectionId, re
                 write_atomic(file, after)?;
             }
         }
+        // A previous attempt may have renamed a file but failed to sync its directory.
+        sync_directory(store.json.parent().unwrap_or(Path::new(".")))?;
     }
     fs::remove_file(&path)?;
     sync_directory(path.parent().unwrap_or(Path::new(".")))
@@ -399,7 +418,10 @@ pub(crate) fn move_items_transaction(
     ) -> io::Result<MovePair> {
         let store = PlaylistStore::new(paths, collection, loaded.manifest.id);
         store.ensure_no_pending()?;
-        if fs::read(&store.json)? != loaded.original_json || fs::read(&store.m3u)? != loaded.original_m3u {
+        if loaded.externally_edited
+            || fs::read(&store.json)? != loaded.original_json
+            || fs::read(&store.m3u)? != loaded.original_m3u
+        {
             return Err(conflict("Playlist changed on disk; reload before moving"));
         }
         next.revision = loaded.manifest.revision.checked_add(1).ok_or_else(|| invalid("Playlist revision overflow"))?;
@@ -529,6 +551,8 @@ fn finish_playlist_move(paths: &CollectionPaths, intent: &PlaylistMoveIntent) ->
             write_atomic(path, bytes)?;
         }
     }
+    sync_directory(dst.json.parent().unwrap_or(Path::new(".")))?;
+    sync_directory(&paths.collection_dir(destination))?;
     for manifest in [&intent.destination_after, &intent.source_after] {
         write_atomic(&paths.collection_manifest(manifest.id), &serde_json::to_vec_pretty(manifest)?)?;
     }
@@ -668,6 +692,194 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn move_pair(loaded: &LoadedPlaylist, mut next: PlaylistManifest) -> MovePair {
+        next.revision += 1;
+        MovePair {
+            id: next.id,
+            before_json: loaded.original_json.clone(),
+            before_m3u: loaded.original_m3u.clone(),
+            after_json: serde_json::to_vec_pretty(&next).unwrap(),
+            after_m3u: render_m3u(&next).unwrap(),
+        }
+    }
+
+    #[test]
+    fn item_move_recovery_at_every_write_boundary() {
+        for stage in 0..=4 {
+            let f = Fixture::new();
+            let paths = CollectionPaths::new(&f.root);
+            let collection = CollectionId::new();
+            let mut destination = PlaylistManifest::new("Destination".into());
+            destination.entries.push(PlaylistEntry::new(f.manifest.entries[0].source.clone()));
+            let dst = PlaylistStore::new(&paths, collection, destination.id);
+            let src = PlaylistStore::new(&paths, collection, f.manifest.id);
+            let a = dst.create(destination).unwrap();
+            let b = src.create(f.manifest.clone()).unwrap();
+            let mut a_next = a.manifest.clone();
+            let mut b_next = b.manifest.clone();
+            a_next.entries.extend(b_next.entries.drain(..));
+            b_next.current = None;
+            b_next.position = None;
+            let intent = MoveIntent {
+                version: 1,
+                transaction: Uuid::new_v4(),
+                pairs: [move_pair(&a, a_next), move_pair(&b, b_next)],
+            };
+            let journal = move_path(&paths, collection);
+            write_atomic(&journal, &serde_json::to_vec(&intent).unwrap()).unwrap();
+            let writes = [
+                (&dst.m3u, &intent.pairs[0].after_m3u),
+                (&dst.json, &intent.pairs[0].after_json),
+                (&src.m3u, &intent.pairs[1].after_m3u),
+                (&src.json, &intent.pairs[1].after_json),
+            ];
+            for (file, bytes) in writes.into_iter().take(stage) {
+                write_atomic(file, bytes).unwrap();
+            }
+            assert!(recover_move(&paths, collection, true).is_err());
+            assert!(journal.exists());
+            recover_move(&paths, collection, false).unwrap();
+            recover_move(&paths, collection, false).unwrap();
+            assert!(!journal.exists());
+            assert_eq!(dst.load().unwrap().manifest.entries, [a.manifest.entries, b.manifest.entries].concat());
+            assert!(src.load().unwrap().manifest.entries.is_empty());
+            assert_eq!(fs::read(&dst.json).unwrap(), intent.pairs[0].after_json);
+            assert_eq!(fs::read(&src.json).unwrap(), intent.pairs[1].after_json);
+        }
+    }
+
+    #[test]
+    fn item_move_recovery_rejects_conflict_and_invalid_intent() {
+        let f = Fixture::new();
+        let paths = CollectionPaths::new(&f.root);
+        let collection = CollectionId::new();
+        let destination = PlaylistManifest::new("Destination".into());
+        let dst = PlaylistStore::new(&paths, collection, destination.id);
+        let src = PlaylistStore::new(&paths, collection, f.manifest.id);
+        let a = dst.create(destination).unwrap();
+        let b = src.create(f.manifest.clone()).unwrap();
+        let mut a_next = a.manifest.clone();
+        let mut b_next = b.manifest.clone();
+        a_next.entries.push(b_next.entries.pop().unwrap());
+        let mut intent = MoveIntent {
+            version: 1,
+            transaction: Uuid::new_v4(),
+            pairs: [move_pair(&a, a_next), move_pair(&b, b_next.clone())],
+        };
+        let journal = move_path(&paths, collection);
+        write_atomic(&journal, &serde_json::to_vec(&intent).unwrap()).unwrap();
+        write_atomic(&src.m3u, b"#EXTM3U\nhttps://example.com/new\n").unwrap();
+        assert!(recover_move(&paths, collection, false).is_err());
+        assert_eq!(fs::read(&dst.json).unwrap(), a.original_json);
+        assert_eq!(fs::read(&src.m3u).unwrap(), b"#EXTM3U\nhttps://example.com/new\n");
+        assert!(journal.exists());
+        write_atomic(&src.m3u, &b.original_m3u).unwrap();
+        // A syntactically valid journal must not silently discard an entry.
+        b_next.entries.clear();
+        b_next.current = None;
+        b_next.position = None;
+        intent.pairs[1] = move_pair(&b, b_next);
+        write_atomic(&journal, &serde_json::to_vec(&intent).unwrap()).unwrap();
+        assert!(recover_move(&paths, collection, false).is_err());
+        assert_eq!(fs::read(&src.json).unwrap(), b.original_json);
+        assert_eq!(fs::read(&dst.json).unwrap(), a.original_json);
+        assert!(journal.exists());
+    }
+
+    #[test]
+    fn playlist_move_recovery_at_every_write_boundary() {
+        for stage in 0..=6 {
+            let f = Fixture::new();
+            let paths = CollectionPaths::new(&f.root);
+            let mut source = super::super::CollectionManifest::new("Source".into());
+            let mut destination = super::super::CollectionManifest::new("Destination".into());
+            let id = f.manifest.id;
+            source.playlist_order = vec![id, PlaylistId::new()];
+            source.active_playlist = Some(id);
+            destination.playlist_order = vec![PlaylistId::new()];
+            destination.active_playlist = destination.playlist_order.first().copied();
+            let src = PlaylistStore::new(&paths, source.id, id);
+            let dst = PlaylistStore::new(&paths, destination.id, id);
+            let loaded = src.create(f.manifest.clone()).unwrap();
+            let mut moved = loaded.manifest.clone();
+            moved.name = "Renamed".into();
+            moved.revision += 1;
+            let mut source_after = source.clone();
+            source_after.playlist_order.remove(0);
+            source_after.active_playlist = source_after.playlist_order.first().copied();
+            let mut destination_after = destination.clone();
+            destination_after.playlist_order.push(id);
+            for manifest in [&source, &destination] {
+                write_atomic(&paths.collection_manifest(manifest.id), &serde_json::to_vec_pretty(manifest).unwrap())
+                    .unwrap();
+            }
+            let intent = PlaylistMoveIntent {
+                version: 1,
+                transaction: Uuid::new_v4(),
+                source_before: source.clone(),
+                source_after,
+                destination_before: destination.clone(),
+                destination_after,
+                playlist: id,
+                source_json: loaded.original_json,
+                source_m3u: loaded.original_m3u,
+                destination_json: serde_json::to_vec_pretty(&moved).unwrap(),
+                destination_m3u: render_m3u(&moved).unwrap(),
+            };
+            let journal = playlist_move_path(&paths);
+            write_atomic(&journal, &serde_json::to_vec(&intent).unwrap()).unwrap();
+            let writes = [
+                (dst.m3u.clone(), intent.destination_m3u.clone()),
+                (dst.json.clone(), intent.destination_json.clone()),
+                (
+                    paths.collection_manifest(destination.id),
+                    serde_json::to_vec_pretty(&intent.destination_after).unwrap(),
+                ),
+                (paths.collection_manifest(source.id), serde_json::to_vec_pretty(&intent.source_after).unwrap()),
+            ];
+            for (file, bytes) in writes.into_iter().take(stage) {
+                write_atomic(&file, &bytes).unwrap();
+            }
+            if stage >= 5 {
+                fs::remove_file(&src.json).unwrap();
+            }
+            if stage >= 6 {
+                fs::remove_file(&src.m3u).unwrap();
+            }
+            let other_lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(paths.collection_dir(destination.id).join("collection.lock"))
+                .unwrap();
+            other_lock.try_lock().unwrap();
+            assert!(recover_playlist_move(&paths, source.id, false).is_err());
+            assert!(journal.exists());
+            drop(other_lock);
+            assert!(recover_playlist_move(&paths, source.id, true).is_err());
+            // Caller owns the current collection, just as Library::open_storage does.
+            let current_lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(paths.collection_dir(source.id).join("collection.lock"))
+                .unwrap();
+            current_lock.try_lock().unwrap();
+            recover_playlist_move(&paths, source.id, false).unwrap();
+            recover_playlist_move(&paths, source.id, false).unwrap();
+            assert!(!journal.exists());
+            assert!(!src.json.exists() && !src.m3u.exists());
+            assert_eq!(dst.load().unwrap().manifest, moved);
+            for expected in [&intent.source_after, &intent.destination_after] {
+                let actual: super::super::CollectionManifest =
+                    serde_json::from_slice(&fs::read(paths.collection_manifest(expected.id)).unwrap()).unwrap();
+                assert_eq!(&actual, expected);
+            }
         }
     }
 
