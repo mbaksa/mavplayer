@@ -49,9 +49,20 @@ fn subtitle_badge(color: Hsla) -> AnyElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
-            for (x, y, w, h) in [(0., 1., 12., 1.), (0., 10., 12., 1.), (0., 2., 1., 8.), (11., 2., 1., 8.),
-                (2., 5., 3., 1.), (6., 5., 4., 1.), (2., 7., 5., 1.), (8., 7., 2., 1.)] {
-                window.paint_quad(gpui::fill(Bounds::new(point(bounds.left() + px(x), bounds.top() + px(y)), size(px(w), px(h))), color));
+            for (x, y, w, h) in [
+                (0., 1., 12., 1.),
+                (0., 10., 12., 1.),
+                (0., 2., 1., 8.),
+                (11., 2., 1., 8.),
+                (2., 5., 3., 1.),
+                (6., 5., 4., 1.),
+                (2., 7., 5., 1.),
+                (8., 7., 2., 1.),
+            ] {
+                window.paint_quad(gpui::fill(
+                    Bounds::new(point(bounds.left() + px(x), bounds.top() + px(y)), size(px(w), px(h))),
+                    color,
+                ));
             }
         },
     )
@@ -380,7 +391,8 @@ impl PlayerView {
             .and_then(|i| self.playlist.items.get(i))
             .and_then(|item| item.custom_title.clone())
             .or_else(|| {
-                self.player.with_state(|s| s.media.as_ref().map(|m| m.title.clone().unwrap_or_else(|| m.source_name.clone())))
+                self.player
+                    .with_state(|s| s.media.as_ref().map(|m| m.title.clone().unwrap_or_else(|| m.source_name.clone())))
             })
             .map(|n| format!("{n} — MavPlayer"))
             .unwrap_or_else(|| "MavPlayer".into())
@@ -1932,12 +1944,22 @@ impl PlayerView {
             .hover(|s| s.bg(t.hover))
             .child(canvas(move |b, _, _| measured_collection.set(b), |_, _, _, _| {}).absolute().size_full())
             .child(icon(Icon::OpenFolder, px(16.), t.text_dim))
-            .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).child(self.playlist_library.collection_label().to_owned()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(13.))
+                    .child(self.playlist_library.collection_label().to_owned()),
+            )
             .child(icon(Icon::DropDown, px(12.), t.text_dim))
-            .on_mouse_down(MouseButton::Right, cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                this.open_collection_settings(window, cx);
-                cx.stop_propagation();
-            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    this.open_collection_settings(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                 if !ev.is_right_click() {
                     this.open_collection_switch(super::menu::below(collection_bounds.get()), window, cx);
@@ -2225,7 +2247,8 @@ impl PlayerView {
                             .as_ref()
                             .filter(|h| {
                                 (hovered && mode.scrubbing() || panel_item == Some(item_id))
-                                    && this.dialog.is_none() && h.id == item_id
+                                    && this.dialog.is_none()
+                                    && h.id == item_id
                             })
                             .and_then(|h| {
                                 if h.duration <= 0.0 {
@@ -2285,8 +2308,13 @@ impl PlayerView {
                             .when(is_cur, |d| d.bg(t.accent_soft))
                             .when(selected && !is_cur, |d| d.bg(t.pressed))
                             .when(selected && is_cur, |d| d.bg(t.accent_soft).border_1().border_color(t.accent))
-                            .when(this.menu.as_ref().and_then(|m| m.playlist_item) == Some(item_id), |d| d.border_1().border_color(t.accent))
-                            .when(this.menu.as_ref().and_then(|m| m.playlist_item).is_some_and(|id| id != item_id), |d| d.opacity(0.55))
+                            .when(this.menu.as_ref().and_then(|m| m.playlist_item) == Some(item_id), |d| {
+                                d.border_1().border_color(t.accent)
+                            })
+                            .when(
+                                this.menu.as_ref().and_then(|m| m.playlist_item).is_some_and(|id| id != item_id),
+                                |d| d.opacity(0.55),
+                            )
                             .hover(|s| s.bg(t.hover))
                             .child(hover_sync)
                             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -2349,20 +2377,29 @@ impl PlayerView {
                                     .gap_2()
                                     .when(can_scrub, |d| {
                                         d.child(
-                                            canvas(move |b, _, _| {
-                                                measured.set(b);
-                                                let mut rows = scrub_bounds.borrow_mut();
-                                                if let Some((_, bounds)) = rows.iter_mut().find(|(id, _)| *id == item_id) {
-                                                    *bounds = b;
-                                                } else {
-                                                    rows.push((item_id, b));
-                                                }
-                                            }, |_, _, _, _| {})
-                                                .absolute()
-                                                .size_full(),
+                                            canvas(
+                                                move |b, _, _| {
+                                                    measured.set(b);
+                                                    let mut rows = scrub_bounds.borrow_mut();
+                                                    if let Some((_, bounds)) =
+                                                        rows.iter_mut().find(|(id, _)| *id == item_id)
+                                                    {
+                                                        *bounds = b;
+                                                    } else {
+                                                        rows.push((item_id, b));
+                                                    }
+                                                },
+                                                |_, _, _, _| {},
+                                            )
+                                            .absolute()
+                                            .size_full(),
                                         )
                                         .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
-                                            if cx.has_active_drag() || this.drag.is_some() || this.menu.is_some() || this.dialog.is_some() {
+                                            if cx.has_active_drag()
+                                                || this.drag.is_some()
+                                                || this.menu.is_some()
+                                                || this.dialog.is_some()
+                                            {
                                                 return;
                                             }
                                             let Some(key) = key.clone() else {
@@ -2469,7 +2506,11 @@ impl PlayerView {
                                             )
                                             .when_some(secondary_title, |d, name| {
                                                 d.child(
-                                                    div().truncate().text_size(px(11.)).text_color(t.text_dim).child(name),
+                                                    div()
+                                                        .truncate()
+                                                        .text_size(px(11.))
+                                                        .text_color(t.text_dim)
+                                                        .child(name),
                                                 )
                                             }),
                                     )
@@ -2797,13 +2838,14 @@ impl PlayerView {
 
     pub(super) fn collection_panel_menu(&self) -> Vec<M> {
         let writable = self.playlist_library.collection_id().is_some();
-        let (up, down, default, delete) = self.playlist_library
-            .collection_management_state(&crate::settings::config_dir()).unwrap_or_default();
+        let (up, down, default, delete) =
+            self.playlist_library.collection_management_state(&crate::settings::config_dir()).unwrap_or_default();
         let mut items = vec![
             M::Header(self.playlist_library.collection_label().to_owned().into()),
             M::action("Rename collection…", |this, w, cx| {
                 this.show_dialog(super::dialogs::Dialog::RenameCollection, w, cx)
-            }).enabled(writable),
+            })
+            .enabled(writable),
             M::action("New collection…", |this, w, cx| {
                 this.show_dialog(super::dialogs::Dialog::NewCollection, w, cx)
             }),
@@ -2812,11 +2854,14 @@ impl PlayerView {
             M::action("Move down", |this, _, cx| this.edit_collection_order(Some(1), cx)).enabled(down),
             M::action(if default { "Default collection" } else { "Set as default" }, |this, _, cx| {
                 this.edit_collection_order(None, cx)
-            }).enabled(writable && !default),
+            })
+            .enabled(writable && !default),
             M::Header("MANAGEMENT".into()),
             M::action("Delete collection…", |this, w, cx| {
                 this.show_dialog(super::dialogs::Dialog::DeleteCollection, w, cx)
-            }).icon(Icon::Delete).enabled(delete),
+            })
+            .icon(Icon::Delete)
+            .enabled(delete),
             M::Header("SESSIONS".into()),
             M::action("New temporary collection", |this, w, cx| this.switch_temporary_workspace(None, w, cx)),
             M::action("Recover session…", |this, w, cx| this.open_recovery_switch(w, cx)),
@@ -2825,10 +2870,20 @@ impl PlayerView {
             items.push(M::action("Save as permanent collection…", |this, w, cx| {
                 this.show_dialog(super::dialogs::Dialog::PromoteCollection, w, cx)
             }));
-            items.push(M::action(if self.playlist_library.keep_session { "Discard session on exit" } else { "Keep session on exit" }, |this, _, cx| {
-                this.playlist_library.keep_session = !this.playlist_library.keep_session;
-                this.osd(if this.playlist_library.keep_session { "Session will be kept for recovery" } else { "Session will be discarded on normal exit" }, cx);
-            }));
+            items.push(M::action(
+                if self.playlist_library.keep_session { "Discard session on exit" } else { "Keep session on exit" },
+                |this, _, cx| {
+                    this.playlist_library.keep_session = !this.playlist_library.keep_session;
+                    this.osd(
+                        if this.playlist_library.keep_session {
+                            "Session will be kept for recovery"
+                        } else {
+                            "Session will be discarded on normal exit"
+                        },
+                        cx,
+                    );
+                },
+            ));
         }
         items
     }
@@ -2911,13 +2966,19 @@ impl PlayerView {
         if !bounds.contains(&pos) || pos.x >= bounds.right() - px(super::widgets::SCROLLBAR_W) {
             return None;
         }
-        self.playlist_row_bounds.borrow().iter().rev().find_map(|(id, row)| {
-            row.contains(&pos).then_some((*id, row.top().max(bounds.top())))
-        })
+        self.playlist_row_bounds
+            .borrow()
+            .iter()
+            .rev()
+            .find_map(|(id, row)| row.contains(&pos).then_some((*id, row.top().max(bounds.top()))))
     }
 
     pub(super) fn open_playlist_item_actions(
-        &mut self, item_id: u64, pos: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>,
+        &mut self,
+        item_id: u64,
+        pos: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         let Some(index) = self.playlist.items.iter().position(|it| it.id == item_id) else { return };
         let row_top = self.playlist_item_at(pos).filter(|(id, _)| *id == item_id).map_or(pos.y, |(_, y)| y);
@@ -2947,8 +3008,8 @@ impl PlayerView {
             self.clear_playlist_panel_scrub(cx);
             return false;
         }
-        let bounds = self.playlist_scrub_bounds.borrow().iter()
-            .find(|(row, b)| *row == id && b.contains(&pos)).map(|(_, b)| *b);
+        let bounds =
+            self.playlist_scrub_bounds.borrow().iter().find(|(row, b)| *row == id && b.contains(&pos)).map(|(_, b)| *b);
         let Some(bounds) = bounds else {
             self.clear_playlist_panel_scrub(cx);
             return false;
@@ -2978,10 +3039,15 @@ impl PlayerView {
         }
     }
 
-    pub(super) fn playlist_panel_scrub_preview(&self, id: u64) -> Option<(super::playlist_thumbnails::Key, super::thumbnails::Preview)> {
+    pub(super) fn playlist_panel_scrub_preview(
+        &self,
+        id: u64,
+    ) -> Option<(super::playlist_thumbnails::Key, super::thumbnails::Preview)> {
         let h = self.playlist_previews.hover.as_ref().filter(|h| h.id == id)?;
         let time = h.duration * f64::from(h.fraction);
-        let preview = self.thumbnails.for_playlist(&h.key.path, h.key.stream, h.key.count, time)
+        let preview = self
+            .thumbnails
+            .for_playlist(&h.key.path, h.key.stream, h.key.count, time)
             .or_else(|| self.playlist_previews.scrub(&h.key, time))?;
         Some((h.key.clone(), preview.clone()))
     }
@@ -2993,7 +3059,10 @@ impl PlayerView {
     }
 
     fn set_playlist_panel_thumbnail(
-        &mut self, key: super::playlist_thumbnails::Key, preview: super::thumbnails::Preview, cx: &mut Context<Self>,
+        &mut self,
+        key: super::playlist_thumbnails::Key,
+        preview: super::thumbnails::Preview,
+        cx: &mut Context<Self>,
     ) {
         self.settings.playlist_thumbnail_times.insert(key.selection_key(), preview.time);
         self.playlist_previews.remember_selection(key, preview.time, preview);
@@ -3006,17 +3075,22 @@ impl PlayerView {
         let key = super::playlist_thumbnails::Key::new(item, &self.settings)?;
         let cached = super::cache_badges::Entry::new(item, &self.settings)
             .is_some_and(|entry| self.cache_badges.get(&entry).video);
-        if !cached && self.thumbnails.for_playlist(&key.path, key.stream, key.count, 0.0).is_none()
+        if !cached
+            && self.thumbnails.for_playlist(&key.path, key.stream, key.count, 0.0).is_none()
             && self.playlist_previews.scrub(&key, 0.0).is_none()
         {
             return None;
         }
         let has_override = self.settings.playlist_thumbnail_times.contains_key(&key.selection_key());
-        Some(M::action("Reset thumbnail", move |this, _, cx| {
-            this.settings.playlist_thumbnail_times.remove(&key.selection_key());
-            this.settings.save();
-            cx.notify();
-        }).icon(Icon::Reset).enabled(has_override))
+        Some(
+            M::action("Reset thumbnail", move |this, _, cx| {
+                this.settings.playlist_thumbnail_times.remove(&key.selection_key());
+                this.settings.save();
+                cx.notify();
+            })
+            .icon(Icon::Reset)
+            .enabled(has_override),
+        )
     }
 
     fn playlist_item_menu(&self, i: usize) -> Vec<M> {
@@ -3060,6 +3134,11 @@ impl PlayerView {
         v.push(M::Header("TRANSFER".into()));
         v.push(
             M::action("Copy to playlist…", move |this, w, cx| this.open_copy_items(copy.clone(), w, cx))
+                .enabled(self.playlist_library.writable && self.playlist_library.slots.len() > 1),
+        );
+        let moving = ids.clone();
+        v.push(
+            M::action("Move to playlist…", move |this, w, cx| this.open_move_items(moving.clone(), w, cx))
                 .enabled(self.playlist_library.writable && self.playlist_library.slots.len() > 1),
         );
         let can_representative = self.playlist.items.iter().any(|it| {

@@ -6,12 +6,12 @@ use super::theme::Theme;
 use super::widgets::{icon, scrollbar, tooltip};
 use crate::icons::Icon;
 use crate::settings::PlaylistThumbnails as P;
+use gpui::{
+    AnyElement, Bounds, Context, Div, MouseButton, SharedString, Window, anchored, canvas, div, fill, point,
+    prelude::*, px, rgb, size,
+};
 use std::cell::Cell;
 use std::rc::Rc;
-use gpui::{
-    AnyElement, Bounds, Context, Div, MouseButton, SharedString, Window, anchored, canvas, div, fill, point, prelude::*,
-    px, rgb, size,
-};
 
 // Draw schematic previews, not media images. No thumbnail cache access is needed.
 fn swatch(mode: P, t: Theme) -> AnyElement {
@@ -77,7 +77,10 @@ fn filmstrip_icon(color: gpui::Hsla) -> AnyElement {
         |_, _, _| (),
         move |bounds, _, window, _| {
             let mut rect = |x: f32, y: f32, w: f32, h: f32| {
-                window.paint_quad(fill(Bounds::new(point(bounds.left() + px(x), bounds.top() + px(y)), size(px(w), px(h))), color));
+                window.paint_quad(fill(
+                    Bounds::new(point(bounds.left() + px(x), bounds.top() + px(y)), size(px(w), px(h))),
+                    color,
+                ));
             };
             rect(0., 1., 16., 1.);
             rect(0., 12., 16., 1.);
@@ -115,12 +118,22 @@ fn action_tooltip(label: &str) -> SharedString {
         "Add folder" => "Add media files from a folder to the current playlist.",
         "Export playlist (M3U)" => "Export the playlist as a standard M3U file, without saving its internal state.",
         "Clear playlist" => "Remove all entries from the playlist without deleting media files.",
-        _ if label.starts_with("Generate missing playlist thumbnails") => "Create missing representative pictures for the playlist.",
-        _ if label.starts_with("Generate playlist thumbnail") => "Create a representative picture for the selected media.",
-        _ if label.starts_with("Generate missing filmstrip") => "Sample video frames for scrubbing, timeline previews and visualizations; keep existing filmstrips.",
+        _ if label.starts_with("Generate missing playlist thumbnails") => {
+            "Create missing representative pictures for the playlist."
+        }
+        _ if label.starts_with("Generate playlist thumbnail") => {
+            "Create a representative picture for the selected media."
+        }
+        _ if label.starts_with("Generate missing filmstrip") => {
+            "Sample video frames for scrubbing, timeline previews and visualizations; keep existing filmstrips."
+        }
         _ if label.starts_with("Regenerate filmstrip") => "Replace existing filmstrips by sampling the video again.",
-        _ if label.starts_with("Generate missing waveforms") => "Analyze audio amplitude over time where a waveform is not cached.",
-        _ if label.starts_with("Regenerate") && label.contains("waveform") => "Analyze the audio again and replace the existing waveform cache.",
+        _ if label.starts_with("Generate missing waveforms") => {
+            "Analyze audio amplitude over time where a waveform is not cached."
+        }
+        _ if label.starts_with("Regenerate") && label.contains("waveform") => {
+            "Analyze the audio again and replace the existing waveform cache."
+        }
         _ => label,
     };
     SharedString::from(description.to_owned())
@@ -184,10 +197,13 @@ impl PlayerView {
         };
         let waveform = label.contains("waveform") && (label.starts_with("Generate") || label.starts_with("Regenerate"));
         let picture = label.starts_with("Generate") && label.contains("playlist thumbnail");
-        let filmstrip = (label.starts_with("Generate") || label.starts_with("Regenerate")) && label.contains("filmstrip");
+        let filmstrip =
+            (label.starts_with("Generate") || label.starts_with("Regenerate")) && label.contains("filmstrip");
         let display = if let Some(text) = label.strip_prefix("Generate ") {
             let mut chars = text.chars();
-            SharedString::from(chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default())
+            SharedString::from(
+                chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default(),
+            )
         } else {
             label.clone()
         };
@@ -215,21 +231,23 @@ impl PlayerView {
             .tooltip(tooltip(action_tooltip(label.as_ref()), t))
             .when(submenu, |d| d.child(icon(Icon::ChevronRight, px(12.), color)))
             .when(enabled, |d| {
-                d.cursor_pointer().hover(|s| s.bg(t.hover)).on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
-                    if let Some(run) = &run {
-                        this.playlist_previews.pointer = Some(ev.position());
-                        if !keep_open {
-                            this.close_menu(cx);
+                d.cursor_pointer().hover(|s| s.bg(t.hover)).on_click(cx.listener(
+                    move |this, ev: &gpui::ClickEvent, window, cx| {
+                        if let Some(run) = &run {
+                            this.playlist_previews.pointer = Some(ev.position());
+                            if !keep_open {
+                                this.close_menu(cx);
+                            }
+                            run(this, window, cx);
+                            if !keep_open {
+                                this.note_activity(cx);
+                            }
+                        } else if let Some(menu) = this.menu.as_mut() {
+                            menu.open_path = vec![index];
                         }
-                        run(this, window, cx);
-                        if !keep_open {
-                            this.note_activity(cx);
-                        }
-                    } else if let Some(menu) = this.menu.as_mut() {
-                        menu.open_path = vec![index];
-                    }
-                    cx.notify();
-                }))
+                        cx.notify();
+                    },
+                ))
             })
             .into_any_element()
     }
@@ -260,12 +278,19 @@ impl PlayerView {
         }
     }
 
-    pub(super) fn playlist_context_panel(&self, menu: &OpenMenu, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn playlist_context_panel(
+        &self,
+        menu: &OpenMenu,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = self.theme;
         let mut items = menu.items.clone();
         if let Some(id) = menu.playlist_item
             && let Some(reset) = self.playlist_panel_reset_action(id)
-            && let Some(index) = items.iter().position(|item| matches!(item, MenuItem::Action { label, .. } if label.as_ref() == "Edit title"))
+            && let Some(index) = items
+                .iter()
+                .position(|item| matches!(item, MenuItem::Action { label, .. } if label.as_ref() == "Edit title"))
         {
             items.insert(index + 1, reset);
         }
@@ -324,10 +349,8 @@ impl PlayerView {
         let scroll = menu.scroll(0);
         let mut body = div().flex().flex_col().gap_1().p_2();
         if menu.playlist_settings {
-            body = body
-                .child(heading("THUMBNAIL DISPLAY", t))
-                .child(self.playlist_mode_cards(P::ALL.len(), cx))
-                .child(self.timeline_panel_toggle(
+            body = body.child(heading("THUMBNAIL DISPLAY", t)).child(self.playlist_mode_cards(P::ALL.len(), cx)).child(
+                self.timeline_panel_toggle(
                     "playlist-panel-autohide",
                     if self.in_fullscreen { "Autohide playlist in fullscreen" } else { "Autohide playlist in window" },
                     self.playlist_autohide(),
@@ -338,7 +361,8 @@ impl PlayerView {
                         this.apply_settings(cx);
                     },
                     cx,
-                ));
+                ),
+            );
         }
         if let Some(item) = menu.playlist_item.and_then(|id| self.playlist.items.iter().find(|it| it.id == id)) {
             let scrub = self.playlist_panel_scrub_preview(item.id).map(|(_, preview)| preview);
@@ -346,14 +370,34 @@ impl PlayerView {
                 let duration = item.duration.unwrap_or_default();
                 let target = key.representative_time(&self.settings, duration);
                 self.thumbnails.for_playlist(&key.path, key.stream, key.count, target).or_else(|| {
-                    self.playlist_previews.cached_representative(&key, target, duration * crate::engine::thumbnails::representative_fraction(&key.path))
+                    self.playlist_previews.cached_representative(
+                        &key,
+                        target,
+                        duration * crate::engine::thumbnails::representative_fraction(&key.path),
+                    )
                 })
             });
             let (title, filename) = item.labels(crate::settings::PlaylistLabels::Both);
-            body = body.child(div().flex().items_center().gap_2().p_1()
-                .when_some(scrub.as_ref().or(preview), |d, p| d.child(p.element(104., 58.)))
-                .child(div().flex_1().min_w_0().flex().flex_col().gap_1().child(title)
-                    .when_some(filename, |d, name| d.child(div().text_size(px(11.)).text_color(t.text_dim).child(name)))));
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .p_1()
+                    .when_some(scrub.as_ref().or(preview), |d, p| d.child(p.element(104., 58.)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(title)
+                            .when_some(filename, |d, name| {
+                                d.child(div().text_size(px(11.)).text_color(t.text_dim).child(name))
+                            }),
+                    ),
+            );
         }
         let mut i = 0;
         let mut section = "";
@@ -391,15 +435,26 @@ impl PlayerView {
                             let item = &items[index];
                             let is_audio = matches!(item, MenuItem::Action { label, .. } if label.contains("waveform"));
                             let button = self.playlist_action_button(index, item, cx);
-                            if is_audio { audio = audio.child(button); } else { pictures = pictures.child(button); }
+                            if is_audio {
+                                audio = audio.child(button);
+                            } else {
+                                pictures = pictures.child(button);
+                            }
                         }
                         body = body.child(div().flex().items_start().gap_1().child(pictures).child(audio));
                         continue;
                     }
-                    let row_columns = if (section == "ORGANIZE" || (!menu.playlist_settings && section.is_empty())) && width >= px(300.) { 3 } else { columns };
+                    let row_columns = if (section == "ORGANIZE" || (!menu.playlist_settings && section.is_empty()))
+                        && width >= px(300.)
+                    {
+                        3
+                    } else {
+                        columns
+                    };
                     let mut row = div().flex().gap_1();
                     let mut n = 0;
-                    while n < row_columns && i < items.len()
+                    while n < row_columns
+                        && i < items.len()
                         && !matches!(&items[i], MenuItem::Header(_) | MenuItem::Separator)
                     {
                         row = row.child(self.playlist_action_button(i, &items[i], cx));
@@ -421,14 +476,28 @@ impl PlayerView {
             .py_1()
             .border_b_1()
             .border_color(t.border)
-            .when(menu.playlist_settings || menu.collection_settings, |d| d.cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
-                if let Some(menu) = this.menu.as_mut() {
-                    let bounds = drag_bounds.get();
-                    menu.panel_drag = Some((point(ev.position.x - bounds.left(), ev.position.y - bounds.top()), bounds.size.height));
-                }
-                cx.stop_propagation();
-            })))
-            .child(if menu.collection_settings { "Collection settings" } else if menu.playlist_settings { "Playlist settings" } else { "Playlist item actions" })
+            .when(menu.playlist_settings || menu.collection_settings, |d| {
+                d.cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                        if let Some(menu) = this.menu.as_mut() {
+                            let bounds = drag_bounds.get();
+                            menu.panel_drag = Some((
+                                point(ev.position.x - bounds.left(), ev.position.y - bounds.top()),
+                                bounds.size.height,
+                            ));
+                        }
+                        cx.stop_propagation();
+                    }),
+                )
+            })
+            .child(if menu.collection_settings {
+                "Collection settings"
+            } else if menu.playlist_settings {
+                "Playlist settings"
+            } else {
+                "Playlist item actions"
+            })
             .child(
                 div()
                     .id("playlist-panel-close")

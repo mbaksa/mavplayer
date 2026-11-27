@@ -1,7 +1,9 @@
 //! Named playlist workspaces. The active draft is independent of the last
 //! explicitly saved (or autosaved) snapshot of each workspace.
 
-use super::collections::storage::{LoadedPlaylist, PlaylistStore, sync_directory, write_atomic};
+use super::collections::storage::{
+    LoadedPlaylist, PlaylistStore, move_items_transaction, recover_move, sync_directory, write_atomic,
+};
 use super::collections::{
     CollectionId, CollectionIndex, CollectionManifest, CollectionPaths, PlaylistEntry, PlaylistId, PlaylistItemId,
     PlaylistManifest,
@@ -228,9 +230,14 @@ impl Library {
     }
 
     fn open_storage(
-        paths: CollectionPaths, id: CollectionId, lock: Option<File>, read_only: bool, temporary: bool,
+        paths: CollectionPaths,
+        id: CollectionId,
+        lock: Option<File>,
+        read_only: bool,
+        temporary: bool,
     ) -> io::Result<Self> {
         let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
+        recover_move(&paths, id, read_only)?;
         let manifest_path = paths.collection_manifest(id);
         let manifest_bytes = fs::read(&manifest_path)?;
         let collection: CollectionManifest = serde_json::from_slice(&manifest_bytes)?;
@@ -279,7 +286,8 @@ impl Library {
             return Err(io::Error::other("Collection changed while loading; retry"));
         }
         let dirty = !read_only && slots.iter().any(|slot| slot.dirty);
-        let collection_label = if read_only { format!("Read-only: {}", collection.name) } else { collection.name.clone() };
+        let collection_label =
+            if read_only { format!("Read-only: {}", collection.name) } else { collection.name.clone() };
         Ok(Self {
             storage: lock.map(|lock| CollectionStorage { paths, collection, _lock: lock }),
             collection_label,
@@ -362,20 +370,19 @@ impl Library {
 
     pub fn session_choices(config: &Path) -> io::Result<Vec<(CollectionId, String)>> {
         let paths = CollectionPaths::sessions(config);
-        Ok(Self::list_sessions(config)?.lines().filter_map(|line| {
-            let id = line.parse::<CollectionId>().ok()?;
-            let collection = Self::read_collection(&paths, id).ok()?;
-            Some((id, format!("{} · {} playlists · {}", collection.name, collection.playlist_order.len(), id)))
-        }).collect())
+        Ok(Self::list_sessions(config)?
+            .lines()
+            .filter_map(|line| {
+                let id = line.parse::<CollectionId>().ok()?;
+                let collection = Self::read_collection(&paths, id).ok()?;
+                Some((id, format!("{} · {} playlists · {}", collection.name, collection.playlist_order.len(), id)))
+            })
+            .collect())
     }
 
     /// Keep a checkpoint on disk if requested, otherwise discard on normal exit.
     pub fn finish_temporary(&mut self) -> io::Result<()> {
-        if self.temporary && self.keep_session {
-            self.flush()
-        } else {
-            self.close_temporary()
-        }
+        if self.temporary && self.keep_session { self.flush() } else { self.close_temporary() }
     }
 
     /// Publish a complete copy before retiring the original recovery session.
@@ -405,7 +412,8 @@ impl Library {
         let result = (|| -> io::Result<Self> {
             let staged = CollectionPaths::new(&stage);
             for slot in &self.slots {
-                let manifest = &slot.stored.as_ref().ok_or_else(|| io::Error::other("Missing saved playlist"))?.manifest;
+                let manifest =
+                    &slot.stored.as_ref().ok_or_else(|| io::Error::other("Missing saved playlist"))?.manifest;
                 PlaylistStore::new(&staged, id, slot.id).create(manifest.clone())?;
             }
             write_atomic(&staged.collection_manifest(id), &serde_json::to_vec_pretty(&collection)?)?;
@@ -463,9 +471,7 @@ impl Library {
 
     pub fn collection_choices(config: &Path) -> io::Result<Vec<(CollectionId, String)>> {
         let (paths, index, _lock) = Self::open_index(config, false)?;
-        index.collection_order.into_iter().map(|id| {
-            Ok((id, Self::read_collection(&paths, id)?.name))
-        }).collect()
+        index.collection_order.into_iter().map(|id| Ok((id, Self::read_collection(&paths, id)?.name))).collect()
     }
 
     pub fn open_for_switch(id: CollectionId) -> io::Result<Self> {
@@ -475,12 +481,15 @@ impl Library {
     /// Do not silently discard unsaved drafts or a recoverable temporary session.
     pub fn can_leave(&self) -> bool {
         if self.temporary {
-            return self.keep_session || (self.slots.len() == 1 && self.slots[0].name == "Default playlist"
-                && self.slots[0].snapshot().sources.is_empty());
+            return self.keep_session
+                || (self.slots.len() == 1
+                    && self.slots[0].name == "Default playlist"
+                    && self.slots[0].snapshot().sources.is_empty());
         }
         self.slots.iter().all(|slot| {
             let draft = slot.snapshot();
-            draft.sources == slot.saved.sources && draft.ids == slot.saved.ids
+            draft.sources == slot.saved.sources
+                && draft.ids == slot.saved.ids
                 && draft.custom_titles == slot.saved.custom_titles
         })
     }
@@ -509,7 +518,10 @@ impl Library {
     pub fn edit_collection_index(&self, config: &Path, move_by: Option<isize>) -> io::Result<()> {
         let id = self.collection_id().ok_or_else(|| io::Error::other("No writable permanent collection"))?;
         let (paths, mut index, _lock) = Self::open_index(config, false)?;
-        let pos = index.collection_order.iter().position(|&other| other == id)
+        let pos = index
+            .collection_order
+            .iter()
+            .position(|&other| other == id)
             .ok_or_else(|| io::Error::other("Collection is not in the index"))?;
         if let Some(delta) = move_by {
             let next = pos.saturating_add_signed(delta).min(index.collection_order.len() - 1);
@@ -523,9 +535,17 @@ impl Library {
     pub fn collection_management_state(&self, config: &Path) -> io::Result<(bool, bool, bool, bool)> {
         let id = self.collection_id().ok_or_else(|| io::Error::other("No writable permanent collection"))?;
         let (_, index, _lock) = Self::open_index(config, false)?;
-        let pos = index.collection_order.iter().position(|&other| other == id)
+        let pos = index
+            .collection_order
+            .iter()
+            .position(|&other| other == id)
             .ok_or_else(|| io::Error::other("Collection is not in the index"))?;
-        Ok((pos > 0, pos + 1 < index.collection_order.len(), index.default_collection == Some(id), index.collection_order.len() > 1))
+        Ok((
+            pos > 0,
+            pos + 1 < index.collection_order.len(),
+            index.default_collection == Some(id),
+            index.collection_order.len() > 1,
+        ))
     }
 
     /// Acquire a replacement before removing the current collection from the index.
@@ -538,12 +558,17 @@ impl Library {
         let (paths, mut index, _lock) = Self::open_index(config, false)?;
         let mut replacement = None;
         for other in index.collection_order.iter().copied().filter(|&other| other != id) {
-            let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
                 .open(paths.collection_dir(other).join("collection.lock"))?;
             if lock.try_lock().is_err() {
                 continue;
             }
-            replacement = Some((other, Self::open_storage(CollectionPaths::new(config), other, Some(lock), false, false)?));
+            replacement =
+                Some((other, Self::open_storage(CollectionPaths::new(config), other, Some(lock), false, false)?));
             break;
         }
         let (other, next) = replacement.ok_or_else(|| io::Error::other("No other writable collection is available"))?;
@@ -751,6 +776,70 @@ impl Library {
         self.dirty = true;
         self.flush()?;
         Ok(copies.len())
+    }
+
+    pub fn move_items(&mut self, target: usize, source: &Snapshot, indices: &[usize]) -> io::Result<usize> {
+        if !self.writable || target == self.active || target >= self.slots.len() || indices.is_empty() {
+            return Err(io::Error::other("Invalid move destination or selection"));
+        }
+        let same_contents =
+            |a: &Snapshot, b: &Snapshot| a.sources == b.sources && a.ids == b.ids && a.custom_titles == b.custom_titles;
+        if !same_contents(source, &self.slots[self.active].saved)
+            || !same_contents(self.slots[target].snapshot(), &self.slots[target].saved)
+        {
+            return Err(io::Error::other("Save both playlist edits before moving"));
+        }
+        if indices.iter().any(|&i| i >= source.ids.len()) || indices.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(io::Error::other("Invalid move selection"));
+        }
+        self.flush()?;
+        let storage = self.storage.as_ref().ok_or_else(|| io::Error::other("Missing collection storage"))?;
+        let src =
+            self.slots[self.active].stored.as_ref().ok_or_else(|| io::Error::other("Save source playlist first"))?;
+        let dst =
+            self.slots[target].stored.as_ref().ok_or_else(|| io::Error::other("Save destination playlist first"))?;
+        let mut src_next = src.manifest.clone();
+        let mut dst_next = dst.manifest.clone();
+        let moved: std::collections::HashSet<_> = indices.iter().map(|&i| source.ids[i]).collect();
+        if dst_next.entries.iter().any(|entry| moved.contains(&entry.id)) {
+            return Err(io::Error::other("Destination already contains a moved item ID"));
+        }
+        dst_next.entries.extend(src_next.entries.iter().filter(|entry| moved.contains(&entry.id)).cloned());
+        src_next.entries.retain(|entry| !moved.contains(&entry.id));
+        src_next.current = source.current.and_then(|i| source.ids.get(i).copied()).filter(|id| !moved.contains(id));
+        src_next.position = src_next.current.and(source.position);
+        let result = move_items_transaction(&storage.paths, storage.collection.id, dst, src, dst_next, src_next);
+        if let Err(err) = result {
+            // Do not allow stale in-memory snapshots to overwrite a committed intent.
+            self.writable = false;
+            return Err(io::Error::other(format!("{err}; reopen collection before further writes")));
+        }
+        for index in [self.active, target] {
+            let slot = &mut self.slots[index];
+            let loaded = match PlaylistStore::new(&storage.paths, storage.collection.id, slot.id).load() {
+                Ok(loaded) => loaded,
+                Err(err) => {
+                    self.writable = false;
+                    return Err(err);
+                }
+            };
+            let m = &loaded.manifest;
+            slot.saved = Snapshot {
+                sources: m.entries.iter().map(|e| e.source.clone()).collect(),
+                ids: m.entries.iter().map(|e| e.id).collect(),
+                custom_titles: m
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| e.custom_title.clone().map(|t| (i, t)))
+                    .collect(),
+                current: m.current.and_then(|id| m.entries.iter().position(|e| e.id == id)),
+                position: m.position,
+            };
+            slot.draft = None;
+            slot.stored = Some(loaded);
+        }
+        Ok(indices.len())
     }
 
     /// Copy the live contents of a playlist into another, exclusively owned

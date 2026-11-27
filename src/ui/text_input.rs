@@ -12,8 +12,22 @@ use unicode_segmentation::UnicodeSegmentation;
 actions!(
     text_input,
     [
-        Backspace, Delete, Left, Right, WordLeft, WordRight, SelectLeft, SelectRight, SelectAll, Home, End, Paste, Cut,
-        Copy, Submit, Cancel
+        Backspace,
+        Delete,
+        Left,
+        Right,
+        WordLeft,
+        WordRight,
+        SelectLeft,
+        SelectRight,
+        SelectAll,
+        Home,
+        End,
+        Paste,
+        Cut,
+        Copy,
+        Submit,
+        Cancel
     ]
 );
 
@@ -109,7 +123,8 @@ impl TextInput {
     }
     fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
         let cursor = self.cursor_offset();
-        let target = self.content.unicode_word_indices().find(|(i, _)| *i > cursor).map_or(self.content.len(), |(i, _)| i);
+        let target =
+            self.content.unicode_word_indices().find(|(i, _)| *i > cursor).map_or(self.content.len(), |(i, _)| i);
         self.move_to(target, cx);
     }
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {

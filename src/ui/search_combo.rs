@@ -28,10 +28,8 @@ impl SearchCombo {
     pub(super) fn new(labels: impl Iterator<Item = (usize, String)>, active: Option<usize>) -> Self {
         let entries: Vec<_> = labels.map(|(id, label)| Entry { id, field: SearchField::new(&label), label }).collect();
         let visible = (0..entries.len()).collect();
-        let selected = entries
-            .iter()
-            .position(|entry| Some(entry.id) == active)
-            .or_else(|| (!entries.is_empty()).then_some(0));
+        let selected =
+            entries.iter().position(|entry| Some(entry.id) == active).or_else(|| (!entries.is_empty()).then_some(0));
         Self { entries, visible, selected, active }
     }
 
@@ -208,7 +206,9 @@ mod tests {
     #[test]
     fn filtering_preserves_identity_and_order() {
         let mut combo = SearchCombo::new(
-            [(4, "Science Fiction"), (9, "Music"), (2, "Silent Films")].into_iter().map(|(id, title)| (id, title.to_owned())),
+            [(4, "Science Fiction"), (9, "Music"), (2, "Silent Films")]
+                .into_iter()
+                .map(|(id, title)| (id, title.to_owned())),
             Some(9),
         );
         assert_eq!(combo.selected_id(), Some(9));

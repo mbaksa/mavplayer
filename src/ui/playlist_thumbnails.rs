@@ -246,9 +246,7 @@ impl PlaylistPreviews {
     pub(super) fn cached_representative(&self, key: &Key, target: f64, default: f64) -> Option<&Preview> {
         self.full_scrub(key, target).or_else(|| {
             [target, default].into_iter().find_map(|time| {
-                self.entries.iter().find_map(|(k, t, p)| {
-                    if k == key && *t == time { p.as_ref() } else { None }
-                })
+                self.entries.iter().find_map(|(k, t, p)| if k == key && *t == time { p.as_ref() } else { None })
             })
         })
     }
@@ -499,7 +497,11 @@ impl PlaylistPreviews {
 
     /// Called directly by pointer events and by worker wake-ups, not just the UI tick.
     pub fn update_hover(
-        &mut self, settings: &Settings, visible: bool, panel_item: Option<u64>, timeline: &TimelineThumbnails,
+        &mut self,
+        settings: &Settings,
+        visible: bool,
+        panel_item: Option<u64>,
+        timeline: &TimelineThumbnails,
     ) -> bool {
         let wanted = self
             .hover
@@ -884,7 +886,8 @@ mod tests {
         assert!(Arc::ptr_eq(&previews.inline_pair(&key, 35., 5.).unwrap().image, &chosen.image));
         previews.drop_full();
         settings.playlist_thumbnails = PlaylistThumbnails::InlineSide;
-        let (_, retired) = previews.update(&settings, true, None, &TimelineThumbnails::default(), &PlaybackState::default());
+        let (_, retired) =
+            previews.update(&settings, true, None, &TimelineThumbnails::default(), &PlaybackState::default());
         assert!(retired.is_empty());
         assert!(Arc::ptr_eq(&previews.inline_pair(&key, 5., 5.).unwrap().image, &default.image));
         assert!(Arc::ptr_eq(&previews.inline_pair(&key, 35., 5.).unwrap().image, &chosen.image));

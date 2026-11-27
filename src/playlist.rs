@@ -142,7 +142,10 @@ impl FilterCache {
         if changed || self.query != text {
             let query = SearchQuery::new(text);
             self.query = text.to_owned();
-            self.visible = self.entries.iter().enumerate()
+            self.visible = self
+                .entries
+                .iter()
+                .enumerate()
                 .filter_map(|(i, entry)| (query.is_empty() || query.score(&entry.fields).is_some()).then_some(i))
                 .collect();
         }

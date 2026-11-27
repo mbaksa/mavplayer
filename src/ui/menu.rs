@@ -5,8 +5,8 @@ use super::theme::Theme;
 use super::widgets::{icon, scrollbar_dragging, scrollbar_with_tolerance};
 use crate::icons::Icon;
 use gpui::{
-    AnyElement, Bounds, Context, Corner, Focusable, MouseButton, Pixels, Point, ScrollHandle, SharedString, Window, anchored,
-    canvas, deferred, div, point, prelude::*, px,
+    AnyElement, Bounds, Context, Corner, Focusable, MouseButton, Pixels, Point, ScrollHandle, SharedString, Window,
+    anchored, canvas, deferred, div, point, prelude::*, px,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -100,6 +100,7 @@ impl MenuItem {
 
 pub(super) enum CopyChoice {
     Items(Vec<u64>),
+    MoveItems(Vec<u64>),
     Playlist,
 }
 
@@ -211,8 +212,12 @@ impl PlayerView {
                     MouseButton::Left,
                     cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
                         this.playlist_previews.pointer = Some(ev.position);
-                        if this.menu.as_ref().is_some_and(|m| m.playlist_context && !m.playlist_settings && !m.collection_settings && m.collection_choices.is_none())
-                            && let Some((id, _)) = this.playlist_item_at(ev.position)
+                        if this.menu.as_ref().is_some_and(|m| {
+                            m.playlist_context
+                                && !m.playlist_settings
+                                && !m.collection_settings
+                                && m.collection_choices.is_none()
+                        }) && let Some((id, _)) = this.playlist_item_at(ev.position)
                         {
                             if this.menu.as_ref().and_then(|m| m.playlist_item) == Some(id) {
                                 if this.scrub_playlist_panel_item(ev.position, cx) {
@@ -233,7 +238,8 @@ impl PlayerView {
                     cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
                         this.playlist_previews.pointer = Some(ev.position);
                         if this.menu.as_ref().is_some_and(|m| m.playlist_context && m.collection_choices.is_none())
-                            && this.playlist_shown() && this.playlist_bounds.get().contains(&ev.position)
+                            && this.playlist_shown()
+                            && this.playlist_bounds.get().contains(&ev.position)
                         {
                             if this.collection_header_contains(ev.position) {
                                 if this.menu.as_ref().is_some_and(|m| m.collection_settings) {
@@ -346,7 +352,8 @@ impl PlayerView {
                             let width = menu.min_width.min((viewport.width - px(8.)).max(px(100.)));
                             menu.pos = point(
                                 (ev.position.x - offset.x).clamp(px(4.), (viewport.width - width - px(4.)).max(px(4.))),
-                                (ev.position.y - offset.y).clamp(px(4.), (viewport.height - height - px(4.)).max(px(4.))),
+                                (ev.position.y - offset.y)
+                                    .clamp(px(4.), (viewport.height - height - px(4.)).max(px(4.))),
                             );
                         } else {
                             menu.panel_drag = None;
@@ -355,11 +362,14 @@ impl PlayerView {
                         cx.stop_propagation();
                     }
                 }))
-                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _cx| {
-                    if let Some(menu) = this.menu.as_mut() {
-                        menu.panel_drag = None;
-                    }
-                }));
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, _cx| {
+                        if let Some(menu) = this.menu.as_mut() {
+                            menu.panel_drag = None;
+                        }
+                    }),
+                );
         }
         if menu.playlist_context && menu.open_path.is_empty() {
             layer = layer.child(self.playlist_context_panel(menu, window, cx));
@@ -374,7 +384,16 @@ impl PlayerView {
                 level += 1;
             }
             let width = menu.min_width.min((win_w - px(8.)).max(px(100.)));
-            let panel = self.menu_panel(items, level, &menu.open_path, theme, width, (max_h, menu.scroll(level)), &menu.anchors, cx);
+            let panel = self.menu_panel(
+                items,
+                level,
+                &menu.open_path,
+                theme,
+                width,
+                (max_h, menu.scroll(level)),
+                &menu.anchors,
+                cx,
+            );
             layer = layer.child(anchored().position(menu.pos).snap_to_window_with_margin(px(4.)).child(panel));
             return Some(deferred(layer).with_priority(10).into_any_element());
         }
@@ -444,7 +463,10 @@ impl PlayerView {
         };
         let active = choices.iter().position(|(id, _)| Some(*id) == self.playlist_library.collection_id());
         let combo = super::search_combo::SearchCombo::new(
-            choices.iter().enumerate().map(|(i, (_, name))| (i, name.clone()))
+            choices
+                .iter()
+                .enumerate()
+                .map(|(i, (_, name))| (i, name.clone()))
                 .chain(std::iter::once((choices.len(), "New collection…".into()))),
             active,
         );
@@ -466,14 +488,18 @@ impl PlayerView {
     pub(super) fn open_recovery_switch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let choices = match crate::playlist::session::Library::session_choices(&crate::settings::config_dir()) {
             Ok(choices) => choices,
-            Err(err) => { self.osd(format!("Could not list sessions: {err}"), cx); return; }
+            Err(err) => {
+                self.osd(format!("Could not list sessions: {err}"), cx);
+                return;
+            }
         };
         if choices.is_empty() {
             self.osd("No sessions available for recovery", cx);
             return;
         }
         let combo = super::search_combo::SearchCombo::new(
-            choices.iter().enumerate().map(|(i, (_, label))| (i, label.clone())), None,
+            choices.iter().enumerate().map(|(i, (_, label))| (i, label.clone())),
+            None,
         );
         let pos = self.playlist_bounds.get().origin;
         self.open_menu(Vec::new(), pos, None, cx);
@@ -505,6 +531,19 @@ impl PlayerView {
         self.open_copy_combo(combo, None, CopyChoice::Items(ids), window, cx);
     }
 
+    pub(super) fn open_move_items(&mut self, ids: Vec<u64>, window: &mut Window, cx: &mut Context<Self>) {
+        let combo = super::search_combo::SearchCombo::new(
+            self.playlist_library
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != self.playlist_library.active)
+                .map(|(i, slot)| (i, slot.name.clone())),
+            None,
+        );
+        self.open_copy_combo(combo, None, CopyChoice::MoveItems(ids), window, cx);
+    }
+
     pub(super) fn open_copy_playlist(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let choices = match crate::playlist::session::Library::collection_choices(&crate::settings::config_dir()) {
             Ok(choices) => choices
@@ -525,7 +564,11 @@ impl PlayerView {
             None,
         );
         self.open_copy_combo(
-            combo, Some(choices.into_iter().map(|(id, _)| id).collect()), CopyChoice::Playlist, window, cx,
+            combo,
+            Some(choices.into_iter().map(|(id, _)| id).collect()),
+            CopyChoice::Playlist,
+            window,
+            cx,
         );
     }
 
@@ -555,7 +598,10 @@ impl PlayerView {
 
     fn select_combo(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let recovering = self.menu.as_ref().is_some_and(|menu| menu.recovery_choices);
-        let collection = self.menu.as_ref().and_then(|menu| menu.collection_choices.as_ref())
+        let collection = self
+            .menu
+            .as_ref()
+            .and_then(|menu| menu.collection_choices.as_ref())
             .map(|choices| choices.get(index).copied());
         let copy = self.menu.as_mut().and_then(|menu| menu.copy_choice.take());
         self.close_menu(cx);
@@ -563,6 +609,7 @@ impl PlayerView {
         if let Some(copy) = copy {
             match copy {
                 CopyChoice::Items(ids) => self.copy_playlist_items_to(index, &ids, cx),
+                CopyChoice::MoveItems(ids) => self.move_playlist_items_to(index, &ids, window, cx),
                 CopyChoice::Playlist => {
                     if let Some(Some(id)) = collection {
                         self.copy_playlist_to_collection(id, cx);
@@ -580,7 +627,9 @@ impl PlayerView {
     }
 
     pub(super) fn combo_page_step(&self) -> isize {
-        self.menu.as_ref().map_or(1, |menu| (f32::from(menu.scroll(0).bounds().size.height) / 42.).floor().max(1.) as isize)
+        self.menu
+            .as_ref()
+            .map_or(1, |menu| (f32::from(menu.scroll(0).bounds().size.height) / 42.).floor().max(1.) as isize)
     }
 
     pub(super) fn combo_move(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -593,7 +642,9 @@ impl PlayerView {
     }
 
     pub(super) fn combo_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(index) = self.menu.as_ref().and_then(|menu| menu.playlist_switch.as_ref()).and_then(|combo| combo.selected_id()) {
+        if let Some(index) =
+            self.menu.as_ref().and_then(|menu| menu.playlist_switch.as_ref()).and_then(|combo| combo.selected_id())
+        {
             self.select_combo(index, window, cx);
         }
     }
@@ -601,9 +652,14 @@ impl PlayerView {
     fn playlist_switch_panel(&self, menu: &OpenMenu, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(combo) = menu.playlist_switch.as_ref() else { return div().into_any_element() };
         combo.render(
-            menu.pos, self.theme, menu.scroll(0), self.inputs.get("playlist_switch").cloned(),
+            menu.pos,
+            self.theme,
+            menu.scroll(0),
+            self.inputs.get("playlist_switch").cloned(),
             if menu.collection_choices.is_some() { Icon::OpenFolder } else { Icon::Playlist },
-            |this, id, w, cx| this.select_combo(id, w, cx), window, cx,
+            |this, id, w, cx| this.select_combo(id, w, cx),
+            window,
+            cx,
         )
     }
 
@@ -807,18 +863,43 @@ impl PlayerView {
         // when the menu content fits. Keep the normal tolerance in other UI.
         frame
             .when(roomy, |d| {
-                d.child(div().flex_none().flex().items_center().justify_between().px_2().py_1()
-                    .border_b_1().border_color(theme.border)
-                    .when(level > 0, |d| d.child(div().id("playlist-menu-back").cursor_pointer().p_2()
-                        .hover(|s| s.bg(theme.hover)).child("‹ Back")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(menu) = this.menu.as_mut() { menu.open_path.pop(); }
-                            cx.notify();
-                        }))))
-                    .child(div().flex_1())
-                    .child(div().id("playlist-menu-close").cursor_pointer().p_2()
-                        .hover(|s| s.bg(theme.hover)).child(icon(Icon::WindowClose, px(16.), theme.text))
-                        .on_click(cx.listener(|this, _, _, cx| this.close_menu(cx)))))
+                d.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_2()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .when(level > 0, |d| {
+                            d.child(
+                                div()
+                                    .id("playlist-menu-back")
+                                    .cursor_pointer()
+                                    .p_2()
+                                    .hover(|s| s.bg(theme.hover))
+                                    .child("‹ Back")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(menu) = this.menu.as_mut() {
+                                            menu.open_path.pop();
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .id("playlist-menu-close")
+                                .cursor_pointer()
+                                .p_2()
+                                .hover(|s| s.bg(theme.hover))
+                                .child(icon(Icon::WindowClose, px(16.), theme.text))
+                                .on_click(cx.listener(|this, _, _, cx| this.close_menu(cx))),
+                        ),
+                )
             })
             .child(panel)
             .child(scrollbar_with_tolerance(format!("menu-bar-{level}"), &scroll, theme, px(3.)))

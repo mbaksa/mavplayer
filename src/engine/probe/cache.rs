@@ -125,7 +125,9 @@ pub(super) fn load_or_probe(
         log::debug!("metadata cache hit: {}", path.display());
         let camera_changed = entry.metadata.refresh_camera(&path);
         let subtitles_changed = allow_offline && entry.metadata.refresh_sidecars(&path);
-        if (camera_changed || subtitles_changed) && let Err(err) = save(&file, &entry) {
+        if (camera_changed || subtitles_changed)
+            && let Err(err) = save(&file, &entry)
+        {
             log::debug!("metadata cache: {err}");
         }
         return Some((entry.metadata, true));

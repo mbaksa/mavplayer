@@ -137,7 +137,8 @@ fn new_source(line: &str, base: &Path) -> io::Result<MediaSource> {
 // A duplicate source has no occurrence identity in ordinary M3U, so refuse
 // ambiguous edits instead of guessing which occurrence gets a custom title.
 fn reconcile(manifest: &mut PlaylistManifest, bytes: &[u8], base: &Path) -> io::Result<bool> {
-    let old_lines: Vec<_> = manifest.entries.iter().map(|entry| source_line(&entry.source)).collect::<io::Result<_>>()?;
+    let old_lines: Vec<_> =
+        manifest.entries.iter().map(|entry| source_line(&entry.source)).collect::<io::Result<_>>()?;
     let new_lines = m3u_lines(bytes)?;
     if old_lines.iter().map(String::as_str).eq(new_lines.iter().copied()) {
         return Ok(false);
@@ -313,6 +314,114 @@ impl PlaylistStore {
         self.finish(&json, &m3u)?;
         Ok(true)
     }
+}
+
+// A collection-wide intent coordinates both playlist pairs. Exact before/after
+// bytes allow recovery of a partially written pair without overwriting edits.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MovePair {
+    id: PlaylistId,
+    before_json: Vec<u8>,
+    before_m3u: Vec<u8>,
+    after_json: Vec<u8>,
+    after_m3u: Vec<u8>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MoveIntent {
+    version: u32,
+    transaction: Uuid,
+    pairs: [MovePair; 2],
+}
+
+fn move_path(paths: &CollectionPaths, collection: CollectionId) -> PathBuf {
+    paths.collection_dir(collection).join("move.pending.json")
+}
+
+pub(crate) fn recover_move(paths: &CollectionPaths, collection: CollectionId, read_only: bool) -> io::Result<()> {
+    let path = move_path(paths, collection);
+    let Some(bytes) = read_optional(&path)? else { return Ok(()) };
+    if read_only {
+        return Err(conflict("Collection move requires writable recovery"));
+    }
+    let intent: MoveIntent = serde_json::from_slice(&bytes)?;
+    if intent.version != 1 || intent.transaction.is_nil() || intent.pairs[0].id == intent.pairs[1].id {
+        return Err(invalid("Invalid move intent"));
+    }
+    // Validate every participant before touching either one.
+    for pair in &intent.pairs {
+        let store = PlaylistStore::new(paths, collection, pair.id);
+        store.ensure_no_pending()?;
+        let before = store.checked_manifest(&pair.before_json)?;
+        let after = store.checked_manifest(&pair.after_json)?;
+        if before.revision.checked_add(1) != Some(after.revision) || render_m3u(&after)? != pair.after_m3u {
+            return Err(invalid("Invalid move revision or M3U"));
+        }
+        for (file, before, after) in
+            [(&store.json, &pair.before_json, &pair.after_json), (&store.m3u, &pair.before_m3u, &pair.after_m3u)]
+        {
+            let current = fs::read(file)?;
+            if &current != before && &current != after {
+                return Err(conflict("Move conflicts with newer playlist data"));
+            }
+        }
+    }
+    // Destination is always first. Source removal follows durable publication.
+    for pair in &intent.pairs {
+        let store = PlaylistStore::new(paths, collection, pair.id);
+        for (file, after) in [(&store.m3u, &pair.after_m3u), (&store.json, &pair.after_json)] {
+            if fs::read(file)? != *after {
+                write_atomic(file, after)?;
+            }
+        }
+    }
+    fs::remove_file(&path)?;
+    sync_directory(path.parent().unwrap_or(Path::new(".")))
+}
+
+pub(crate) fn move_items_transaction(
+    paths: &CollectionPaths,
+    collection: CollectionId,
+    destination: &LoadedPlaylist,
+    source: &LoadedPlaylist,
+    mut destination_next: PlaylistManifest,
+    mut source_next: PlaylistManifest,
+) -> io::Result<()> {
+    let path = move_path(paths, collection);
+    if read_optional(&path)?.is_some() {
+        return Err(conflict("Previous move requires recovery"));
+    }
+    fn pair(
+        paths: &CollectionPaths,
+        collection: CollectionId,
+        loaded: &LoadedPlaylist,
+        next: &mut PlaylistManifest,
+    ) -> io::Result<MovePair> {
+        let store = PlaylistStore::new(paths, collection, loaded.manifest.id);
+        store.ensure_no_pending()?;
+        if fs::read(&store.json)? != loaded.original_json || fs::read(&store.m3u)? != loaded.original_m3u {
+            return Err(conflict("Playlist changed on disk; reload before moving"));
+        }
+        next.revision = loaded.manifest.revision.checked_add(1).ok_or_else(|| invalid("Playlist revision overflow"))?;
+        store.validate(next)?;
+        Ok(MovePair {
+            id: next.id,
+            before_json: loaded.original_json.clone(),
+            before_m3u: loaded.original_m3u.clone(),
+            after_json: serde_json::to_vec_pretty(next)?,
+            after_m3u: render_m3u(next)?,
+        })
+    }
+    let intent = MoveIntent {
+        version: 1,
+        transaction: Uuid::new_v4(),
+        pairs: [
+            pair(paths, collection, destination, &mut destination_next)?,
+            pair(paths, collection, source, &mut source_next)?,
+        ],
+    };
+    write_atomic(&path, &serde_json::to_vec(&intent)?)?;
+    recover_move(paths, collection, false)
 }
 
 #[cfg(test)]

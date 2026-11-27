@@ -866,13 +866,8 @@ mod tests {
 
     #[test]
     fn cancelling_timeline_worker_keeps_its_media_reserved() {
-        let request = Request {
-            path: "movie.mp4".into(),
-            stream: 0,
-            directory: "cache".into(),
-            count: 20,
-            auto_generate: false,
-        };
+        let request =
+            Request { path: "movie.mp4".into(), stream: 0, directory: "cache".into(), count: 20, auto_generate: false };
         let cancel = Arc::new(AtomicBool::new(false));
         let (_tx, result) = std::sync::mpsc::channel();
         let mut timeline = TimelineThumbnails {

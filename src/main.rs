@@ -109,7 +109,9 @@ fn parse_args() -> Args {
                     });
                     args.collection = CollectionRequest::Recover(id);
                 }
-                "--list-collections" => exit_with(Library::list_collections(&settings::config_dir()).map_err(Into::into)),
+                "--list-collections" => {
+                    exit_with(Library::list_collections(&settings::config_dir()).map_err(Into::into))
+                }
                 _ if a.starts_with("--create-collection=") => exit_with(
                     Library::create_collection(&settings::config_dir(), &a["--create-collection=".len()..])
                         .map(|id| id.to_string())

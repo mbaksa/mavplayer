@@ -18,9 +18,7 @@ pub(crate) struct SearchQuery {
 
 impl SearchQuery {
     pub(crate) fn new(text: &str) -> Self {
-        Self {
-            tokens: text.split_whitespace().map(|token| token.to_lowercase().chars().collect()).collect(),
-        }
+        Self { tokens: text.split_whitespace().map(|token| token.to_lowercase().chars().collect()).collect() }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -124,7 +122,10 @@ mod tests {
     fn tokens_can_match_different_fields() {
         assert!(score("scifi alien", &["Science Fiction", "Alien (1979)"]).is_some());
         assert_eq!(score("alien missing", &["Alien", "Science Fiction"]), None);
-        assert_eq!(score("alien scifi", &["Alien", "Science Fiction"]), score("scifi alien", &["Science Fiction", "Alien"]));
+        assert_eq!(
+            score("alien scifi", &["Alien", "Science Fiction"]),
+            score("scifi alien", &["Science Fiction", "Alien"])
+        );
     }
 
     #[test]

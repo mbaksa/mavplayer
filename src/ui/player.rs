@@ -918,9 +918,11 @@ impl PlayerView {
         let panel_item = self.menu.as_ref().and_then(|m| m.playlist_item);
         // An occluding popup can prevent delivery of the row's mouse-exit event.
         if panel_item.is_some()
-            && self.playlist_previews.hover.as_ref().is_some_and(|h| {
-                !window.is_window_hovered() || !h.bounds.contains(&window.mouse_position())
-            })
+            && self
+                .playlist_previews
+                .hover
+                .as_ref()
+                .is_some_and(|h| !window.is_window_hovered() || !h.bounds.contains(&window.mouse_position()))
         {
             self.clear_playlist_panel_scrub(cx);
         }
@@ -1565,7 +1567,11 @@ impl PlayerView {
     }
 
     pub(super) fn set_playlist_item_title(
-        &mut self, id: u64, title: &str, window: &mut Window, cx: &mut Context<Self>,
+        &mut self,
+        id: u64,
+        title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         if let Some((index, item)) = self.playlist.items.iter_mut().enumerate().find(|(_, item)| item.id == id) {
             let title = title.trim();
@@ -1604,13 +1610,18 @@ impl PlayerView {
         let snapshot = self.playlist_snapshot();
         self.playlist_library.capture(snapshot, true, false);
         if !self.playlist_library.can_leave() {
-            return Err(std::io::Error::other("Save unsaved playlists before switching; save or keep a nonempty temporary session first"));
+            return Err(std::io::Error::other(
+                "Save unsaved playlists before switching; save or keep a nonempty temporary session first",
+            ));
         }
         self.playlist_library.flush()
     }
 
     pub(super) fn switch_collection_workspace(
-        &mut self, id: crate::playlist::collections::CollectionId, window: &mut Window, cx: &mut Context<Self>,
+        &mut self,
+        id: crate::playlist::collections::CollectionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         if self.playlist_library.collection_id() == Some(id) {
             return;
@@ -1631,7 +1642,10 @@ impl PlayerView {
     }
 
     pub(super) fn switch_temporary_workspace(
-        &mut self, recover: Option<crate::playlist::collections::CollectionId>, window: &mut Window, cx: &mut Context<Self>,
+        &mut self,
+        recover: Option<crate::playlist::collections::CollectionId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         let result = self.prepare_collection_switch().and_then(|()| match recover {
             Some(id) => PlaylistLibrary::recover_for_switch(id),
@@ -1664,7 +1678,8 @@ impl PlayerView {
     }
 
     pub(super) fn create_collection_workspace(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let result = self.prepare_collection_switch()
+        let result = self
+            .prepare_collection_switch()
             .and_then(|()| PlaylistLibrary::create_collection(&crate::settings::config_dir(), name));
         match result {
             Ok(id) => {
@@ -1690,7 +1705,8 @@ impl PlayerView {
     }
 
     pub(super) fn delete_collection_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let result = self.prepare_collection_switch()
+        let result = self
+            .prepare_collection_switch()
             .and_then(|()| self.playlist_library.remove_collection(&crate::settings::config_dir()));
         match result {
             Ok(next) => {
@@ -1724,8 +1740,45 @@ impl PlayerView {
         cx.notify();
     }
 
+    pub(super) fn move_playlist_items_to(
+        &mut self,
+        target: usize,
+        ids: &[u64],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selected: std::collections::HashSet<_> = ids.iter().copied().collect();
+        let indices: Vec<_> = self
+            .playlist
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| selected.contains(&item.id).then_some(i))
+            .collect();
+        if indices.len() != selected.len() {
+            self.osd("Playlist selection changed; retry moving", cx);
+            return;
+        }
+        // Avoid stopping playback before a move is confirmed durable.
+        if self.playlist.current.is_some_and(|i| indices.contains(&i)) {
+            self.osd("Select another current item before moving this item", cx);
+            return;
+        }
+        let snapshot = self.playlist_snapshot();
+        match self.playlist_library.move_items(target, &snapshot, &indices) {
+            Ok(count) => {
+                self.remove_playlist_items(ids, window, cx);
+                self.osd(format!("Moved {count} playlist items"), cx);
+            }
+            Err(err) => self.osd(format!("Could not confirm playlist move: {err}"), cx),
+        }
+        cx.notify();
+    }
+
     pub(super) fn copy_playlist_to_collection(
-        &mut self, id: crate::playlist::collections::CollectionId, cx: &mut Context<Self>,
+        &mut self,
+        id: crate::playlist::collections::CollectionId,
+        cx: &mut Context<Self>,
     ) {
         if self.playlist_library.collection_id() == Some(id) {
             return;
@@ -2195,21 +2248,36 @@ impl PlayerView {
     }
 
     fn prompt_playlist_add_paths(
-        &mut self, dirs_mode: bool, playlists_only: bool, window: &mut Window, cx: &mut Context<Self>,
+        &mut self,
+        dirs_mode: bool,
+        playlists_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: !dirs_mode,
             directories: dirs_mode,
             multiple: true,
-            prompt: Some(if playlists_only { "Import playlist from file" } else if dirs_mode { "Add folder" } else { "Add files" }.into()),
+            prompt: Some(
+                if playlists_only {
+                    "Import playlist from file"
+                } else if dirs_mode {
+                    "Add folder"
+                } else {
+                    "Add files"
+                }
+                .into(),
+            ),
         });
         cx.spawn_in(window, async move |this, cx| match rx.await {
             Ok(Ok(Some(mut paths))) => {
                 let _ = this.update_in(cx, |v, window, cx| {
                     if playlists_only {
-                        paths.retain(|p| p.extension().is_some_and(|e| {
-                            playlist::PLAYLIST_EXTS.contains(&e.to_string_lossy().to_ascii_lowercase().as_str())
-                        }));
+                        paths.retain(|p| {
+                            p.extension().is_some_and(|e| {
+                                playlist::PLAYLIST_EXTS.contains(&e.to_string_lossy().to_ascii_lowercase().as_str())
+                            })
+                        });
                         if paths.is_empty() {
                             v.osd("No supported playlist files", cx);
                             return;

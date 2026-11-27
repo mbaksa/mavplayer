@@ -106,7 +106,11 @@ impl PlayerView {
                 window.focus(&input.focus_handle(cx));
             }
             Dialog::NewCollection | Dialog::RenameCollection | Dialog::PromoteCollection => {
-                let name = if d == Dialog::RenameCollection { self.playlist_library.collection_label().to_owned() } else { String::new() };
+                let name = if d == Dialog::RenameCollection {
+                    self.playlist_library.collection_label().to_owned()
+                } else {
+                    String::new()
+                };
                 let input = self.input("collection_name", "Collection name", window, cx);
                 input.update(cx, |i, cx| i.set_text(name, cx));
                 window.focus(&input.focus_handle(cx));
@@ -1281,11 +1285,34 @@ impl PlayerView {
                 let rename = self.dialog == Some(Dialog::RenameCollection);
                 let promote = self.dialog == Some(Dialog::PromoteCollection);
                 let body = div().p_4().child(self.input_box("collection_name")).into_any_element();
-                let footer = self.text_button(
-                    "collection-name-confirm", if rename { "Rename" } else if promote { "Save" } else { "Create" }, true,
-                    |this, _, w, cx| this.on_input_submit("collection_name", w, cx), cx,
-                ).into_any_element();
-                self.modal(if rename { "Rename collection" } else if promote { "Save temporary collection" } else { "New collection" }, 380., body, Some(footer), cx)
+                let footer = self
+                    .text_button(
+                        "collection-name-confirm",
+                        if rename {
+                            "Rename"
+                        } else if promote {
+                            "Save"
+                        } else {
+                            "Create"
+                        },
+                        true,
+                        |this, _, w, cx| this.on_input_submit("collection_name", w, cx),
+                        cx,
+                    )
+                    .into_any_element();
+                self.modal(
+                    if rename {
+                        "Rename collection"
+                    } else if promote {
+                        "Save temporary collection"
+                    } else {
+                        "New collection"
+                    },
+                    380.,
+                    body,
+                    Some(footer),
+                    cx,
+                )
             }
             Dialog::NamePlaylist(rename) => {
                 let body = div().p_4().child(self.input_box("playlist_name")).into_any_element();
@@ -1318,9 +1345,23 @@ impl PlayerView {
                     "Remove collection ‘{}’ from the collection list? Its saved files will be retained for recovery. No media files will be deleted.",
                     self.playlist_library.collection_label()
                 )).into_any_element();
-                let footer = div().flex().gap_2()
-                    .child(self.text_button("collection-delete-cancel", "Cancel", false, |this, _, w, cx| this.close_dialog(w, cx), cx))
-                    .child(self.text_button("collection-delete-confirm", "Delete", true, |this, _, w, cx| this.delete_collection_workspace(w, cx), cx))
+                let footer = div()
+                    .flex()
+                    .gap_2()
+                    .child(self.text_button(
+                        "collection-delete-cancel",
+                        "Cancel",
+                        false,
+                        |this, _, w, cx| this.close_dialog(w, cx),
+                        cx,
+                    ))
+                    .child(self.text_button(
+                        "collection-delete-confirm",
+                        "Delete",
+                        true,
+                        |this, _, w, cx| this.delete_collection_workspace(w, cx),
+                        cx,
+                    ))
                     .into_any_element();
                 self.modal("Delete collection", 420., body, Some(footer), cx)
             }
@@ -2099,62 +2140,91 @@ impl PlayerView {
                 c = c
                     .child(self.section("Windowed"))
                     .child(self.toggle_row(
-                        "playlist-window-visible", "Show playlist", None, self.show_playlist,
+                        "playlist-window-visible",
+                        "Show playlist",
+                        None,
+                        self.show_playlist,
                         |t, _| {
                             t.show_playlist = !t.show_playlist;
                             t.settings.set_playlist_visibility(false, t.show_playlist);
                             t.playlist_autohide_open = false;
-                        }, cx,
+                        },
+                        cx,
                     ))
                     .child(self.toggle_row(
-                        "playlist-window-autohide", "Autohide playlist", Some("Reveal the enabled playlist at the right edge."),
-                        s.playlist_autohide, |t, _| {
+                        "playlist-window-autohide",
+                        "Autohide playlist",
+                        Some("Reveal the enabled playlist at the right edge."),
+                        s.playlist_autohide,
+                        |t, _| {
                             t.settings.set_playlist_autohide_for(false, !t.settings.playlist_autohide);
                             t.playlist_autohide_open = false;
-                        }, cx,
+                        },
+                        cx,
                     ))
                     .child(self.section("Fullscreen"))
                     .child(self.toggle_row(
-                        "playlist-fs-visible", "Show playlist", None,
+                        "playlist-fs-visible",
+                        "Show playlist",
+                        None,
                         s.fullscreen_playlist_initially_visible(),
                         |t, _| {
                             let visible = !t.settings.fullscreen_playlist_initially_visible();
                             t.settings.set_playlist_visibility(true, visible);
                             t.fs_playlist = visible;
                             t.playlist_autohide_open = false;
-                        }, cx,
+                        },
+                        cx,
                     ))
                     .child(self.toggle_row(
-                        "playlist-fs-autohide", "Autohide playlist", Some("Reveal the enabled playlist at the right edge in fullscreen."),
-                        s.playlist_autohide_for(true), |t, _| {
+                        "playlist-fs-autohide",
+                        "Autohide playlist",
+                        Some("Reveal the enabled playlist at the right edge in fullscreen."),
+                        s.playlist_autohide_for(true),
+                        |t, _| {
                             let enabled = t.settings.playlist_autohide_for(true);
                             t.settings.set_playlist_autohide_for(true, !enabled);
                             t.playlist_autohide_open = false;
-                        }, cx,
+                        },
+                        cx,
                     ))
                     .child(self.section("Playlist labels"))
                     .child(self.option_toggle(
-                        "playlist-compact-title", "Prefer media title without inline thumbnails",
+                        "playlist-compact-title",
+                        "Prefer media title without inline thumbnails",
                         "Use the custom or embedded title instead of the file name when available.",
-                        s.playlist_compact_prefer_title, true, false,
-                        |t, _| t.settings.playlist_compact_prefer_title = !t.settings.playlist_compact_prefer_title, cx,
+                        s.playlist_compact_prefer_title,
+                        true,
+                        false,
+                        |t, _| t.settings.playlist_compact_prefer_title = !t.settings.playlist_compact_prefer_title,
+                        cx,
                     ))
                     .child(self.option_choice(
-                        "playlist-inline-labels", "Labels with inline thumbnails", "Show the title, file name or both.",
+                        "playlist-inline-labels",
+                        "Labels with inline thumbnails",
+                        "Show the title, file name or both.",
                         vec![
                             ("Title".into(), crate::settings::PlaylistLabels::Title),
                             ("File name".into(), crate::settings::PlaylistLabels::FileName),
                             ("Title and file name".into(), crate::settings::PlaylistLabels::Both),
                         ],
-                        s.playlist_inline_labels, true, |t, v, _| t.settings.playlist_inline_labels = v, cx,
+                        s.playlist_inline_labels,
+                        true,
+                        |t, v, _| t.settings.playlist_inline_labels = v,
+                        cx,
                     ))
                     .child(self.section("Thumbnail display"))
                     .child(self.playlist_mode_cards(PlaylistThumbnails::ALL.len(), cx))
                     .child(div().text_size(px(12.)).text_color(self.theme.text_dim).child(playlist_desc))
                     .child(self.option_toggle(
-                        "playlist-thumb-auto-video", "Create pictures automatically", representative_desc,
-                        s.playlist_thumbnail_auto_video || (inline && filmstrips_auto), inline && !filmstrips_auto, true,
-                        |t, _| t.settings.playlist_thumbnail_auto_video = !t.settings.playlist_thumbnail_auto_video, cx,
+                        "playlist-thumb-auto-video",
+                        "Create pictures automatically",
+                        representative_desc,
+                        s.playlist_thumbnail_auto_video || (inline && filmstrips_auto),
+                        inline && !filmstrips_auto,
+                        true,
+                        |t, _| t.settings.playlist_thumbnail_auto_video = !t.settings.playlist_thumbnail_auto_video,
+                        cx,
                     ));
             }
             3 => {

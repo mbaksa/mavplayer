@@ -517,7 +517,11 @@ fn sub_lang_prefs(own: &str) -> Vec<String> {
 
 impl Settings {
     pub fn playlist_autohide_for(&self, fullscreen: bool) -> bool {
-        if fullscreen { self.playlist_fullscreen_autohide.unwrap_or(self.playlist_autohide) } else { self.playlist_autohide }
+        if fullscreen {
+            self.playlist_fullscreen_autohide.unwrap_or(self.playlist_autohide)
+        } else {
+            self.playlist_autohide
+        }
     }
 
     pub fn fullscreen_playlist_initially_visible(&self) -> bool {

@@ -192,9 +192,14 @@ fn parse(xml: &str, path: &Path) -> Option<CameraMetadata> {
     let value = |key: &str| {
         root.descendants()
             .find(|n| {
-                n.is_element() && n.tag_name().name() == "Item" && n.attribute("name") == Some(key)
-                    && n.parent().is_some_and(|g| g.tag_name().name() == "Group" && g.attribute("name") == Some("CameraUnitMetadataSet")
-                        && g.parent().is_some_and(|a| a.tag_name().name() == "AcquisitionRecord"))
+                n.is_element()
+                    && n.tag_name().name() == "Item"
+                    && n.attribute("name") == Some(key)
+                    && n.parent().is_some_and(|g| {
+                        g.tag_name().name() == "Group"
+                            && g.attribute("name") == Some("CameraUnitMetadataSet")
+                            && g.parent().is_some_and(|a| a.tag_name().name() == "AcquisitionRecord")
+                    })
             })
             .and_then(|n| n.attribute("value"))
             .and_then(clean)

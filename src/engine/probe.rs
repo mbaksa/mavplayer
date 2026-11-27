@@ -197,5 +197,13 @@ fn read_metadata(source: &MediaSource, cfg: &EngineConfig) -> Option<Metadata> {
             }
         })
         .collect();
-    Some(Metadata { info, video_stream, default_audio_stream, sidecars: None, video_formats, camera_sidecars: None, camera_reader_version: 0 })
+    Some(Metadata {
+        info,
+        video_stream,
+        default_audio_stream,
+        sidecars: None,
+        video_formats,
+        camera_sidecars: None,
+        camera_reader_version: 0,
+    })
 }
