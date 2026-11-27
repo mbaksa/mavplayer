@@ -27,16 +27,16 @@ fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
 }
 
 #[cfg(unix)]
-pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     fs::File::open(path)?.sync_all()
 }
 
 #[cfg(not(unix))]
-pub(super) fn sync_directory(_path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| invalid("Missing playlist directory"))?;
     fs::create_dir_all(parent)?;
     let temp = parent.join(format!(".playlist-{}.tmp", Uuid::new_v4()));

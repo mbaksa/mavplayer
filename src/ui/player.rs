@@ -621,6 +621,9 @@ impl PlayerView {
         if !sources.is_empty() {
             v.playlist.add(sources);
             if restored_position.is_some() {
+                for (item, id) in v.playlist.items.iter_mut().zip(&v.playlist_library.snapshot().ids) {
+                    item.persistent_id = *id;
+                }
                 for (&i, title) in &v.playlist_library.snapshot().custom_titles {
                     if let Some(item) = v.playlist.items.get_mut(i) {
                         item.custom_title = Some(title.clone());
@@ -1528,7 +1531,10 @@ impl PlayerView {
                     return None;
                 }
             }
-            if previous.current.and_then(|j| previous.sources.get(j)) == sources.get(i) {
+            if previous.current.is_some_and(|j| {
+                previous.ids.get(j) == Some(&self.playlist.items[i].persistent_id)
+                    && previous.sources.get(j) == sources.get(i)
+            }) {
                 previous.position
             } else {
                 None
@@ -1541,7 +1547,8 @@ impl PlayerView {
             .enumerate()
             .filter_map(|(i, item)| item.custom_title.clone().map(|title| (i, title)))
             .collect();
-        PlaylistSnapshot { sources, custom_titles, current, position }
+        let ids = self.playlist.items.iter().map(|item| item.persistent_id).collect();
+        PlaylistSnapshot { sources, ids, custom_titles, current, position }
     }
 
     fn save_playlist_session(&mut self, exact: bool, manual: bool) {
@@ -1645,6 +1652,10 @@ impl PlayerView {
         if !self.playlist_library.duplicate(name, snapshot) {
             return;
         }
+        // The live queue is now the duplicate, without restarting playback.
+        for (item, id) in self.playlist.items.iter_mut().zip(&self.playlist_library.snapshot().ids) {
+            item.persistent_id = *id;
+        }
         self.close_dialog(window, cx);
         match self.playlist_library.flush() {
             Ok(()) => self.osd("Playlist duplicated", cx),
@@ -1661,6 +1672,9 @@ impl PlayerView {
         self.playlist_previews.hover = None;
         self.armed = None;
         self.playlist.add(snapshot.sources);
+        for (item, id) in self.playlist.items.iter_mut().zip(snapshot.ids) {
+            item.persistent_id = id;
+        }
         for (i, title) in snapshot.custom_titles {
             if let Some(item) = self.playlist.items.get_mut(i) {
                 item.custom_title = Some(title);

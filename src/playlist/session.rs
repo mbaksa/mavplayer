@@ -1,15 +1,21 @@
 //! Named playlist workspaces. The active draft is independent of the last
 //! explicitly saved (or autosaved) snapshot of each workspace.
 
+use super::collections::storage::{LoadedPlaylist, PlaylistStore, sync_directory, write_atomic};
+use super::collections::{
+    CollectionIndex, CollectionManifest, CollectionPaths, PlaylistEntry, PlaylistId, PlaylistItemId, PlaylistManifest,
+};
 use crate::engine::MediaSource;
-use crate::settings::{config_dir, read_json, write_json};
-use serde::{Deserialize, Serialize};
+use crate::settings::config_dir;
 use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io;
+use std::path::Path;
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Snapshot {
     pub sources: Vec<MediaSource>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ids: Vec<PlaylistItemId>,
     pub custom_titles: BTreeMap<usize, String>,
     pub current: Option<usize>,
     pub position: Option<f64>,
@@ -18,6 +24,7 @@ pub(crate) struct Snapshot {
 impl Snapshot {
     fn normalize(&mut self) {
         let len = self.sources.len();
+        debug_assert_eq!(self.ids.len(), len);
         self.custom_titles.retain(|i, title| {
             let trimmed = title.trim();
             if *i >= len || trimmed.is_empty() {
@@ -33,7 +40,8 @@ impl Snapshot {
     }
 
     fn needs_autosave(&self, saved: &Self) -> bool {
-        self.sources != saved.sources
+        self.ids != saved.ids
+            || self.sources != saved.sources
             || self.custom_titles != saved.custom_titles
             || self.current != saved.current
             || match (self.position, saved.position) {
@@ -43,18 +51,27 @@ impl Snapshot {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 pub(crate) struct Slot {
     pub name: String,
     pub autosave: bool,
-    pub(super) saved: Snapshot,
-    #[serde(skip)]
+    saved: Snapshot,
+    id: PlaylistId,
+    stored: Option<LoadedPlaylist>,
+    dirty: bool,
     draft: Option<Snapshot>,
 }
 
 impl Slot {
     fn new(name: String, autosave: bool) -> Self {
-        Self { name, autosave, saved: Snapshot::default(), draft: None }
+        Self {
+            name,
+            autosave,
+            saved: Snapshot::default(),
+            id: PlaylistId::new(),
+            stored: None,
+            dirty: true,
+            draft: None,
+        }
     }
 
     fn snapshot(&self) -> &Snapshot {
@@ -62,43 +79,134 @@ impl Slot {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+struct CollectionStorage {
+    paths: CollectionPaths,
+    collection: CollectionManifest,
+    _lock: File,
+}
+
 pub(crate) struct Library {
-    pub(super) version: u32,
+    storage: Option<CollectionStorage>,
     pub active: usize,
     pub slots: Vec<Slot>,
-    #[serde(skip)]
     pub writable: bool,
-    #[serde(skip)]
     dirty: bool,
 }
 
 impl Library {
     fn empty(writable: bool) -> Self {
-        Self { version: 1, active: 0, slots: vec![Slot::new("Default playlist".into(), false)], writable, dirty: false }
+        Self {
+            storage: None,
+            active: 0,
+            slots: vec![Slot::new("Default playlist".into(), false)],
+            writable,
+            dirty: false,
+        }
     }
 
     pub fn load(primary: bool) -> Self {
         if !primary {
             return Self::empty(false);
         }
-        let path = config_dir().join("playlists.json");
-        if !path.exists() {
-            return Self::empty(true);
+        match Self::open(&config_dir()) {
+            Ok(library) => library,
+            Err(err) => {
+                eprintln!("Could not open collection; using a temporary playlist: {err}");
+                Self::empty(false)
+            }
         }
-        let Some(mut library) = read_json::<Self>(&path) else {
-            return Self::empty(false);
-        };
-        // Never overwrite an unknown version or a damaged library.
-        if library.version != 1 || library.slots.is_empty() {
-            return Self::empty(false);
+    }
+
+    fn open(config: &Path) -> io::Result<Self> {
+        let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
+        fs::create_dir_all(config)?;
+        let paths = CollectionPaths::new(config);
+        // Serialize first-run initialization as well as subsequent writes.
+        let index_lock =
+            OpenOptions::new().write(true).create(true).truncate(false).open(config.join("collections.lock"))?;
+        index_lock.try_lock().map_err(|err| io::Error::other(format!("Collection index lock unavailable: {err}")))?;
+        if !paths.index().try_exists()? {
+            if config.join("collections-migration/collections").try_exists()?
+                || config.join("collections").try_exists()?
+            {
+                return Err(invalid("Collection storage is not activated or is incomplete"));
+            }
+            // Stage the entire first-run collection before publishing it.
+            let stage = config.join(format!(".collections-init-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&stage)?;
+            let result = (|| -> io::Result<()> {
+                let staged = CollectionPaths::new(&stage);
+                let mut collection = CollectionManifest::new("Default collection".into());
+                let playlist = PlaylistManifest::new("Default playlist".into());
+                collection.playlist_order.push(playlist.id);
+                collection.active_playlist = Some(playlist.id);
+                PlaylistStore::new(&staged, collection.id, playlist.id).create(playlist)?;
+                write_atomic(&staged.collection_manifest(collection.id), &serde_json::to_vec_pretty(&collection)?)?;
+                let mut index = CollectionIndex::new();
+                index.collection_order.push(collection.id);
+                index.default_collection = Some(collection.id);
+                write_atomic(&staged.index(), &serde_json::to_vec_pretty(&index)?)?;
+                fs::rename(stage.join("collections"), config.join("collections"))?;
+                sync_directory(config)
+            })();
+            let _ = fs::remove_dir_all(&stage);
+            result?;
         }
-        library.active = library.active.min(library.slots.len() - 1);
-        for slot in &mut library.slots {
-            slot.saved.normalize();
+        let index: CollectionIndex = serde_json::from_slice(&fs::read(paths.index())?)?;
+        index.validate().map_err(invalid)?;
+        let id = index.default_collection.ok_or_else(|| invalid("Missing default collection"))?;
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(paths.collection_dir(id).join("collection.lock"))?;
+        lock.try_lock().map_err(|err| io::Error::other(format!("Collection lock unavailable: {err}")))?;
+        drop(index_lock);
+        let collection: CollectionManifest = serde_json::from_slice(&fs::read(paths.collection_manifest(id))?)?;
+        collection.validate().map_err(invalid)?;
+        if collection.id != id || collection.playlist_order.is_empty() {
+            return Err(invalid("Invalid collection manifest"));
         }
-        library.writable = true;
-        library
+        let active = collection
+            .active_playlist
+            .and_then(|id| collection.playlist_order.iter().position(|p| *p == id))
+            .unwrap_or(0);
+        let mut slots = Vec::new();
+        for &id in &collection.playlist_order {
+            let store = PlaylistStore::new(&paths, collection.id, id);
+            store.recover()?;
+            let loaded = store.load()?;
+            let manifest = &loaded.manifest;
+            let saved = Snapshot {
+                sources: manifest.entries.iter().map(|entry| entry.source.clone()).collect(),
+                ids: manifest.entries.iter().map(|entry| entry.id).collect(),
+                custom_titles: manifest
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, entry)| entry.custom_title.clone().map(|title| (i, title)))
+                    .collect(),
+                current: manifest.current.and_then(|id| manifest.entries.iter().position(|entry| entry.id == id)),
+                position: manifest.position,
+            };
+            slots.push(Slot {
+                name: manifest.name.clone(),
+                autosave: manifest.autosave,
+                saved,
+                id,
+                dirty: loaded.externally_edited,
+                stored: Some(loaded),
+                draft: None,
+            });
+        }
+        let dirty = slots.iter().any(|slot| slot.dirty);
+        Ok(Self {
+            storage: Some(CollectionStorage { paths, collection, _lock: lock }),
+            active,
+            slots,
+            writable: true,
+            dirty,
+        })
     }
 
     pub fn snapshot(&self) -> &Snapshot {
@@ -116,6 +224,10 @@ impl Library {
         let slot = &mut self.slots[self.active];
         if (manual || (slot.autosave && (exact || snapshot.needs_autosave(&slot.saved)))) && slot.saved != snapshot {
             slot.saved = snapshot.clone();
+            slot.dirty = true;
+            self.dirty = true;
+        }
+        if manual && slot.stored.is_none() {
             self.dirty = true;
         }
         slot.draft = Some(snapshot);
@@ -124,6 +236,7 @@ impl Library {
     pub fn set_autosave(&mut self, enabled: bool) {
         if self.slots[self.active].autosave != enabled {
             self.slots[self.active].autosave = enabled;
+            self.slots[self.active].dirty = true;
             self.dirty = true;
         }
     }
@@ -179,6 +292,7 @@ impl Library {
         }
         snapshot.normalize();
         let mut slot = Slot::new(name, true);
+        snapshot.ids = snapshot.sources.iter().map(|_| PlaylistItemId::new()).collect();
         slot.saved = snapshot;
         self.slots.push(slot);
         self.active = self.slots.len() - 1;
@@ -188,6 +302,7 @@ impl Library {
 
     pub fn rename(&mut self, name: String) {
         self.slots[self.active].name = name;
+        self.slots[self.active].dirty = true;
         self.dirty = true;
     }
 
@@ -207,7 +322,49 @@ impl Library {
         if !self.writable || !self.dirty {
             return Ok(());
         }
-        write_json(&config_dir().join("playlists.json"), self)?;
+        let storage = self.storage.as_mut().ok_or_else(|| io::Error::other("Missing collection storage"))?;
+        for slot in self.slots.iter_mut().filter(|slot| slot.dirty) {
+            if slot.saved.sources.len() != slot.saved.ids.len() {
+                return Err(io::Error::other("Playlist source and ID counts differ"));
+            }
+            let entries = slot
+                .saved
+                .sources
+                .iter()
+                .zip(&slot.saved.ids)
+                .enumerate()
+                .map(|(i, (source, id))| PlaylistEntry {
+                    id: *id,
+                    source: source.clone(),
+                    custom_title: slot.saved.custom_titles.get(&i).cloned(),
+                })
+                .collect();
+            let manifest = PlaylistManifest {
+                version: super::collections::FORMAT_VERSION,
+                id: slot.id,
+                name: slot.name.clone(),
+                autosave: slot.autosave,
+                revision: slot.stored.as_ref().map_or(0, |loaded| loaded.manifest.revision),
+                entries,
+                current: slot.saved.current.and_then(|i| slot.saved.ids.get(i).copied()),
+                position: slot.saved.position,
+            };
+            let store = PlaylistStore::new(&storage.paths, storage.collection.id, slot.id);
+            if let Some(loaded) = &mut slot.stored {
+                loaded.manifest = manifest;
+                store.save(loaded)?;
+            } else {
+                slot.stored = Some(store.create(manifest)?);
+            }
+            slot.dirty = false;
+        }
+        let mut collection = storage.collection.clone();
+        collection.playlist_order = self.slots.iter().map(|slot| slot.id).collect();
+        collection.active_playlist = Some(self.slots[self.active].id);
+        if collection != storage.collection {
+            write_atomic(&storage.paths.collection_manifest(collection.id), &serde_json::to_vec_pretty(&collection)?)?;
+            storage.collection = collection;
+        }
         self.dirty = false;
         Ok(())
     }
@@ -219,7 +376,8 @@ mod tests {
 
     fn snapshot(name: &str, position: f64) -> Snapshot {
         Snapshot {
-            sources: vec![MediaSource::File(name.into())],
+            sources: vec![MediaSource::File(std::env::temp_dir().join(name))],
+            ids: vec![PlaylistItemId::new()],
             current: Some(0),
             position: Some(position),
             ..Default::default()
@@ -227,107 +385,121 @@ mod tests {
     }
 
     #[test]
-    fn playlist_workspaces_preserve_independent_drafts_and_saved_positions() {
-        let mut lib = Library::empty(true);
-        lib.set_autosave(true);
-        lib.capture(snapshot("first.mp4", 12.5), true, false);
+    fn collection_roundtrip_preserves_ids_and_independent_drafts() {
+        let root = std::env::temp_dir().join(format!("mavplayer-session-{}", uuid::Uuid::new_v4()));
+        let mut lib = Library::open(&root).unwrap();
+        let first = snapshot("first.mp4", 12.5);
+        lib.capture(first.clone(), true, true);
         lib.create("Second".into());
-        lib.capture(snapshot("first.mp4", 70.0), true, false);
+        let second = snapshot("first.mp4", 70.0);
+        lib.capture(second.clone(), true, true);
         lib.set_autosave(false);
-        lib.capture(snapshot("unsaved.mp4", 23.0), true, false);
+        let draft = snapshot("unsaved.mp4", 23.0);
+        lib.capture(draft.clone(), true, false);
         assert!(lib.switch(0));
-        assert_eq!(lib.snapshot(), &snapshot("first.mp4", 12.5));
+        assert_eq!(lib.snapshot(), &first);
         assert!(lib.switch(1));
-        assert_eq!(lib.snapshot(), &snapshot("unsaved.mp4", 23.0));
-        let mut restored: Library = serde_json::from_str(&serde_json::to_string(&lib).unwrap()).unwrap();
-        assert_eq!(restored.active, 1);
-        assert_eq!(restored.snapshot(), &snapshot("first.mp4", 70.0));
-        assert!(!restored.autosave());
+        assert_eq!(lib.snapshot(), &draft);
+        lib.flush().unwrap();
+        assert!(Library::open(&root).is_err());
+        drop(lib);
+        let mut restored = Library::open(&root).unwrap();
+        assert_eq!(restored.snapshot(), &second);
         assert!(restored.switch(0));
-        assert_eq!(restored.snapshot(), &snapshot("first.mp4", 12.5));
+        assert_eq!(restored.snapshot(), &first);
+        assert!(restored.duplicate("Copy".into(), first.clone()));
+        assert_ne!(restored.snapshot().ids, first.ids);
+        assert_eq!(restored.snapshot().sources, first.sources);
+        restored.flush().unwrap();
+        drop(restored);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn deleting_playlist_preserves_other_saved_slots() {
-        let mut lib = Library::empty(true);
-        lib.capture(snapshot("first.mp4", 12.5), true, true);
+    fn duplicate_occurrences_keep_their_ids_on_reorder() {
+        let root = std::env::temp_dir().join(format!("mavplayer-session-{}", uuid::Uuid::new_v4()));
+        let mut lib = Library::open(&root).unwrap();
+        let mut saved = snapshot("movie.mp4", 10.0);
+        saved.sources.push(saved.sources[0].clone());
+        saved.ids.push(PlaylistItemId::new());
+        lib.capture(saved.clone(), true, true);
+        lib.flush().unwrap();
+        saved.custom_titles.insert(0, "First".into());
+        saved.custom_titles.insert(1, "Second".into());
+        lib.capture(saved.clone(), true, true);
+        lib.flush().unwrap();
+        saved.ids.swap(0, 1);
+        saved.custom_titles.insert(0, "Second".into());
+        saved.custom_titles.insert(1, "First".into());
+        saved.current = Some(1);
+        lib.capture(saved.clone(), true, true);
+        lib.flush().unwrap();
+        drop(lib);
+        let restored = Library::open(&root).unwrap();
+        assert_eq!(restored.snapshot(), &saved);
+        drop(restored);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleted_playlist_is_not_reopened() {
+        let root = std::env::temp_dir().join(format!("mavplayer-session-{}", uuid::Uuid::new_v4()));
+        let mut lib = Library::open(&root).unwrap();
+        let first = snapshot("first.mp4", 10.0);
+        lib.capture(first.clone(), true, true);
         lib.create("Second".into());
-        lib.capture(snapshot("second.mp4", 42.), true, false);
-        lib.create("Third".into());
-        lib.capture(snapshot("third.mp4", 70.), true, false);
-        assert!(lib.switch(1));
+        lib.capture(snapshot("second.mp4", 20.0), true, true);
+        lib.flush().unwrap();
         assert!(lib.delete_active());
-        assert_eq!(lib.slots.len(), 2);
-        assert_eq!(lib.name(), "Third");
-        assert_eq!(lib.snapshot(), &snapshot("third.mp4", 70.));
-        assert!(lib.switch(0));
-        assert_eq!(lib.snapshot(), &snapshot("first.mp4", 12.5));
-        assert!(lib.delete_active());
-        assert!(!lib.delete_active());
-        assert_eq!(lib.name(), "Third");
+        lib.flush().unwrap();
+        drop(lib);
+        let restored = Library::open(&root).unwrap();
+        assert_eq!(restored.slots.len(), 1);
+        assert_eq!(restored.snapshot(), &first);
+        drop(restored);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn legacy_closed_playlist_preserves_saved_contents() {
-        let mut lib = Library::empty(true);
-        lib.create("Second".into());
-        lib.capture(snapshot("movie.mp4", 42.), true, false);
-        assert!(lib.switch(0));
-        // Older versions could mark a saved playlist as closed. Ignore that flag.
-        let mut json = serde_json::to_value(&lib).unwrap();
-        json["slots"][1]["open"] = serde_json::Value::Bool(false);
-        let mut restored: Library = serde_json::from_value(json).unwrap();
-        assert_eq!(restored.slots.len(), 2);
-        assert!(restored.switch(1));
-        assert_eq!(restored.snapshot(), &snapshot("movie.mp4", 42.));
+    fn external_change_keeps_failed_save_dirty() {
+        let root = std::env::temp_dir().join(format!("mavplayer-session-{}", uuid::Uuid::new_v4()));
+        let mut lib = Library::open(&root).unwrap();
+        let saved = snapshot("first.mp4", 10.0);
+        lib.capture(saved.clone(), true, true);
+        lib.flush().unwrap();
+        let storage = lib.storage.as_ref().unwrap();
+        let path = storage.paths.playlist_m3u8(storage.collection.id, lib.slots[0].id);
+        let original = fs::read(&path).unwrap();
+        fs::write(&path, b"#EXTM3U\n# external edit\n").unwrap();
+        lib.rename("Renamed".into());
+        assert!(lib.flush().is_err());
+        assert!(lib.dirty && lib.slots[0].dirty);
+        assert!(lib.flush().is_err());
+        fs::write(&path, original).unwrap();
+        lib.flush().unwrap();
+        drop(lib);
+        let restored = Library::open(&root).unwrap();
+        assert_eq!(restored.name(), "Renamed");
+        assert_eq!(restored.snapshot(), &saved);
+        drop(restored);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn duplicate_preserves_live_contents_without_overwriting_original() {
-        let mut lib = Library::empty(true);
-        lib.capture(snapshot("saved.mp4", 10.0), true, true);
+    fn launch_playlist_does_not_replace_saved_playlist() {
+        let root = std::env::temp_dir().join(format!("mavplayer-session-{}", uuid::Uuid::new_v4()));
+        let mut lib = Library::open(&root).unwrap();
+        let saved = snapshot("saved.mp4", 10.0);
+        lib.capture(saved.clone(), true, true);
+        lib.flush().unwrap();
         lib.start_launch_playlist();
-        let live = snapshot("launch.mp4", 42.0);
-        lib.capture(live.clone(), true, false);
-        assert!(!lib.duplicate("Launch playlist".into(), live.clone()));
-        assert!(lib.duplicate("Movies".into(), live.clone()));
-        assert_eq!(lib.name(), "Movies");
-        assert_eq!(lib.snapshot(), &live);
-        let mut restored: Library = serde_json::from_str(&serde_json::to_string(&lib).unwrap()).unwrap();
-        assert_eq!(restored.snapshot(), &live);
-        assert!(restored.switch(0));
-        assert_eq!(restored.snapshot(), &snapshot("saved.mp4", 10.0));
-        assert!(restored.switch(1));
-        assert!(restored.snapshot().sources.is_empty());
-        assert!(lib.switch(1));
-        assert_eq!(lib.snapshot(), &live);
-    }
-
-    #[test]
-    fn custom_titles_roundtrip_and_trigger_autosave() {
-        let mut saved = snapshot("movie.mp4", 0.0);
-        let legacy = serde_json::to_string(&saved).unwrap();
-        assert!(!legacy.contains("custom_titles"));
-        let mut edited: Snapshot = serde_json::from_str(&legacy).unwrap();
-        edited.custom_titles.insert(0, "My title".into());
-        edited.custom_titles.insert(9, "Invalid index".into());
-        edited.normalize();
-        assert_eq!(edited.custom_titles.len(), 1);
-        assert!(edited.needs_autosave(&saved));
-        saved = serde_json::from_str(&serde_json::to_string(&edited).unwrap()).unwrap();
-        assert_eq!(edited, saved);
-    }
-
-    #[test]
-    fn launching_media_does_not_overwrite_saved_playlist() {
-        let mut lib = Library::empty(true);
-        lib.capture(snapshot("saved.mp4", 10.0), true, true);
-        lib.dirty = false;
-        lib.start_launch_playlist();
-        assert!(!lib.autosave());
         lib.capture(snapshot("launch.mp4", 0.0), true, false);
-        assert!(!lib.dirty);
-        assert!(lib.switch(0));
-        assert_eq!(lib.snapshot(), &snapshot("saved.mp4", 10.0));
+        lib.flush().unwrap();
+        drop(lib);
+        let restored = Library::open(&root).unwrap();
+        assert_eq!(restored.slots.len(), 1);
+        assert_eq!(restored.snapshot(), &saved);
+        drop(restored);
+        fs::remove_dir_all(root).unwrap();
     }
 }

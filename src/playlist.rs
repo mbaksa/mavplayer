@@ -1,8 +1,6 @@
 //! The play queue: ordering, shuffle/repeat, folder expansion and
 //! M3U / PLS import & export.
 
-// The migration command uses the collection model before runtime activation.
-#[allow(dead_code)]
 pub(crate) mod collections;
 pub(crate) mod session;
 
@@ -34,6 +32,7 @@ pub fn is_media_path(p: &Path) -> bool {
 #[derive(Clone, Debug)]
 pub struct PlaylistItem {
     pub id: u64,
+    pub(crate) persistent_id: collections::PlaylistItemId,
     pub source: MediaSource,
     pub title: Option<String>,
     pub custom_title: Option<String>,
@@ -311,6 +310,7 @@ impl Playlist {
                 self.next_id += 1;
                 PlaylistItem {
                     id,
+                    persistent_id: collections::PlaylistItemId::new(),
                     source: s,
                     title: None,
                     custom_title: None,
@@ -806,6 +806,17 @@ mod tests {
 
     fn names(p: &Playlist) -> Vec<String> {
         p.items.iter().map(|i| i.source.display_name()).collect()
+    }
+
+    #[test]
+    fn moving_duplicate_sources_preserves_persistent_item_ids() {
+        let mut p = pl(&["first.mp4", "first.mp4"]);
+        let first = p.items[0].persistent_id;
+        let second = p.items[1].persistent_id;
+        assert_ne!(first, second);
+        p.move_item(0, 1);
+        assert_eq!(p.items[0].persistent_id, second);
+        assert_eq!(p.items[1].persistent_id, first);
     }
 
     #[test]
