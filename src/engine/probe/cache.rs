@@ -108,6 +108,7 @@ pub(super) fn load_or_probe(
     let Some(hash) = hash_path(&path) else {
         let mut metadata = probe()?;
         metadata.refresh_sidecars(&path);
+        metadata.refresh_camera(&path);
         return Some((metadata, true));
     };
     let _guard = LOCKS[(hash % LOCKS.len() as u64) as usize].lock();
@@ -122,7 +123,9 @@ pub(super) fn load_or_probe(
         && entry.stamp == stamp
     {
         log::debug!("metadata cache hit: {}", path.display());
-        if allow_offline && entry.metadata.refresh_sidecars(&path) && let Err(err) = save(&file, &entry) {
+        let camera_changed = entry.metadata.refresh_camera(&path);
+        let subtitles_changed = allow_offline && entry.metadata.refresh_sidecars(&path);
+        if (camera_changed || subtitles_changed) && let Err(err) = save(&file, &entry) {
             log::debug!("metadata cache: {err}");
         }
         return Some((entry.metadata, true));
@@ -130,6 +133,7 @@ pub(super) fn load_or_probe(
     log::debug!("metadata cache miss: {}", path.display());
     let mut metadata = probe()?;
     metadata.refresh_sidecars(&path);
+    metadata.refresh_camera(&path);
     // Do not publish a record for a file replaced while FFmpeg was probing it.
     if Stamp::read(&path).ok().as_ref() != Some(&stamp) {
         return None;
@@ -184,7 +188,25 @@ mod tests {
             default_audio_stream: Some(1),
             sidecars: None,
             video_formats: vec![],
+            camera_sidecars: None,
         }
+    }
+
+    #[test]
+    fn camera_sidecar_changes_without_media_probe() {
+        let f = Fixture::new();
+        let sidecar = f.source.with_file_name("videoM01.XML");
+        f.load(true, || Some(metadata(42.0))).unwrap();
+        fs::write(&sidecar, r#"<NonRealTimeMeta><Device manufacturer="Sony" modelName="ILCE-7M4"/>
+            <Item name="CaptureGammaEquation" value="s-log3-cine"/></NonRealTimeMeta>"#).unwrap();
+        let (m, _) = f.load(true, || panic!("unexpected probe")).unwrap();
+        assert_eq!(m.info.camera.unwrap().capture_gamma.as_deref(), Some("s-log3-cine"));
+        fs::write(&sidecar, r#"<NonRealTimeMeta><Device manufacturer="Sony" modelName="ILCE-7M4"/>
+            <Item name="CaptureGammaEquation" value="hlg"/></NonRealTimeMeta>"#).unwrap();
+        let (m, _) = f.load(true, || panic!("unexpected probe")).unwrap();
+        assert_eq!(m.info.camera.unwrap().capture_gamma.as_deref(), Some("hlg"));
+        fs::remove_file(sidecar).unwrap();
+        assert!(f.load(true, || panic!("unexpected probe")).unwrap().0.info.camera.is_none());
     }
 
     #[test]

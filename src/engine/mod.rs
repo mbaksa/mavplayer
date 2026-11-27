@@ -18,6 +18,7 @@
 //! audio, the demuxer promotes it at end of file.
 
 mod audio;
+mod camera_metadata;
 pub mod av;
 pub mod cdda;
 mod decoder;

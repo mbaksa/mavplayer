@@ -442,7 +442,11 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
     if !ctx.alive() {
         return;
     }
-    let info = Arc::new(build_media_info(&ic, &source));
+    let mut info = build_media_info(&ic, &source);
+    if let MediaSource::File(path) = &source {
+        info.camera = super::camera_metadata::read(&super::camera_metadata::candidates(path));
+    }
+    let info = Arc::new(info);
     ctx.start_time.set(info.start_time);
     ctx.duration.set(info.duration);
     for i in 0..ic.nb_streams() {

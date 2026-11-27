@@ -3152,6 +3152,20 @@ impl PlayerView {
                 c = c.child(kv(&label, desc.join(" · ")));
             }
         }
+        if let Some(camera) = &m.camera {
+            c = c.child(self.section("Camera metadata"));
+            for (label, value) in [
+                ("Manufacturer", &camera.manufacturer),
+                ("Camera model", &camera.model),
+                ("Capture gamma", &camera.capture_gamma),
+                ("Capture gamut", &camera.capture_gamut),
+            ] {
+                if let Some(value) = value {
+                    c = c.child(kv(label, value.clone()));
+                }
+            }
+            c = c.child(kv("Metadata source", camera.source.display().to_string()));
+        }
         c = c.child(self.section("Playback"));
         if let Some(v) = &st.video {
             c = c.child(kv(

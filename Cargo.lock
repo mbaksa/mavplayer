@@ -3418,6 +3418,7 @@ dependencies = [
  "parking_lot",
  "pipewire",
  "raw-window-handle",
+ "roxmltree",
  "serde",
  "serde_json",
  "smallvec",

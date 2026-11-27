@@ -251,6 +251,16 @@ pub struct Chapter {
     pub title: String,
 }
 
+/// Capture settings explicitly reported by camera metadata, not codec tags.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CameraMetadata {
+    pub manufacturer: Option<String>,
+    pub model: Option<String>,
+    pub capture_gamma: Option<String>,
+    pub capture_gamut: Option<String>,
+    pub source: PathBuf,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MediaInfo {
     pub source_name: String,
@@ -268,6 +278,8 @@ pub struct MediaInfo {
     pub tracks: Vec<Track>,
     pub chapters: Vec<Chapter>,
     pub file_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<CameraMetadata>,
 }
 
 impl MediaInfo {
