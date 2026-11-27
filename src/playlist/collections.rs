@@ -2,6 +2,7 @@
 //! Storage, migration and cache management are deliberately separate from this model.
 
 pub(crate) mod storage;
+pub(crate) mod migration;
 
 use crate::engine::MediaSource;
 use serde::{Deserialize, Serialize};

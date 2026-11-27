@@ -171,6 +171,14 @@ fn main() {
     if verbose && log::set_boxed_logger(Box::new(StderrLog(start))).is_ok() {
         log::set_max_level(log::LevelFilter::Debug);
     }
+    if std::env::var_os("MAVPLAYER_PREPARE_COLLECTION_MIGRATION").is_some() {
+        let result = playlist::collections::migration::run();
+        if let Err(error) = result {
+            eprintln!("Collection migration failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Files on the command line win over --background.
     let background = (args.background || args.handover) && args.sources.is_empty();
     let handover = background && args.handover;

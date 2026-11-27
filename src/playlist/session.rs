@@ -47,7 +47,7 @@ impl Snapshot {
 pub(crate) struct Slot {
     pub name: String,
     pub autosave: bool,
-    saved: Snapshot,
+    pub(super) saved: Snapshot,
     #[serde(skip)]
     draft: Option<Snapshot>,
 }
@@ -64,7 +64,7 @@ impl Slot {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Library {
-    version: u32,
+    pub(super) version: u32,
     pub active: usize,
     pub slots: Vec<Slot>,
     #[serde(skip)]
