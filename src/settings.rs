@@ -692,6 +692,40 @@ pub(crate) fn write_json<T: Serialize>(p: &Path, v: &T) -> std::io::Result<()> {
     Ok(())
 }
 
+// Secondary windows may modify their in-memory settings, but must never
+// replace the primary's newer settings or global resume store on disk.
+static GLOBAL_WRITES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn global_write_lock(config: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(config)?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(config.join("global-state.lock"))?;
+    lock.try_lock().map_err(|err| std::io::Error::other(format!("Global state lock unavailable: {err}")))?;
+    Ok(lock)
+}
+
+pub(crate) fn claim_global_writes() -> Option<std::fs::File> {
+    match global_write_lock(&config_dir()) {
+        Ok(lock) => {
+            GLOBAL_WRITES.store(true, std::sync::atomic::Ordering::Release);
+            Some(lock)
+        }
+        Err(err) => {
+            eprintln!("Global settings and resume positions are read-only: {err}");
+            None
+        }
+    }
+}
+
+pub(crate) fn release_global_writes(lock: Option<std::fs::File>) {
+    GLOBAL_WRITES.store(false, std::sync::atomic::Ordering::Release);
+    drop(lock);
+}
+
 impl Settings {
     pub fn load() -> Self {
         let raw: Option<serde_json::Value> = read_json(&config_dir().join("settings.json"));
@@ -716,6 +750,9 @@ impl Settings {
         Ok(s)
     }
     pub fn save(&self) {
+        if !GLOBAL_WRITES.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         if let Err(e) = write_json(&config_dir().join("settings.json"), self) {
             log::warn!("could not save settings: {e}");
         }
@@ -739,6 +776,9 @@ impl ResumeStore {
         read_json(&config_dir().join("resume.json")).unwrap_or_default()
     }
     pub fn save(&self) {
+        if !GLOBAL_WRITES.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         if let Err(e) = write_json(&config_dir().join("resume.json"), self) {
             log::warn!("could not save resume positions: {e}");
         }
@@ -942,4 +982,16 @@ fn timeline_visualization_generators_are_independent() {
     assert_eq!(FilmstripWaveform.available(false, false), None);
     assert_eq!(Luma.available(false, true), None);
     assert_eq!(Waveform.available(false, true), Waveform);
+}
+
+#[cfg(test)]
+#[test]
+fn global_state_lock_is_exclusive_and_released_on_drop() {
+    let root = std::env::temp_dir().join(format!("mavplayer-global-state-{}", uuid::Uuid::new_v4()));
+    let lock = global_write_lock(&root).unwrap();
+    assert!(global_write_lock(&root).is_err());
+    drop(lock);
+    let lock = global_write_lock(&root).unwrap();
+    drop(lock);
+    std::fs::remove_dir_all(root).unwrap();
 }

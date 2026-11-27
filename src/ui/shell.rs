@@ -205,7 +205,7 @@ fn reopen(sources: Vec<MediaSource>, fullscreen: bool, cx: &mut App) {
     crate::mark_launch();
     log::debug!("opening the window from the tray with {} item(s)", sources.len());
     let primary = cx.global::<Shell>().primary;
-    let boot = Boot::start(Settings::load(), sources, primary);
+    let boot = Boot::start(Settings::load(), sources, primary, Default::default());
     if !open_window(boot, fullscreen, cx) {
         quit(cx);
     }

@@ -1950,7 +1950,8 @@ impl PlayerView {
                                     .child(self.playlist_library.name().to_owned()),
                             )
                             .child(div().text_size(px(11.)).text_color(t.text_dim).truncate().child(format!(
-                                "{total_count} item{}{}{}",
+                                "{} · {total_count} item{}{}{}",
+                                self.playlist_library.collection_label(),
                                 if total_count == 1 { "" } else { "s" },
                                 if total > 0.0 { format!(" · {}", format_time(total)) } else { String::new() },
                                 if selected_count > 1 {

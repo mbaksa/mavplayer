@@ -290,7 +290,12 @@ pub struct Boot {
 }
 
 impl Boot {
-    pub fn start(settings: Settings, mut sources: Vec<MediaSource>, primary: bool) -> Self {
+    pub fn start(
+        settings: Settings,
+        mut sources: Vec<MediaSource>,
+        primary: bool,
+        collection: crate::playlist::session::CollectionRequest,
+    ) -> Self {
         icons::set_use_system_theme(settings.icon_theme == crate::settings::IconTheme::System);
         // Icons from the desktop theme are resolved off the UI thread, once per process.
         static ICONS: std::sync::Once = std::sync::Once::new();
@@ -316,7 +321,7 @@ impl Boot {
         player.set_muted(settings.muted);
         player.set_audio_fx(settings.audio_fx.clone());
         let resume = ResumeStore::load();
-        let mut playlist_library = PlaylistLibrary::load(primary);
+        let mut playlist_library = PlaylistLibrary::load(collection);
         let (start_index, restored_position) = if sources.is_empty() {
             let snapshot = playlist_library.snapshot();
             sources = snapshot.sources.clone();

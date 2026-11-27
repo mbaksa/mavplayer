@@ -39,6 +39,14 @@ persistent_id!(CollectionId);
 persistent_id!(PlaylistId);
 persistent_id!(PlaylistItemId);
 
+impl std::str::FromStr for CollectionId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self)
+    }
+}
+
 fn unique<T: Eq + Hash>(ids: impl IntoIterator<Item = T>) -> bool {
     let mut seen = HashSet::new();
     ids.into_iter().all(|id| seen.insert(id))

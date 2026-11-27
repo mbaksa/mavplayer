@@ -3,7 +3,8 @@
 
 use super::collections::storage::{LoadedPlaylist, PlaylistStore, sync_directory, write_atomic};
 use super::collections::{
-    CollectionIndex, CollectionManifest, CollectionPaths, PlaylistEntry, PlaylistId, PlaylistItemId, PlaylistManifest,
+    CollectionId, CollectionIndex, CollectionManifest, CollectionPaths, PlaylistEntry, PlaylistId, PlaylistItemId,
+    PlaylistManifest,
 };
 use crate::engine::MediaSource;
 use crate::settings::config_dir;
@@ -85,8 +86,25 @@ struct CollectionStorage {
     _lock: File,
 }
 
+/// Explicit collection launches do not participate in the single-window IPC.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum CollectionRequest {
+    #[default]
+    Default,
+    Temporary,
+    Writable(CollectionId),
+    ReadOnly(CollectionId),
+}
+
+impl CollectionRequest {
+    pub fn is_explicit(self) -> bool {
+        !matches!(self, Self::Default)
+    }
+}
+
 pub(crate) struct Library {
     storage: Option<CollectionStorage>,
+    collection_label: String,
     pub active: usize,
     pub slots: Vec<Slot>,
     pub writable: bool,
@@ -97,6 +115,7 @@ impl Library {
     fn empty(writable: bool) -> Self {
         Self {
             storage: None,
+            collection_label: "Temporary collection".into(),
             active: 0,
             slots: vec![Slot::new("Default playlist".into(), false)],
             writable,
@@ -104,28 +123,40 @@ impl Library {
         }
     }
 
-    pub fn load(primary: bool) -> Self {
-        if !primary {
-            return Self::empty(false);
-        }
-        match Self::open(&config_dir()) {
+    pub fn load(request: CollectionRequest) -> Self {
+        let config = config_dir();
+        let result = match request {
+            CollectionRequest::Default => Self::open(&config),
+            CollectionRequest::Temporary => return Self::empty(false),
+            CollectionRequest::Writable(id) => Self::open_selected(&config, Some(id), false),
+            CollectionRequest::ReadOnly(id) => Self::open_selected(&config, Some(id), true),
+        };
+        match result {
             Ok(library) => library,
             Err(err) => {
-                eprintln!("Could not open collection; using a temporary playlist: {err}");
+                eprintln!("Could not open collection; using a temporary collection: {err}");
                 Self::empty(false)
             }
         }
     }
 
-    fn open(config: &Path) -> io::Result<Self> {
+    fn open_index(config: &Path, initialize: bool) -> io::Result<(CollectionPaths, CollectionIndex, File)> {
         let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
         fs::create_dir_all(config)?;
         let paths = CollectionPaths::new(config);
-        // Serialize first-run initialization as well as subsequent writes.
-        let index_lock =
-            OpenOptions::new().write(true).create(true).truncate(false).open(config.join("collections.lock"))?;
-        index_lock.try_lock().map_err(|err| io::Error::other(format!("Collection index lock unavailable: {err}")))?;
+        // Never hold the global index lock while waiting for a collection owner.
+        // This short critical section serializes index reads and mutations.
+        let index_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(config.join("collections.lock"))?;
+        index_lock.lock()?;
         if !paths.index().try_exists()? {
+            if !initialize {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "Collection index does not exist"));
+            }
             if config.join("collections-migration/collections").try_exists()?
                 || config.join("collections").try_exists()?
             {
@@ -154,15 +185,36 @@ impl Library {
         }
         let index: CollectionIndex = serde_json::from_slice(&fs::read(paths.index())?)?;
         index.validate().map_err(invalid)?;
-        let id = index.default_collection.ok_or_else(|| invalid("Missing default collection"))?;
-        let lock = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(paths.collection_dir(id).join("collection.lock"))?;
-        lock.try_lock().map_err(|err| io::Error::other(format!("Collection lock unavailable: {err}")))?;
+        Ok((paths, index, index_lock))
+    }
+
+    fn open(config: &Path) -> io::Result<Self> {
+        Self::open_selected(config, None, false)
+    }
+
+    fn open_selected(config: &Path, requested: Option<CollectionId>, read_only: bool) -> io::Result<Self> {
+        let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
+        let (paths, index, index_lock) = Self::open_index(config, requested.is_none() && !read_only)?;
+        let id = requested.or(index.default_collection).ok_or_else(|| invalid("Missing default collection"))?;
+        if !index.collection_order.contains(&id) {
+            return Err(invalid("Collection is not in the index"));
+        }
+        let lock = if read_only {
+            None
+        } else {
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(paths.collection_dir(id).join("collection.lock"))?;
+            lock.try_lock().map_err(|err| io::Error::other(format!("Collection {id} lock unavailable: {err}")))?;
+            Some(lock)
+        };
         drop(index_lock);
-        let collection: CollectionManifest = serde_json::from_slice(&fs::read(paths.collection_manifest(id))?)?;
+        let manifest_path = paths.collection_manifest(id);
+        let manifest_bytes = fs::read(&manifest_path)?;
+        let collection: CollectionManifest = serde_json::from_slice(&manifest_bytes)?;
         collection.validate().map_err(invalid)?;
         if collection.id != id || collection.playlist_order.is_empty() {
             return Err(invalid("Invalid collection manifest"));
@@ -174,7 +226,9 @@ impl Library {
         let mut slots = Vec::new();
         for &id in &collection.playlist_order {
             let store = PlaylistStore::new(&paths, collection.id, id);
-            store.recover()?;
+            if !read_only {
+                store.recover()?;
+            }
             let loaded = store.load()?;
             let manifest = &loaded.manifest;
             let saved = Snapshot {
@@ -191,7 +245,7 @@ impl Library {
             };
             slots.push(Slot {
                 name: manifest.name.clone(),
-                autosave: manifest.autosave,
+                autosave: !read_only && manifest.autosave,
                 saved,
                 id,
                 dirty: loaded.externally_edited,
@@ -199,14 +253,84 @@ impl Library {
                 draft: None,
             });
         }
-        let dirty = slots.iter().any(|slot| slot.dirty);
+        // A reader cannot recover pending transactions or acquire the writer's
+        // lock. Each pair is checked by PlaylistStore::load; reject a manifest
+        // change during loading rather than presenting a partially edited list.
+        if read_only && fs::read(&manifest_path)? != manifest_bytes {
+            return Err(io::Error::other("Collection changed while loading; retry"));
+        }
+        let dirty = !read_only && slots.iter().any(|slot| slot.dirty);
+        let collection_label = if read_only { format!("Read-only: {}", collection.name) } else { collection.name.clone() };
         Ok(Self {
-            storage: Some(CollectionStorage { paths, collection, _lock: lock }),
+            storage: lock.map(|lock| CollectionStorage { paths, collection, _lock: lock }),
+            collection_label,
             active,
             slots,
-            writable: true,
+            writable: !read_only,
             dirty,
         })
+    }
+
+    pub fn collection_label(&self) -> &str {
+        &self.collection_label
+    }
+
+    /// Administrative entry points also used by the future collection UI.
+    pub fn list_collections(config: &Path) -> io::Result<String> {
+        let (paths, index, _index_lock) = Self::open_index(config, false)?;
+        let mut lines = Vec::new();
+        for id in index.collection_order {
+            let collection = Self::read_collection(&paths, id)?;
+            let suffix = if index.default_collection == Some(id) { " (default)" } else { "" };
+            lines.push(format!("{id}  {}{suffix}", collection.name));
+        }
+        Ok(lines.join("\n"))
+    }
+
+    fn read_collection(paths: &CollectionPaths, id: CollectionId) -> io::Result<CollectionManifest> {
+        let collection: CollectionManifest = serde_json::from_slice(&fs::read(paths.collection_manifest(id))?)?;
+        collection.validate().map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        if collection.id != id {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Collection ID mismatch"));
+        }
+        Ok(collection)
+    }
+
+    pub fn create_collection(config: &Path, name: &str) -> io::Result<CollectionId> {
+        let name = name.trim();
+        if name.is_empty() || name.contains(['\r', '\n', '\0']) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid collection name"));
+        }
+        let (paths, mut index, _index_lock) = Self::open_index(config, true)?;
+        for &id in &index.collection_order {
+            if Self::read_collection(&paths, id)?.name.eq_ignore_ascii_case(name) {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "Collection name already exists"));
+            }
+        }
+        let mut collection = CollectionManifest::new(name.into());
+        let playlist = PlaylistManifest::new("Default playlist".into());
+        collection.playlist_order.push(playlist.id);
+        collection.active_playlist = Some(playlist.id);
+        let stage = config.join(format!(".collections-create-{}", collection.id));
+        fs::create_dir(&stage)?;
+        let result = (|| -> io::Result<()> {
+            let staged = CollectionPaths::new(&stage);
+            PlaylistStore::new(&staged, collection.id, playlist.id).create(playlist)?;
+            write_atomic(&staged.collection_manifest(collection.id), &serde_json::to_vec_pretty(&collection)?)?;
+            sync_directory(&staged.collection_dir(collection.id))?;
+            // Publish a complete collection before adding its ID to the index.
+            // On a failed index commit, leave an unindexed directory for recovery.
+            fs::rename(staged.collection_dir(collection.id), paths.collection_dir(collection.id))?;
+            sync_directory(paths.index().parent().ok_or_else(|| io::Error::other("Missing index directory"))?)?;
+            index.collection_order.push(collection.id);
+            if index.default_collection.is_none() {
+                index.default_collection = Some(collection.id);
+            }
+            write_atomic(&paths.index(), &serde_json::to_vec_pretty(&index)?)
+        })();
+        let _ = fs::remove_dir_all(&stage);
+        result?;
+        Ok(collection.id)
     }
 
     pub fn snapshot(&self) -> &Snapshot {
@@ -382,6 +506,63 @@ mod tests {
             position: Some(position),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn different_collections_can_be_opened_and_saved_independently() {
+        let root = std::env::temp_dir().join(format!("mavplayer-session-{}", uuid::Uuid::new_v4()));
+        let mut first = Library::open(&root).unwrap();
+        let second_id = Library::create_collection(&root, "Second collection").unwrap();
+        assert!(Library::create_collection(&root, "second collection").is_err());
+        let mut second = Library::open_selected(&root, Some(second_id), false).unwrap();
+        assert_eq!(second.collection_label(), "Second collection");
+        assert!(Library::open(&root).is_err());
+        assert!(Library::open_selected(&root, Some(second_id), false).is_err());
+        let a = snapshot("first.mp4", 12.5);
+        let b = snapshot("second.mp4", 25.0);
+        first.capture(a.clone(), true, true);
+        second.capture(b.clone(), true, true);
+        first.flush().unwrap();
+        second.flush().unwrap();
+        assert!(Library::list_collections(&root).unwrap().contains("Second collection"));
+        drop(first);
+        drop(second);
+        let first = Library::open(&root).unwrap();
+        let second = Library::open_selected(&root, Some(second_id), false).unwrap();
+        assert_eq!(first.snapshot(), &a);
+        assert_eq!(second.snapshot(), &b);
+        drop(first);
+        drop(second);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_only_snapshot_never_writes_or_recovers_a_locked_collection() {
+        let root = std::env::temp_dir().join(format!("mavplayer-session-{}", uuid::Uuid::new_v4()));
+        let mut writer = Library::open(&root).unwrap();
+        let saved = snapshot("saved.mp4", 10.0);
+        writer.capture(saved.clone(), true, true);
+        writer.flush().unwrap();
+        let storage = writer.storage.as_ref().unwrap();
+        let id = storage.collection.id;
+        let json = storage.paths.playlist_manifest(id, writer.slots[0].id);
+        let before = fs::read(&json).unwrap();
+        let mut reader = Library::open_selected(&root, Some(id), true).unwrap();
+        assert!(!reader.writable);
+        assert!(reader.collection_label().starts_with("Read-only: "));
+        assert!(!reader.autosave());
+        assert_eq!(reader.snapshot(), &saved);
+        reader.capture(snapshot("local.mp4", 20.0), true, true);
+        reader.rename("Local name".into());
+        reader.flush().unwrap();
+        assert_eq!(fs::read(&json).unwrap(), before);
+        let pending = json.with_extension("pending.json");
+        fs::write(&pending, b"unfinished transaction").unwrap();
+        assert!(Library::open_selected(&root, Some(id), true).is_err());
+        assert_eq!(fs::read(&pending).unwrap(), b"unfinished transaction");
+        drop(reader);
+        drop(writer);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

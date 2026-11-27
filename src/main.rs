@@ -15,6 +15,7 @@ mod settings;
 mod ui;
 
 use gpui::{App, Application};
+use playlist::session::{CollectionRequest, Library};
 
 /// The system allocator, keeping a few big blocks (video frames) for reuse.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -34,6 +35,14 @@ USAGE:
 OPTIONS:
     -f, --fullscreen          Start in fullscreen
     -n, --new-window          Open a new window even if MavPlayer is already open
+        --collection=UUID     Open a specific collection in a separate window
+        --read-only-collection=UUID
+                              Open a read-only snapshot of a collection
+        --temporary-collection
+                              Open an unsaved temporary collection
+        --list-collections    List collection UUIDs and names, then exit
+        --create-collection=NAME
+                              Create an empty collection, print its UUID, then exit
         --background          Start in the system tray without a window, so
                               the first file opened plays almost instantly
         --integrate           Add this AppImage to the desktop's application menu
@@ -47,6 +56,7 @@ struct Args {
     sources: Vec<engine::MediaSource>,
     fullscreen: bool,
     new_window: bool,
+    collection: CollectionRequest,
     /// Wait in the system tray without a window.
     background: bool,
     /// Taking over from a MavPlayer whose window just closed (internal).
@@ -59,6 +69,7 @@ fn parse_args() -> Args {
         sources: vec![],
         fullscreen: false,
         new_window: false,
+        collection: CollectionRequest::Default,
         background: false,
         handover: false,
         verbose: false,
@@ -85,6 +96,25 @@ fn parse_args() -> Args {
                 "--integrate" => exit_with(integration::integrate().map(|p| format!("Installed {}", p.display()))),
                 "--remove-integration" | "--unintegrate" => {
                     exit_with(integration::unintegrate().map(|_| "Removed desktop integration".to_string()))
+                }
+                "--temporary-collection" => args.collection = CollectionRequest::Temporary,
+                "--list-collections" => exit_with(Library::list_collections(&settings::config_dir()).map_err(Into::into)),
+                _ if a.starts_with("--create-collection=") => exit_with(
+                    Library::create_collection(&settings::config_dir(), &a["--create-collection=".len()..])
+                        .map(|id| id.to_string())
+                        .map_err(Into::into),
+                ),
+                _ if a.starts_with("--collection=") || a.starts_with("--read-only-collection=") => {
+                    let (option, value) = a.split_once('=').expect("collection option contains '='");
+                    let id = value.parse().unwrap_or_else(|_| {
+                        eprintln!("mavplayer: invalid collection UUID: {value}");
+                        std::process::exit(1);
+                    });
+                    args.collection = if option == "--collection" {
+                        CollectionRequest::Writable(id)
+                    } else {
+                        CollectionRequest::ReadOnly(id)
+                    };
                 }
                 // Ignore unknown options passed by desktop launchers (e.g. -psn_… on macOS).
                 other => eprintln!("mavplayer: ignoring unknown option {other}"),
@@ -172,7 +202,8 @@ fn main() {
         log::set_max_level(log::LevelFilter::Debug);
     }
     // Files on the command line win over --background.
-    let background = (args.background || args.handover) && args.sources.is_empty();
+    let separate_collection = args.collection.is_explicit();
+    let background = (args.background || args.handover) && args.sources.is_empty() && !separate_collection;
     let handover = background && args.handover;
 
     let settings = settings::Settings::load();
@@ -181,7 +212,10 @@ fn main() {
     // its window is much quicker than starting up.
     let hand_over =
         !args.sources.is_empty() && !args.new_window && settings.when_running != settings::RunningMode::NewWindow;
-    if !background && instance::forward(settings.when_running, &args.sources, args.fullscreen, !hand_over) {
+    if !background
+        && !separate_collection
+        && instance::forward(settings.when_running, &args.sources, args.fullscreen, !hand_over)
+    {
         log::debug!("startup: handed {} item(s) to the running MavPlayer", args.sources.len());
         return;
     }
@@ -201,7 +235,7 @@ fn main() {
         ui::shell::report_ready();
         log::debug!("startup: tray icon up at {:.0} ms", ms_since_start());
     }
-    let primary = {
+    let primary = !separate_collection && {
         let tx = tx.clone();
         // That MavPlayer exits once our icon is up: wait for its socket.
         let wait = std::time::Duration::from_secs(if handover { 5 } else { 0 });
@@ -213,6 +247,11 @@ fn main() {
         log::debug!("startup: another MavPlayer is already running; nothing to do in the background");
         return;
     }
+    // A collection owner is not necessarily the global settings owner. Only
+    // the IPC primary may write global settings/resume data, and it must also
+    // hold the OS lock (including across tray handovers).
+    let global_writes = primary.then(settings::claim_global_writes).flatten();
+    let settings = if global_writes.is_some() { settings::Settings::load() } else { settings };
     // GPUI's font scan in Application::new() is slow on a cold cache: warm it in parallel first.
     #[cfg(target_os = "linux")]
     let fonts = font_prefetch::start();
@@ -224,7 +263,7 @@ fn main() {
     } else {
         // Start opening the first file now: it decodes while GPUI brings up the GPU.
         ui::shell::Start::Window {
-            boot: ui::player::Boot::start(settings, args.sources, primary),
+            boot: ui::player::Boot::start(settings, args.sources, primary, args.collection),
             fullscreen: args.fullscreen,
         }
     };
@@ -257,6 +296,9 @@ fn main() {
         // no use windowless), unless it is to wait in the system tray.
         ui::shell::run(cx, boot, primary, tx, rx);
     });
+    // All UI save callbacks have finished. Release global writes before the
+    // tray successor takes the IPC socket and reloads settings.
+    settings::release_global_writes(global_writes);
     // Hands the tray over to the process that waits in it, if one was started.
     ui::shell::finish_handover();
     // Leave without running the exit handlers. Engine threads may still be
