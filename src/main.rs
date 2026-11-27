@@ -5,6 +5,7 @@
 mod engine;
 #[cfg(target_os = "linux")]
 mod font_prefetch;
+mod fuzzy;
 mod icons;
 mod instance;
 mod integration;

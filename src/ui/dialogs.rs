@@ -226,7 +226,12 @@ impl PlayerView {
                 // Valid values were already applied by on_input_changed.
                 cx.notify();
             }
-            "playlist_filter" => self.playlist_focus_list(window, cx),
+            "playlist_filter" => {
+                if !self.visible_playlist_indices(cx).is_empty() {
+                    self.playlist_focus_list(window, cx);
+                    self.playlist_key_play(window, cx);
+                }
+            }
             "shortcut_search" => {}
             _ => self.close_dialog(window, cx),
         }

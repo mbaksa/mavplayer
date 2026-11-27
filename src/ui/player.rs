@@ -23,7 +23,7 @@ use gpui::{
     App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, ImageId, PathPromptOptions, Pixels, Point,
     RenderImage, Subscription, Window, px, size,
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -198,6 +198,7 @@ pub struct PlayerView {
     pub playlist_selection: playlist::Selection,
     pub playlist_hovered: Option<u64>,
     pub playlist_filter_open: bool,
+    playlist_filter_cache: RefCell<playlist::FilterCache>,
     pub ab_loop: (Option<f64>, Option<f64>),
     pub loop_file: bool,
     /// The playlist item queued in the engine to follow the current one.
@@ -574,6 +575,7 @@ impl PlayerView {
             playlist_selection: Default::default(),
             playlist_hovered: None,
             playlist_filter_open: false,
+            playlist_filter_cache: Default::default(),
             ab_loop: (None, None),
             loop_file: false,
             armed: None,
@@ -1175,29 +1177,11 @@ impl PlayerView {
     /// The display indices are also used by keyboard navigation and selection.
     pub(super) fn visible_playlist_indices(&self, cx: &App) -> Vec<usize> {
         let query = if self.playlist_filter_open {
-            self.inputs
-                .get("playlist_filter")
-                .map(|input| input.read(cx).text().trim().to_lowercase())
-                .unwrap_or_default()
+            self.inputs.get("playlist_filter").map(|input| input.read(cx).text()).unwrap_or_default()
         } else {
             String::new()
         };
-        if query.is_empty() {
-            (0..self.playlist.items.len()).collect()
-        } else {
-            self.playlist
-                .items
-                .iter()
-                .enumerate()
-                .filter_map(|(i, item)| {
-                    (item.display_title().to_lowercase().contains(&query)
-                        || item.source.display_name().to_lowercase().contains(&query)
-                        || item.source.key().to_lowercase().contains(&query)
-                        || item.artist.as_ref().is_some_and(|a| a.to_lowercase().contains(&query)))
-                    .then_some(i)
-                })
-                .collect()
-        }
+        self.playlist_filter_cache.borrow_mut().visible_indices(&self.playlist.items, &query)
     }
 
     pub(super) fn playlist_focus_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1279,7 +1263,7 @@ impl PlayerView {
         }
     }
 
-    fn playlist_key_play(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn playlist_key_play(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let visible = self.visible_playlist_indices(cx);
         let selected = |i: usize| self.playlist_selection.contains(self.playlist.items[i].id);
         let lead = self.playlist_selection.lead();
