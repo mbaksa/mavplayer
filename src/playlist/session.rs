@@ -4,22 +4,37 @@
 use crate::engine::MediaSource;
 use crate::settings::{config_dir, read_json, write_json};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Snapshot {
     pub sources: Vec<MediaSource>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom_titles: BTreeMap<usize, String>,
     pub current: Option<usize>,
     pub position: Option<f64>,
 }
 
 impl Snapshot {
     fn normalize(&mut self) {
+        let len = self.sources.len();
+        self.custom_titles.retain(|i, title| {
+            let trimmed = title.trim();
+            if *i >= len || trimmed.is_empty() {
+                return false;
+            }
+            if trimmed.len() != title.len() {
+                *title = trimmed.to_owned();
+            }
+            true
+        });
         self.current = self.current.filter(|&i| i < self.sources.len());
         self.position = self.position.filter(|p| self.current.is_some() && p.is_finite() && *p >= 0.0);
     }
 
     fn needs_autosave(&self, saved: &Self) -> bool {
         self.sources != saved.sources
+            || self.custom_titles != saved.custom_titles
             || self.current != saved.current
             || match (self.position, saved.position) {
                 (Some(a), Some(b)) => (a - b).abs() >= 5.0,
@@ -228,7 +243,12 @@ mod tests {
     use super::*;
 
     fn snapshot(name: &str, position: f64) -> Snapshot {
-        Snapshot { sources: vec![MediaSource::File(name.into())], current: Some(0), position: Some(position) }
+        Snapshot {
+            sources: vec![MediaSource::File(name.into())],
+            current: Some(0),
+            position: Some(position),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -305,6 +325,21 @@ mod tests {
         assert!(restored.snapshot().sources.is_empty());
         assert!(lib.switch(1));
         assert_eq!(lib.snapshot(), &live);
+    }
+
+    #[test]
+    fn custom_titles_roundtrip_and_trigger_autosave() {
+        let mut saved = snapshot("movie.mp4", 0.0);
+        let legacy = serde_json::to_string(&saved).unwrap();
+        assert!(!legacy.contains("custom_titles"));
+        let mut edited: Snapshot = serde_json::from_str(&legacy).unwrap();
+        edited.custom_titles.insert(0, "My title".into());
+        edited.custom_titles.insert(9, "Invalid index".into());
+        edited.normalize();
+        assert_eq!(edited.custom_titles.len(), 1);
+        assert!(edited.needs_autosave(&saved));
+        saved = serde_json::from_str(&serde_json::to_string(&edited).unwrap()).unwrap();
+        assert_eq!(edited, saved);
     }
 
     #[test]

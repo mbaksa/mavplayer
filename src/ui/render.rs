@@ -17,7 +17,9 @@ use super::theme::{Theme, overlay_theme};
 use super::widgets::{format_speed, format_time, frac_to_speed, icon, speed_to_frac, tooltip};
 use crate::engine::{MediaSource, Status, SubContent, TrackKind};
 use crate::icons::Icon;
-use crate::settings::{BarControl, PlaylistThumbnails, RepeatMode, ScrollAction, SubStyle, TimelineVisualization};
+use crate::settings::{
+    BarControl, PlaylistLabels, PlaylistThumbnails, RepeatMode, ScrollAction, SubStyle, TimelineVisualization,
+};
 use gpui::{
     AnyElement, AnyView, Bounds, ClickEvent, Context, Corners, CursorStyle, Decorations, Div, DragMoveEvent, ElementId,
     ExternalPaths, Focusable, Hsla, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point,
@@ -1948,7 +1950,7 @@ impl PlayerView {
             .child(self.icon_button(
                 "pl-search",
                 Icon::Search,
-                "Filter playlist",
+                &keymap::hint("Filter playlist", &PlaylistFilter),
                 t,
                 |this, _, window, cx| {
                     this.playlist_filter_open = !this.playlist_filter_open;
@@ -2044,10 +2046,16 @@ impl PlayerView {
                         let i = filtered[display_index];
                         let it = &this.playlist.items[i];
                         let is_cur = current == Some(i);
-                        let title = it.display_title();
-                        let dur = if super::playlist_thumbnails::PlaylistPreviews::mode(&this.settings)
-                            == PlaylistThumbnails::Inline
-                        {
+                        let mode = super::playlist_thumbnails::PlaylistPreviews::mode(&this.settings);
+                        let labels = if mode.inline() {
+                            this.settings.playlist_inline_labels
+                        } else if this.settings.playlist_compact_prefer_title {
+                            PlaylistLabels::Title
+                        } else {
+                            PlaylistLabels::FileName
+                        };
+                        let (title, secondary_title) = it.labels(labels);
+                        let dur = if mode == PlaylistThumbnails::Inline {
                             this.playlist_previews
                                 .hover
                                 .as_ref()
@@ -2079,7 +2087,6 @@ impl PlayerView {
                         let drag_value = PlaylistDrag { ids: drag_ids, anchor: item_id, title: drag_title.into() };
                         let failed = it.failed;
                         let duration = it.duration.unwrap_or(0.0);
-                        let mode = super::playlist_thumbnails::PlaylistPreviews::mode(&this.settings);
                         let key = super::playlist_thumbnails::Key::new(it, &this.settings);
                         let entry = super::cache_badges::Entry::new(it, &this.settings);
                         let cached = entry.as_ref().map(|entry| this.cache_badges.get(entry)).unwrap_or_default();
@@ -2367,16 +2374,27 @@ impl PlayerView {
                                         div()
                                             .flex_1()
                                             .min_w_0()
-                                            .truncate()
-                                            .text_size(px(13.))
-                                            .text_color(if failed {
-                                                t.text_disabled
-                                            } else if is_cur {
-                                                t.accent
-                                            } else {
-                                                t.text
-                                            })
-                                            .child(title),
+                                            .flex()
+                                            .flex_col()
+                                            .justify_center()
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .text_size(px(13.))
+                                                    .text_color(if failed {
+                                                        t.text_disabled
+                                                    } else if is_cur {
+                                                        t.accent
+                                                    } else {
+                                                        t.text
+                                                    })
+                                                    .child(title),
+                                            )
+                                            .when_some(secondary_title, |d, name| {
+                                                d.child(
+                                                    div().truncate().text_size(px(11.)).text_color(t.text_dim).child(name),
+                                                )
+                                            }),
                                     )
                                     .when(
                                         (!mode.inline() && (cached.video || cached.audio))
@@ -2832,6 +2850,10 @@ impl PlayerView {
                 }
             })
             .icon(Icon::Play),
+            M::action("Edit item title…", move |this, w, cx| {
+                this.show_dialog(super::dialogs::Dialog::EditPlaylistItemTitle(item_id), w, cx)
+            })
+            .enabled(count == 1),
             M::action("Move Up", move |this, _, cx| this.move_playlist_items(&up, true, cx))
                 .icon(Icon::Up)
                 .enabled(self.playlist.can_move_selected(&ids, true)),
@@ -3054,7 +3076,11 @@ impl PlayerView {
         let mut root = div()
             .id("root")
             .key_context(if overlay_open {
-                "Overlay"
+                if self.dialog == Some(super::dialogs::Dialog::MediaInfo) && self.menu.is_none() {
+                    "Overlay MediaInfo"
+                } else {
+                    "Overlay"
+                }
             } else if playlist_filter_focused {
                 // Text input must not inherit playback or DVD shortcuts.
                 "EditingText"

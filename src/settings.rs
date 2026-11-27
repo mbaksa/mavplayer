@@ -155,6 +155,13 @@ impl TimelineVisualization {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlaylistLabels {
+    Title,
+    FileName,
+    Both,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlaylistThumbnails {
     None,
     Hover,
@@ -319,6 +326,8 @@ pub struct Settings {
     pub timeline_fullscreen_opacity: Option<u32>,
     pub timeline_fullscreen_height: Option<u32>,
     pub playlist_thumbnails: PlaylistThumbnails,
+    pub playlist_compact_prefer_title: bool,
+    pub playlist_inline_labels: PlaylistLabels,
     pub playlist_thumbnail_times: HashMap<String, f64>,
     pub chapter_thumbnails: bool,
     pub timeline_adaptive: bool,
@@ -432,6 +441,8 @@ impl Default for Settings {
             timeline_fullscreen_opacity: None,
             timeline_fullscreen_height: None,
             playlist_thumbnails: PlaylistThumbnails::InlineSide,
+            playlist_compact_prefer_title: true,
+            playlist_inline_labels: PlaylistLabels::Both,
             playlist_thumbnail_times: HashMap::new(),
             chapter_thumbnails: true,
             timeline_adaptive: true,
@@ -742,14 +753,20 @@ mod tests {
     fn playlist_preview_preferences_roundtrip() {
         let mut settings = Settings::default();
         assert_eq!(settings.playlist_thumbnails, PlaylistThumbnails::InlineSide);
+        assert!(settings.playlist_compact_prefer_title);
+        assert_eq!(settings.playlist_inline_labels, PlaylistLabels::Both);
         assert!(PlaylistThumbnails::InlineSide.inline() && PlaylistThumbnails::InlineSide.side());
         assert!(PlaylistThumbnails::Inline.inline() && !PlaylistThumbnails::Inline.side());
         assert!(PlaylistThumbnails::StaticInline.inline() && !PlaylistThumbnails::StaticInline.scrubbing());
         assert!(PlaylistThumbnails::Hover.side() && !PlaylistThumbnails::Hover.inline());
         settings.playlist_width = 425.;
+        settings.playlist_compact_prefer_title = false;
+        settings.playlist_inline_labels = PlaylistLabels::FileName;
         settings.playlist_thumbnail_times.insert("0:example.mp4".into(), 25.);
         let restored: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert_eq!(restored.playlist_width, 425.);
+        assert!(!restored.playlist_compact_prefer_title);
+        assert_eq!(restored.playlist_inline_labels, PlaylistLabels::FileName);
         assert_eq!(restored.playlist_thumbnail_times.get("0:example.mp4"), Some(&25.));
         assert_eq!(restored.playlist_thumbnails, PlaylistThumbnails::InlineSide);
     }

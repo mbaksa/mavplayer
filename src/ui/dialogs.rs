@@ -26,6 +26,7 @@ pub enum Dialog {
     MediaInfo,
     OpenUrl,
     NamePlaylist(bool),
+    EditPlaylistItemTitle(u64),
     DuplicatePlaylist,
     DeletePlaylist,
     OpenDisc,
@@ -85,6 +86,18 @@ impl PlayerView {
                 let clip =
                     cx.read_from_clipboard().and_then(|c| c.text()).filter(|t| t.contains("://") && !t.contains('\n'));
                 input.update(cx, |i, cx| i.set_text(clip.unwrap_or_default(), cx));
+                window.focus(&input.focus_handle(cx));
+            }
+            Dialog::EditPlaylistItemTitle(id) => {
+                let input = self.input("playlist_item_title", "Leave empty to use the media title", window, cx);
+                let title = self
+                    .playlist
+                    .items
+                    .iter()
+                    .find(|item| item.id == id)
+                    .and_then(|item| item.custom_title.clone())
+                    .unwrap_or_default();
+                input.update(cx, |i, cx| i.set_text(title, cx));
                 window.focus(&input.focus_handle(cx));
             }
             Dialog::NamePlaylist(rename) => {
@@ -204,6 +217,11 @@ impl PlayerView {
                 if !t.is_empty() {
                     self.close_dialog(window, cx);
                     self.open_sources(vec![playlist::source_for_arg(&t)], window, cx);
+                }
+            }
+            "playlist_item_title" => {
+                if let Some(Dialog::EditPlaylistItemTitle(id)) = self.dialog {
+                    self.set_playlist_item_title(id, &text, window, cx);
                 }
             }
             "playlist_name" => {
@@ -1199,6 +1217,26 @@ impl PlayerView {
                     .into_any_element();
                 self.modal("Open URL", 560., body, Some(footer), cx)
             }
+            Dialog::EditPlaylistItemTitle(_) => {
+                let body = div()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child("Set a title for this playlist item without changing the media file. Leave empty to reset.")
+                    .child(self.input_box("playlist_item_title"))
+                    .into_any_element();
+                let footer = self
+                    .text_button(
+                        "playlist-item-title-confirm",
+                        "Apply",
+                        true,
+                        |this, _, w, cx| this.on_input_submit("playlist_item_title", w, cx),
+                        cx,
+                    )
+                    .into_any_element();
+                self.modal("Edit item title", 420., body, Some(footer), cx)
+            }
             Dialog::NamePlaylist(rename) => {
                 let body = div().p_4().child(self.input_box("playlist_name")).into_any_element();
                 let footer = self
@@ -1783,6 +1821,22 @@ impl PlayerView {
                             t.playlist_autohide_open = false;
                         },
                         cx,
+                    ))
+                    .child(self.section("Playlist labels"))
+                    .child(self.option_toggle(
+                        "playlist-compact-title", "Prefer media title without inline thumbnails",
+                        "Use the custom or embedded title instead of the file name when available.",
+                        s.playlist_compact_prefer_title, true, false,
+                        |t, _| t.settings.playlist_compact_prefer_title = !t.settings.playlist_compact_prefer_title, cx,
+                    ))
+                    .child(self.option_choice(
+                        "playlist-inline-labels", "Labels with inline thumbnails", "Show the title, file name or both.",
+                        vec![
+                            ("Title".into(), crate::settings::PlaylistLabels::Title),
+                            ("File name".into(), crate::settings::PlaylistLabels::FileName),
+                            ("Title and file name".into(), crate::settings::PlaylistLabels::Both),
+                        ],
+                        s.playlist_inline_labels, true, |t, v, _| t.settings.playlist_inline_labels = v, cx,
                     ))
                     .child(self.section("Mouse"))
                     .child(self.toggle_row(

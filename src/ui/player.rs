@@ -617,6 +617,13 @@ impl PlayerView {
         window.set_window_title("MavPlayer");
         if !sources.is_empty() {
             v.playlist.add(sources);
+            if restored_position.is_some() {
+                for (&i, title) in &v.playlist_library.snapshot().custom_titles {
+                    if let Some(item) = v.playlist.items.get_mut(i) {
+                        item.custom_title = Some(title.clone());
+                    }
+                }
+            }
             v.probe_playlist(cx);
             if let Some(index) = start_index {
                 let paused = restored_position.is_some() || v.settings.start_paused;
@@ -1199,12 +1206,14 @@ impl PlayerView {
     }
 
     fn playlist_focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.playlist_shown() {
-            return;
+        if !self.playlist_enabled() {
+            self.toggle_playlist(window, cx);
         }
+        self.playlist_autohide_open = true;
         self.playlist_filter_open = true;
         let input = self.input("playlist_filter", "Filter playlist…", window, cx);
         window.focus(&input.focus_handle(cx));
+        cx.notify();
     }
 
     fn playlist_key_move(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
@@ -1489,7 +1498,14 @@ impl PlayerView {
                 None
             }
         });
-        PlaylistSnapshot { sources, current, position }
+        let custom_titles = self
+            .playlist
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| item.custom_title.clone().map(|title| (i, title)))
+            .collect();
+        PlaylistSnapshot { sources, custom_titles, current, position }
     }
 
     fn save_playlist_session(&mut self, exact: bool, manual: bool) {
@@ -1498,6 +1514,20 @@ impl PlayerView {
         if let Err(err) = self.playlist_library.flush() {
             log::warn!("could not save playlist state: {err}");
         }
+    }
+
+    pub(super) fn set_playlist_item_title(
+        &mut self, id: u64, title: &str, window: &mut Window, cx: &mut Context<Self>,
+    ) {
+        if let Some((index, item)) = self.playlist.items.iter_mut().enumerate().find(|(_, item)| item.id == id) {
+            let title = title.trim();
+            item.custom_title = (!title.is_empty()).then(|| title.to_owned());
+            if self.playlist.current == Some(index) {
+                window.set_window_title(&format!("{} — MavPlayer", item.display_title()));
+            }
+            self.save_playlist_session(true, false);
+        }
+        self.close_dialog(window, cx);
     }
 
     pub(super) fn toggle_playlist_autosave(&mut self, cx: &mut Context<Self>) {
@@ -1602,6 +1632,11 @@ impl PlayerView {
         self.playlist_previews.hover = None;
         self.armed = None;
         self.playlist.add(snapshot.sources);
+        for (i, title) in snapshot.custom_titles {
+            if let Some(item) = self.playlist.items.get_mut(i) {
+                item.custom_title = Some(title);
+            }
+        }
         self.probe_playlist(cx);
         if let Some(index) = snapshot.current {
             self.start_item_at(index, true, true, Some(snapshot.position), window, cx);
@@ -2250,7 +2285,7 @@ impl PlayerView {
             return;
         }
         let hovered = window.is_window_hovered();
-        if hovered
+        if window.is_window_active()
             && self.playlist_filter_open
             && self.inputs.get("playlist_filter").is_some_and(|input| input.focus_handle(cx).is_focused(window))
         {
@@ -3002,7 +3037,10 @@ impl PlayerView {
                 else if w.is_fullscreen() { w.toggle_fullscreen() }
             },
             Screenshot => |this, _w, cx| this.screenshot(cx),
-            ShowMediaInfo => |this, w, cx| this.show_dialog(Dialog::MediaInfo, w, cx),
+            ShowMediaInfo => |this, w, cx| {
+                if this.dialog == Some(Dialog::MediaInfo) { this.close_dialog(w, cx) }
+                else { this.show_dialog(Dialog::MediaInfo, w, cx) }
+            },
             ToggleAbLoop => |this, _w, cx| {
                 let pos = this.player.position();
                 this.ab_loop = match this.ab_loop {

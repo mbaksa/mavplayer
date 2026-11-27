@@ -122,6 +122,7 @@ commands! {
     ]
     "Window" => [
         TogglePlaylist, "Show / hide playlist", ["secondary-l"];
+        PlaylistFilter, "Filter playlist", ["f3"];
         ToggleMenubar, "Show / hide menu bar", ["secondary-m"];
         ShowPreferences, "Preferences", ["secondary-,", "secondary-p"];
         ShowShortcuts, "Keyboard shortcuts", ["f1", "?"];
@@ -184,6 +185,12 @@ pub fn apply(cx: &mut App, overrides: &BTreeMap<String, Vec<String>>) {
         });
         for k in &keys {
             bindings.push((c.bind)(k, if c.global { None } else { Some(CTX) }));
+            if c.id == "ShowMediaInfo" {
+                bindings.push((c.bind)(k, Some("MediaInfo")));
+            } else if c.id == "PlaylistFilter" {
+                bindings.push((c.bind)(k, Some(PLAYLIST_CTX)));
+                bindings.push((c.bind)(k, Some("EditingText")));
+            }
         }
         current.insert(c.id, keys);
     }
@@ -211,7 +218,6 @@ pub fn apply(cx: &mut App, overrides: &BTreeMap<String, Vec<String>>) {
         KeyBinding::new("delete", PlaylistDelete, playlist),
         KeyBinding::new("enter", PlaylistPlay, playlist),
         KeyBinding::new("secondary-a", PlaylistSelectAll, playlist),
-        KeyBinding::new("f3", PlaylistFilter, playlist),
     ]);
     // A DVD menu's buttons take the arrow keys and Enter (after the rest,
     // so they win over seeking and volume while it shows).

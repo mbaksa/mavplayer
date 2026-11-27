@@ -6,7 +6,7 @@ pub(crate) mod session;
 use crate::engine::MediaSource;
 use crate::engine::disc;
 use crate::fuzzy::{SearchField, SearchQuery};
-use crate::settings::RepeatMode;
+use crate::settings::{PlaylistLabels, RepeatMode};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -33,6 +33,7 @@ pub struct PlaylistItem {
     pub id: u64,
     pub source: MediaSource,
     pub title: Option<String>,
+    pub custom_title: Option<String>,
     pub artist: Option<String>,
     pub duration: Option<f64>,
     pub video_stream: Option<usize>,
@@ -44,10 +45,30 @@ pub struct PlaylistItem {
 
 impl PlaylistItem {
     pub fn display_title(&self) -> String {
-        match (&self.title, &self.artist) {
+        self.custom_title.clone().unwrap_or_else(|| self.metadata_title())
+    }
+
+    fn metadata_title(&self) -> String {
+        match (
+            self.title.as_deref().filter(|title| !title.trim().is_empty()),
+            self.artist.as_deref().filter(|artist| !artist.trim().is_empty()),
+        ) {
             (Some(t), Some(a)) => format!("{a} – {t}"),
-            (Some(t), None) => t.clone(),
+            (Some(t), None) => t.to_owned(),
             _ => self.source.display_name(),
+        }
+    }
+
+    pub fn labels(&self, mode: PlaylistLabels) -> (String, Option<String>) {
+        match mode {
+            PlaylistLabels::Title => (self.display_title(), None),
+            PlaylistLabels::FileName => (self.source.display_name(), None),
+            PlaylistLabels::Both => {
+                let title = self.display_title();
+                let name = self.source.display_name();
+                let secondary = (title != name).then_some(name);
+                (title, secondary)
+            }
         }
     }
 }
@@ -64,6 +85,7 @@ struct FilterEntry {
     id: u64,
     source: MediaSource,
     title: Option<String>,
+    custom_title: Option<String>,
     artist: Option<String>,
     fields: Vec<SearchField>,
 }
@@ -71,18 +93,32 @@ struct FilterEntry {
 impl FilterEntry {
     fn new(item: &PlaylistItem) -> Self {
         let mut fields = vec![
-            SearchField::new(&item.display_title()),
+            SearchField::new(&item.metadata_title()),
             SearchField::new(&item.source.display_name()),
             SearchField::new(&item.source.key()),
         ];
         if let Some(artist) = &item.artist {
             fields.push(SearchField::new(artist));
         }
-        Self { id: item.id, source: item.source.clone(), title: item.title.clone(), artist: item.artist.clone(), fields }
+        if let Some(title) = &item.custom_title {
+            fields.push(SearchField::new(title));
+        }
+        Self {
+            id: item.id,
+            source: item.source.clone(),
+            title: item.title.clone(),
+            custom_title: item.custom_title.clone(),
+            artist: item.artist.clone(),
+            fields,
+        }
     }
 
     fn matches_item(&self, item: &PlaylistItem) -> bool {
-        self.id == item.id && self.source == item.source && self.title == item.title && self.artist == item.artist
+        self.id == item.id
+            && self.source == item.source
+            && self.title == item.title
+            && self.custom_title == item.custom_title
+            && self.artist == item.artist
     }
 }
 
@@ -274,6 +310,7 @@ impl Playlist {
                     id,
                     source: s,
                     title: None,
+                    custom_title: None,
                     artist: None,
                     duration: None,
                     video_stream: None,
@@ -799,6 +836,26 @@ mod tests {
         assert_eq!(cache.visible_indices(&p.items, "alpha"), [2]);
         p.remove(2);
         assert!(cache.visible_indices(&p.items, "alpha").is_empty());
+    }
+
+    #[test]
+    fn playlist_custom_title_and_labels() {
+        let mut p = pl(&["first.mp4", "first.mp4"]);
+        p.items[0].title = Some("English".into());
+        p.items[0].custom_title = Some("Mountain footage".into());
+        assert_eq!(p.items[0].labels(PlaylistLabels::Title), ("Mountain footage".to_owned(), None));
+        assert_eq!(p.items[0].labels(PlaylistLabels::FileName), ("first.mp4".to_owned(), None));
+        assert_eq!(
+            p.items[0].labels(PlaylistLabels::Both),
+            ("Mountain footage".to_owned(), Some("first.mp4".to_owned()))
+        );
+        assert_eq!(p.items[1].labels(PlaylistLabels::Both), ("first.mp4".to_owned(), None));
+        let mut cache = FilterCache::default();
+        assert_eq!(cache.visible_indices(&p.items, "mountain"), [0]);
+        assert_eq!(cache.visible_indices(&p.items, "English"), [0]);
+        p.items[0].custom_title = None;
+        assert!(cache.visible_indices(&p.items, "mountain").is_empty());
+        assert_eq!(p.items[0].display_title(), "English");
     }
 
     #[test]
