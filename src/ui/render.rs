@@ -2362,7 +2362,7 @@ impl PlayerView {
                                                 .size_full(),
                                         )
                                         .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
-                                            if cx.has_active_drag() || this.menu.is_some() || this.dialog.is_some() {
+                                            if cx.has_active_drag() || this.drag.is_some() || this.menu.is_some() || this.dialog.is_some() {
                                                 return;
                                             }
                                             let Some(key) = key.clone() else {
@@ -2688,7 +2688,20 @@ impl PlayerView {
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 this.playlist_previews.pointer = Some(ev.position);
                 this.update_playlist_autohide(window, cx);
+                // The autohide overlay occludes the root's mouse handlers.
+                if this.handle_drag_move(ev, window, cx) {
+                    cx.stop_propagation();
+                }
             }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    if this.drag.is_some() {
+                        this.end_drag(window, cx);
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .relative()
             .w(px(width))
             .flex_1()

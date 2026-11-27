@@ -27,6 +27,7 @@ pub enum Dialog {
     OpenUrl,
     NamePlaylist(bool),
     NewCollection,
+    PromoteCollection,
     RenameCollection,
     DeleteCollection,
     EditPlaylistItemTitle(u64),
@@ -104,7 +105,7 @@ impl PlayerView {
                 input.update(cx, |i, cx| i.set_text(title, cx));
                 window.focus(&input.focus_handle(cx));
             }
-            Dialog::NewCollection | Dialog::RenameCollection => {
+            Dialog::NewCollection | Dialog::RenameCollection | Dialog::PromoteCollection => {
                 let name = if d == Dialog::RenameCollection { self.playlist_library.collection_label().to_owned() } else { String::new() };
                 let input = self.input("collection_name", "Collection name", window, cx);
                 input.update(cx, |i, cx| i.set_text(name, cx));
@@ -239,6 +240,8 @@ impl PlayerView {
                     self.create_collection_workspace(text.trim(), window, cx);
                 } else if self.dialog == Some(Dialog::RenameCollection) {
                     self.rename_collection_workspace(text.trim(), window, cx);
+                } else if self.dialog == Some(Dialog::PromoteCollection) {
+                    self.promote_collection_workspace(text.trim(), window, cx);
                 }
             }
             "playlist_name" => {
@@ -1274,14 +1277,15 @@ impl PlayerView {
                     .into_any_element();
                 self.modal("Edit item title", 420., body, Some(footer), cx)
             }
-            Dialog::NewCollection | Dialog::RenameCollection => {
+            Dialog::NewCollection | Dialog::RenameCollection | Dialog::PromoteCollection => {
                 let rename = self.dialog == Some(Dialog::RenameCollection);
+                let promote = self.dialog == Some(Dialog::PromoteCollection);
                 let body = div().p_4().child(self.input_box("collection_name")).into_any_element();
                 let footer = self.text_button(
-                    "collection-name-confirm", if rename { "Rename" } else { "Create" }, true,
+                    "collection-name-confirm", if rename { "Rename" } else if promote { "Save" } else { "Create" }, true,
                     |this, _, w, cx| this.on_input_submit("collection_name", w, cx), cx,
                 ).into_any_element();
-                self.modal(if rename { "Rename collection" } else { "New collection" }, 380., body, Some(footer), cx)
+                self.modal(if rename { "Rename collection" } else if promote { "Save temporary collection" } else { "New collection" }, 380., body, Some(footer), cx)
             }
             Dialog::NamePlaylist(rename) => {
                 let body = div().p_4().child(self.input_box("playlist_name")).into_any_element();
