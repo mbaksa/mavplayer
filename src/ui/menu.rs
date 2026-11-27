@@ -101,6 +101,7 @@ impl MenuItem {
 pub struct OpenMenu {
     pub(super) timeline_settings: bool,
     pub(super) playlist_switch: Option<super::search_combo::SearchCombo>,
+    pub(super) collection_choices: Option<Vec<crate::playlist::collections::CollectionId>>,
     pub(super) playlist_context: bool,
     pub(super) playlist_settings: bool,
     pub(super) playlist_item: Option<u64>,
@@ -148,6 +149,7 @@ impl PlayerView {
         self.menu = Some(OpenMenu {
             timeline_settings: false,
             playlist_switch: None,
+            collection_choices: None,
             playlist_context: false,
             playlist_settings: false,
             playlist_item: None,
@@ -198,7 +200,7 @@ impl PlayerView {
                     MouseButton::Left,
                     cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
                         this.playlist_previews.pointer = Some(ev.position);
-                        if this.menu.as_ref().is_some_and(|m| m.playlist_context && !m.playlist_settings)
+                        if this.menu.as_ref().is_some_and(|m| m.playlist_context && !m.playlist_settings && m.collection_choices.is_none())
                             && let Some((id, _)) = this.playlist_item_at(ev.position)
                         {
                             if this.menu.as_ref().and_then(|m| m.playlist_item) == Some(id) {
@@ -219,7 +221,7 @@ impl PlayerView {
                     MouseButton::Right,
                     cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
                         this.playlist_previews.pointer = Some(ev.position);
-                        if this.menu.as_ref().is_some_and(|m| m.playlist_context)
+                        if this.menu.as_ref().is_some_and(|m| m.playlist_context && m.collection_choices.is_none())
                             && this.playlist_shown() && this.playlist_bounds.get().contains(&ev.position)
                         {
                             if let Some((id, _)) = this.playlist_item_at(ev.position) {
@@ -407,12 +409,53 @@ impl PlayerView {
             menu.playlist_switch = Some(combo);
         }
         let t = self.theme;
-        let input = self.input("playlist_switch", "Filter playlists…", window, cx);
+        let input = self.input("playlist_switch", "Filter…", window, cx);
         input.update(cx, |input, cx| {
             input.set_text("", cx);
             input.colors = (t.text, t.text_disabled, t.accent_soft, t.accent);
         });
         window.focus(&input.focus_handle(cx));
+    }
+
+    pub(super) fn open_collection_switch(&mut self, pos: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let choices = match crate::playlist::session::Library::collection_choices(&crate::settings::config_dir()) {
+            Ok(choices) => choices,
+            Err(err) => {
+                self.osd(format!("Could not list collections: {err}"), cx);
+                return;
+            }
+        };
+        let active = choices.iter().position(|(id, _)| Some(*id) == self.playlist_library.collection_id());
+        let combo = super::search_combo::SearchCombo::new(
+            choices.iter().enumerate().map(|(i, (_, name))| (i, name.clone()))
+                .chain(std::iter::once((choices.len(), "New collection…".into()))),
+            active,
+        );
+        self.open_menu(Vec::new(), pos, None, cx);
+        if let Some(menu) = self.menu.as_mut() {
+            menu.playlist_switch = Some(combo);
+            menu.collection_choices = Some(choices.into_iter().map(|(id, _)| id).collect());
+            menu.playlist_context = true;
+        }
+        let t = self.theme;
+        let input = self.input("playlist_switch", "Filter…", window, cx);
+        input.update(cx, |input, cx| {
+            input.set_text("", cx);
+            input.colors = (t.text, t.text_disabled, t.accent_soft, t.accent);
+        });
+        window.focus(&input.focus_handle(cx));
+    }
+
+    fn select_combo(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let collection = self.menu.as_ref().and_then(|menu| menu.collection_choices.as_ref())
+            .map(|choices| choices.get(index).copied());
+        self.close_menu(cx);
+        window.focus(&self.playlist_focus);
+        match collection {
+            Some(Some(id)) => self.switch_collection_workspace(id, window, cx),
+            Some(None) => self.show_dialog(super::dialogs::Dialog::NewCollection, window, cx),
+            None => self.switch_playlist_workspace(index, window, cx),
+        }
     }
 
     pub(super) fn combo_page_step(&self) -> isize {
@@ -430,20 +473,16 @@ impl PlayerView {
 
     pub(super) fn combo_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.menu.as_ref().and_then(|menu| menu.playlist_switch.as_ref()).and_then(|combo| combo.selected_id()) {
-            self.close_menu(cx);
-            window.focus(&self.playlist_focus);
-            self.switch_playlist_workspace(index, window, cx);
+            self.select_combo(index, window, cx);
         }
     }
 
     fn playlist_switch_panel(&self, menu: &OpenMenu, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(combo) = menu.playlist_switch.as_ref() else { return div().into_any_element() };
         combo.render(
-            menu.pos, self.theme, menu.scroll(0), self.inputs.get("playlist_switch").cloned(), Icon::Playlist,
-            |this, id, w, cx| {
-                w.focus(&this.playlist_focus);
-                this.switch_playlist_workspace(id, w, cx);
-            }, window, cx,
+            menu.pos, self.theme, menu.scroll(0), self.inputs.get("playlist_switch").cloned(),
+            if menu.collection_choices.is_some() { Icon::OpenFolder } else { Icon::Playlist },
+            |this, id, w, cx| this.select_combo(id, w, cx), window, cx,
         )
     }
 

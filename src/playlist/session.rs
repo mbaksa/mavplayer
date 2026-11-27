@@ -376,7 +376,35 @@ impl Library {
         &self.collection_label
     }
 
-    /// Administrative entry points also used by the future collection UI.
+    pub fn collection_id(&self) -> Option<CollectionId> {
+        self.storage.as_ref().filter(|_| !self.temporary).map(|s| s.collection.id)
+    }
+
+    pub fn collection_choices(config: &Path) -> io::Result<Vec<(CollectionId, String)>> {
+        let (paths, index, _lock) = Self::open_index(config, false)?;
+        index.collection_order.into_iter().map(|id| {
+            Ok((id, Self::read_collection(&paths, id)?.name))
+        }).collect()
+    }
+
+    pub fn open_for_switch(id: CollectionId) -> io::Result<Self> {
+        Self::open_selected(&config_dir(), Some(id), false)
+    }
+
+    /// Do not silently discard unsaved drafts or a recoverable temporary session.
+    pub fn can_leave(&self) -> bool {
+        if self.temporary {
+            return self.slots.len() == 1 && self.slots[0].name == "Default playlist"
+                && self.slots[0].snapshot().sources.is_empty();
+        }
+        self.slots.iter().all(|slot| {
+            let draft = slot.snapshot();
+            draft.sources == slot.saved.sources && draft.ids == slot.saved.ids
+                && draft.custom_titles == slot.saved.custom_titles
+        })
+    }
+
+    /// Administrative entry points also used by the collection UI.
     pub fn list_collections(config: &Path) -> io::Result<String> {
         let (paths, index, _index_lock) = Self::open_index(config, false)?;
         let mut lines = Vec::new();
@@ -638,6 +666,24 @@ mod tests {
         assert!(Library::list_sessions(&root).unwrap().is_empty());
         assert!(Library::recover_session(&root, id).is_err());
         assert!(!root.join("collections").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn collection_switch_preserves_unsaved_drafts() {
+        let root = std::env::temp_dir().join(format!("mavplayer-switch-{}", uuid::Uuid::new_v4()));
+        let mut library = Library::open(&root).unwrap();
+        let id = library.collection_id().unwrap();
+        assert_eq!(Library::collection_choices(&root).unwrap()[0].0, id);
+        assert!(Library::open_selected(&root, Some(id), false).is_err());
+        library.set_autosave(false);
+        let draft = snapshot("draft.mp4", 0.0);
+        library.capture(draft.clone(), true, false);
+        assert!(!library.can_leave());
+        library.capture(draft, true, true);
+        library.flush().unwrap();
+        assert!(library.can_leave());
+        drop(library);
         fs::remove_dir_all(root).unwrap();
     }
 

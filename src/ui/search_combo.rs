@@ -124,7 +124,6 @@ impl SearchCombo {
                     .child(div().flex_1().min_w_0().truncate().child(entry.label.clone()))
                     .when(active, |d| d.child(icon(Icon::Check, px(16.), t.accent)))
                     .on_click(cx.listener(move |this, _, w, cx| {
-                        this.close_menu(cx);
                         on_select(this, id, w, cx);
                         cx.notify();
                     })),

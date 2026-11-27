@@ -1915,6 +1915,31 @@ impl PlayerView {
         let selected_count = self.playlist_selection.ids(&self.playlist.items).len();
         let switch_bounds = Rc::new(Cell::new(Bounds::default()));
         let measured_switch = switch_bounds.clone();
+        let collection_bounds = Rc::new(Cell::new(Bounds::default()));
+        let measured_collection = collection_bounds.clone();
+        let collection_header = div()
+            .id("collection-switch")
+            .relative()
+            .h(px(30.))
+            .flex_none()
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .border_b_1()
+            .border_color(t.chrome_border)
+            .cursor_pointer()
+            .hover(|s| s.bg(t.hover))
+            .child(canvas(move |b, _, _| measured_collection.set(b), |_, _, _, _| {}).absolute().size_full())
+            .child(icon(Icon::OpenFolder, px(16.), t.text_dim))
+            .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).child(self.playlist_library.collection_label().to_owned()))
+            .child(icon(Icon::DropDown, px(12.), t.text_dim))
+            .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                if !ev.is_right_click() {
+                    this.open_collection_switch(super::menu::below(collection_bounds.get()), window, cx);
+                    cx.stop_propagation();
+                }
+            }));
         let header = div()
             .flex()
             .items_center()
@@ -1950,8 +1975,7 @@ impl PlayerView {
                                     .child(self.playlist_library.name().to_owned()),
                             )
                             .child(div().text_size(px(11.)).text_color(t.text_dim).truncate().child(format!(
-                                "{} · {total_count} item{}{}{}",
-                                self.playlist_library.collection_label(),
+                                "{total_count} item{}{}{}",
                                 if total_count == 1 { "" } else { "s" },
                                 if total > 0.0 { format!(" · {}", format_time(total)) } else { String::new() },
                                 if selected_count > 1 {
@@ -2670,6 +2694,7 @@ impl PlayerView {
             .bg(t.surface)
             .border_l_1()
             .border_color(t.chrome_border)
+            .child(collection_header)
             .child(header)
             .when_some(search_row, |d, row| d.child(row))
             .child(

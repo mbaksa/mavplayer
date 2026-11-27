@@ -1600,6 +1600,48 @@ impl PlayerView {
         }
     }
 
+    fn prepare_collection_switch(&mut self) -> std::io::Result<()> {
+        let snapshot = self.playlist_snapshot();
+        self.playlist_library.capture(snapshot, true, false);
+        if !self.playlist_library.can_leave() {
+            return Err(std::io::Error::other("Save unsaved playlists before switching; nonempty temporary or read-only collections must remain open"));
+        }
+        self.playlist_library.flush()
+    }
+
+    pub(super) fn switch_collection_workspace(
+        &mut self, id: crate::playlist::collections::CollectionId, window: &mut Window, cx: &mut Context<Self>,
+    ) {
+        if self.playlist_library.collection_id() == Some(id) {
+            return;
+        }
+        let result = self.prepare_collection_switch().and_then(|()| PlaylistLibrary::open_for_switch(id));
+        match result {
+            Ok(next) => {
+                self.stop(window, cx);
+                if let Err(err) = self.playlist_library.close_temporary() {
+                    self.osd(format!("Could not close temporary collection: {err}"), cx);
+                    return;
+                }
+                self.playlist_library = next;
+                self.restore_playlist_workspace(window, cx);
+            }
+            Err(err) => self.osd(format!("Could not switch collection: {err}"), cx),
+        }
+    }
+
+    pub(super) fn create_collection_workspace(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let result = self.prepare_collection_switch()
+            .and_then(|()| PlaylistLibrary::create_collection(&crate::settings::config_dir(), name));
+        match result {
+            Ok(id) => {
+                self.close_dialog(window, cx);
+                self.switch_collection_workspace(id, window, cx);
+            }
+            Err(err) => self.osd(format!("Could not create collection: {err}"), cx),
+        }
+    }
+
     pub(super) fn switch_playlist_workspace(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index == self.playlist_library.active || index >= self.playlist_library.slots.len() {
             return;

@@ -26,6 +26,7 @@ pub enum Dialog {
     MediaInfo,
     OpenUrl,
     NamePlaylist(bool),
+    NewCollection,
     EditPlaylistItemTitle(u64),
     DuplicatePlaylist,
     DeletePlaylist,
@@ -99,6 +100,11 @@ impl PlayerView {
                     .map(|item| item.display_title())
                     .unwrap_or_default();
                 input.update(cx, |i, cx| i.set_text(title, cx));
+                window.focus(&input.focus_handle(cx));
+            }
+            Dialog::NewCollection => {
+                let input = self.input("collection_name", "Collection name", window, cx);
+                input.update(cx, |i, cx| i.set_text("", cx));
                 window.focus(&input.focus_handle(cx));
             }
             Dialog::NamePlaylist(rename) => {
@@ -223,6 +229,11 @@ impl PlayerView {
             "playlist_item_title" => {
                 if let Some(Dialog::EditPlaylistItemTitle(id)) = self.dialog {
                     self.set_playlist_item_title(id, &text, window, cx);
+                }
+            }
+            "collection_name" => {
+                if self.dialog == Some(Dialog::NewCollection) {
+                    self.create_collection_workspace(text.trim(), window, cx);
                 }
             }
             "playlist_name" => {
@@ -1257,6 +1268,14 @@ impl PlayerView {
                     ))
                     .into_any_element();
                 self.modal("Edit item title", 420., body, Some(footer), cx)
+            }
+            Dialog::NewCollection => {
+                let body = div().p_4().child(self.input_box("collection_name")).into_any_element();
+                let footer = self.text_button(
+                    "collection-name-confirm", "Create", true,
+                    |this, _, w, cx| this.on_input_submit("collection_name", w, cx), cx,
+                ).into_any_element();
+                self.modal("New collection", 380., body, Some(footer), cx)
             }
             Dialog::NamePlaylist(rename) => {
                 let body = div().p_4().child(self.input_box("playlist_name")).into_any_element();
