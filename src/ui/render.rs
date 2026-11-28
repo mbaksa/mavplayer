@@ -2885,6 +2885,24 @@ impl PlayerView {
                 },
             ));
         }
+        if self.playlist_library.collection_id().is_some() {
+            match self.playlist_library.inbox_pending_summary() {
+                Ok(requests) => {
+                    items.push(M::Header(format!("INBOX — {} pending", requests.len()).into()));
+                    if requests.is_empty() {
+                        items.push(M::Header("No pending requests".into()));
+                    }
+                    for (label, status) in requests {
+                        items.push(M::Header(format!("{label} — {status}").into()));
+                    }
+                }
+                Err(err) => {
+                    items.push(M::Header("INBOX".into()));
+                    items.push(M::Header(format!("Cannot inspect inbox: {err}").into()));
+                }
+            }
+            items.push(M::action("Refresh inbox…", |this, w, cx| this.open_collection_settings(w, cx)));
+        }
         items
     }
 

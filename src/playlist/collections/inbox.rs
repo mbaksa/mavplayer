@@ -197,3 +197,80 @@ pub(crate) fn import_items(
     }
     Ok(count)
 }
+
+/// Read-only snapshot for the collection settings panel. Never recover or
+/// acknowledge requests from the inspector, including in read-only instances.
+pub(crate) fn describe_pending(
+    paths: &CollectionPaths,
+    collection: CollectionId,
+    mut item_status: impl FnMut(super::PlaylistId) -> (String, String),
+    ready_status: &str,
+) -> io::Result<Vec<(String, String)>> {
+    let inbox = paths.collection_dir(collection).join("inbox");
+    let entries = match fs::read_dir(inbox) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut requests = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && entry.path().extension().is_some_and(|ext| ext == "json" || ext == "items") {
+            requests.push(entry.path());
+        }
+    }
+    requests.sort();
+    let mut result = Vec::new();
+    for path in requests {
+        let id = path.file_stem().unwrap_or_default().to_string_lossy();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                result.push((format!("Request {id}"), format!("Cannot read request: {err}")));
+                continue;
+            }
+        };
+        let items = path.extension().is_some_and(|ext| ext == "items");
+        let receipt = path.with_extension(if items { "items-done" } else { "done" });
+        let (label, mut status) = if items {
+            match serde_json::from_slice::<ItemRequest>(&bytes) {
+                Ok(request) => {
+                    let mut check = PlaylistManifest::new("Inbox items".into());
+                    check.entries = request.entries;
+                    if request.version != 1
+                        || check.entries.is_empty()
+                        || check.validate().is_err()
+                        || super::storage::render_m3u(&check).is_err()
+                    {
+                        (format!("Item request {id}"), "Invalid request".into())
+                    } else {
+                        let (name, status) = item_status(request.target);
+                        (format!("Copy {} item(s) to {name}", check.entries.len()), status)
+                    }
+                }
+                Err(_) => (format!("Item request {id}"), "Invalid request".into()),
+            }
+        } else {
+            match serde_json::from_slice::<PlaylistManifest>(&bytes) {
+                Ok(manifest)
+                    if manifest.validate().is_ok() && manifest.revision == 0 && id == manifest.id.to_string() =>
+                {
+                    (
+                        format!("Copy playlist: {} ({} items)", manifest.name, manifest.entries.len()),
+                        ready_status.into(),
+                    )
+                }
+                _ => (format!("Playlist request {id}"), "Invalid request".into()),
+            }
+        };
+        match fs::read(&receipt) {
+            Ok(previous) if previous == bytes => status = "Already imported; acknowledgment cleanup pending".into(),
+            Ok(_) => status = "Request conflicts with existing receipt".into(),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => status = format!("Cannot read receipt: {err}"),
+        }
+        result.push((label, status));
+    }
+    Ok(result)
+}

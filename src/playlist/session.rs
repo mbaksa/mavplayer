@@ -907,6 +907,44 @@ impl Library {
         Ok(name)
     }
 
+    pub fn inbox_pending_summary(&self) -> io::Result<Vec<(String, String)>> {
+        let Some(storage) = self.storage.as_ref().filter(|_| !self.temporary) else { return Ok(Vec::new()) };
+        let ready = if !self.writable {
+            "Waiting for writable collection owner"
+        } else if self.dirty {
+            "Waiting for collection changes to be saved"
+        } else {
+            "Waiting for automatic processing"
+        };
+        super::collections::inbox::describe_pending(
+            &storage.paths,
+            storage.collection.id,
+            |target| {
+                let Some(slot) = self.slots.iter().find(|slot| slot.id == target) else {
+                    return (target.to_string(), "Destination playlist not in current collection snapshot".into());
+                };
+                let status = if !self.writable || self.dirty {
+                    ready.into()
+                } else if slot.dirty {
+                    "Waiting for playlist changes to be saved".into()
+                } else {
+                    match PlaylistStore::new(&storage.paths, storage.collection.id, target).load() {
+                        Ok(loaded)
+                            if !loaded.externally_edited
+                                && slot.stored.as_ref().is_some_and(|stored| stored.same_disk_version(&loaded)) =>
+                        {
+                            ready.into()
+                        }
+                        Ok(_) => "Destination playlist changed on disk".into(),
+                        Err(err) => format!("Destination unavailable: {err}"),
+                    }
+                };
+                (slot.name.clone(), status)
+            },
+            ready,
+        )
+    }
+
     /// Import new playlists without replacing the live workspace or its drafts.
     /// Existing slot indices remain stable. Only the collection owner may write.
     pub fn poll_inbox(&mut self, active_added: &mut Vec<PlaylistEntry>) -> io::Result<usize> {
@@ -1445,6 +1483,23 @@ mod tests {
         assert!(restored.switch(1));
         assert_eq!(restored.snapshot(), &saved);
         drop(restored);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inbox_pending_summary_is_read_only() {
+        let root = std::env::temp_dir().join(format!("mavplayer-inbox-summary-{}", uuid::Uuid::new_v4()));
+        let mut target = Library::open(&root).unwrap();
+        let collection = target.collection_id().unwrap();
+        let destination = target.slots[0].id;
+        let incoming = snapshot("incoming.mp4", 0.0);
+        Library::queue_item_copy(&root, collection, destination, &incoming, &[0]).unwrap();
+        assert_eq!(target.inbox_pending_summary().unwrap().len(), 1);
+        assert_eq!(target.inbox_pending_summary().unwrap().len(), 1);
+        assert!(target.snapshot().sources.is_empty());
+        assert_eq!(target.poll_inbox(&mut Vec::new()).unwrap(), 1);
+        assert!(target.inbox_pending_summary().unwrap().is_empty());
+        drop(target);
         fs::remove_dir_all(root).unwrap();
     }
 
