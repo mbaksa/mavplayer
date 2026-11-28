@@ -244,10 +244,18 @@ impl Library {
         recover_move(&paths, id, read_only)?;
         let manifest_path = paths.collection_manifest(id);
         let manifest_bytes = fs::read(&manifest_path)?;
-        let collection: CollectionManifest = serde_json::from_slice(&manifest_bytes)?;
+        let mut collection: CollectionManifest = serde_json::from_slice(&manifest_bytes)?;
         collection.validate().map_err(invalid)?;
         if collection.id != id || collection.playlist_order.is_empty() {
             return Err(invalid("Invalid collection manifest"));
+        }
+        if !read_only && !temporary {
+            // Recover existing playlist pairs before resolving imported names.
+            for &playlist in &collection.playlist_order {
+                PlaylistStore::new(&paths, id, playlist).recover()?;
+            }
+            super::collections::inbox::import_pending(&paths, &mut collection)?;
+            super::collections::inbox::import_items(&paths, &collection, |_| true, |_| {})?;
         }
         let active = collection
             .active_playlist
@@ -899,6 +907,198 @@ impl Library {
         Ok(name)
     }
 
+    /// Import new playlists without replacing the live workspace or its drafts.
+    /// Existing slot indices remain stable. Only the collection owner may write.
+    pub fn poll_inbox(&mut self) -> io::Result<usize> {
+        if !self.writable || self.temporary || self.dirty {
+            return Ok(0);
+        }
+        let Some(storage) = self.storage.as_mut() else { return Ok(0) };
+        let inbox = storage.paths.collection_dir(storage.collection.id).join("inbox");
+        let entries = match fs::read_dir(inbox) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(err) => return Err(err),
+        };
+        let mut pending = false;
+        for entry in entries {
+            let entry = entry?;
+            if entry.path().extension().is_some_and(|ext| ext == "json" || ext == "items")
+                && entry.file_type()?.is_file()
+            {
+                pending = true;
+                break;
+            }
+        }
+        if !pending {
+            return Ok(0);
+        }
+        let result = (|| {
+            let disk: CollectionManifest =
+                serde_json::from_slice(&fs::read(storage.paths.collection_manifest(storage.collection.id))?)?;
+            if disk != storage.collection {
+                return Err(io::Error::other("Collection changed on disk; reopen before importing"));
+            }
+            let old_len = self.slots.len();
+            if !disk.playlist_order.iter().copied().eq(self.slots.iter().map(|slot| slot.id)) {
+                return Err(io::Error::other("Playlist order changed; reopen before importing"));
+            }
+            super::collections::inbox::import_pending(&storage.paths, &mut storage.collection)?;
+            let mut added = Vec::new();
+            for &id in &storage.collection.playlist_order[old_len..] {
+                let loaded = PlaylistStore::new(&storage.paths, storage.collection.id, id).load()?;
+                let manifest = &loaded.manifest;
+                let saved = Snapshot {
+                    sources: manifest.entries.iter().map(|entry| entry.source.clone()).collect(),
+                    ids: manifest.entries.iter().map(|entry| entry.id).collect(),
+                    custom_titles: manifest
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, entry)| entry.custom_title.clone().map(|title| (i, title)))
+                        .collect(),
+                    current: manifest.current.and_then(|id| manifest.entries.iter().position(|entry| entry.id == id)),
+                    position: manifest.position,
+                };
+                if loaded.externally_edited {
+                    return Err(io::Error::other("Imported playlist changed on disk"));
+                }
+                added.push(Slot {
+                    name: manifest.name.clone(),
+                    autosave: manifest.autosave,
+                    saved,
+                    id,
+                    stored: Some(loaded),
+                    dirty: false,
+                    draft: None,
+                });
+            }
+            let count = added.len();
+            self.slots.extend(added);
+            let eligible: std::collections::HashSet<_> = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(i, slot)| *i != self.active && !slot.dirty && slot.snapshot() == &slot.saved)
+                .map(|(_, slot)| slot.id)
+                .collect();
+            let imported = super::collections::inbox::import_items(
+                &storage.paths,
+                &storage.collection,
+                |id| eligible.contains(&id),
+                |loaded| {
+                    let manifest = &loaded.manifest;
+                    if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == manifest.id) {
+                        slot.saved = Snapshot {
+                            sources: manifest.entries.iter().map(|e| e.source.clone()).collect(),
+                            ids: manifest.entries.iter().map(|e| e.id).collect(),
+                            custom_titles: manifest
+                                .entries
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, e)| e.custom_title.clone().map(|t| (i, t)))
+                                .collect(),
+                            current: manifest.current.and_then(|id| manifest.entries.iter().position(|e| e.id == id)),
+                            position: manifest.position,
+                        };
+                        slot.draft = None;
+                        slot.stored = Some(loaded);
+                    }
+                },
+            )?;
+            Ok(count + imported)
+        })();
+        if result.is_err() {
+            // An import may have committed the collection before failing to load
+            // its slots. Never let a stale workspace overwrite that manifest.
+            self.writable = false;
+        }
+        result
+    }
+
+    pub fn inbox_playlist_choices(config: &Path, target: CollectionId) -> io::Result<Vec<(PlaylistId, String)>> {
+        let (paths, index, _lock) = Self::open_index(config, false)?;
+        if !index.collection_order.contains(&target) {
+            return Err(io::Error::other("Destination collection no longer exists"));
+        }
+        let collection = Self::read_collection(&paths, target)?;
+        collection
+            .playlist_order
+            .into_iter()
+            .map(|id| {
+                let manifest: PlaylistManifest =
+                    serde_json::from_slice(&fs::read(paths.playlist_manifest(target, id))?)?;
+                manifest.validate().map_err(io::Error::other)?;
+                if manifest.id != id {
+                    return Err(io::Error::other("Invalid destination playlist ID"));
+                }
+                Ok((id, manifest.name))
+            })
+            .collect()
+    }
+
+    pub fn queue_item_copy(
+        config: &Path,
+        collection: CollectionId,
+        target: PlaylistId,
+        source: &Snapshot,
+        indices: &[usize],
+    ) -> io::Result<()> {
+        if indices.is_empty()
+            || indices.iter().any(|&i| i >= source.sources.len())
+            || indices.windows(2).any(|w| w[0] >= w[1])
+        {
+            return Err(io::Error::other("Invalid playlist selection"));
+        }
+        let (paths, index, _lock) = Self::open_index(config, false)?;
+        if !index.collection_order.contains(&collection)
+            || !Self::read_collection(&paths, collection)?.playlist_order.contains(&target)
+        {
+            return Err(io::Error::other("Destination playlist no longer exists"));
+        }
+        let entries = indices
+            .iter()
+            .map(|&i| PlaylistEntry {
+                id: PlaylistItemId::new(),
+                source: source.sources[i].clone(),
+                custom_title: source.custom_titles.get(&i).cloned(),
+            })
+            .collect();
+        super::collections::inbox::enqueue_items(&paths, collection, target, entries)
+    }
+
+    pub fn queue_playlist_copy(
+        config: &Path,
+        target: CollectionId,
+        name: &str,
+        autosave: bool,
+        mut snapshot: Snapshot,
+    ) -> io::Result<()> {
+        if snapshot.ids.len() != snapshot.sources.len() {
+            return Err(io::Error::other("Invalid source playlist"));
+        }
+        snapshot.normalize();
+        let (paths, index, _index_lock) = Self::open_index(config, false)?;
+        if !index.collection_order.contains(&target) {
+            return Err(io::Error::other("Destination collection no longer exists"));
+        }
+        let mut manifest = PlaylistManifest::new(name.to_owned());
+        manifest.autosave = autosave;
+        manifest.entries = snapshot
+            .sources
+            .into_iter()
+            .enumerate()
+            .map(|(i, source)| PlaylistEntry {
+                id: PlaylistItemId::new(),
+                source,
+                custom_title: snapshot.custom_titles.get(&i).cloned(),
+            })
+            .collect();
+        manifest.current = snapshot.current.and_then(|i| manifest.entries.get(i).map(|entry| entry.id));
+        manifest.position = snapshot.position;
+        super::collections::inbox::enqueue(&paths, target, &manifest)
+    }
+
     /// Copy the live contents of a playlist into another, exclusively owned
     /// collection. The destination's active playlist is left unchanged.
     pub fn copy_playlist(&mut self, name: &str, autosave: bool, mut snapshot: Snapshot) -> io::Result<String> {
@@ -1227,6 +1427,112 @@ mod tests {
         assert!(restored.switch(1));
         assert_eq!(restored.snapshot(), &saved);
         drop(restored);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inbox_item_copy_defers_active_and_replays_without_duplicates() {
+        let root = std::env::temp_dir().join(format!("mavplayer-item-inbox-{}", uuid::Uuid::new_v4()));
+        let mut target = Library::open(&root).unwrap();
+        let collection = target.collection_id().unwrap();
+        let destination = target.slots[0].id;
+        let mut original = snapshot("existing.mp4", 12.0);
+        target.capture(original.clone(), true, true);
+        target.flush().unwrap();
+        let mut incoming = snapshot("incoming.mp4", 0.0);
+        incoming.custom_titles.insert(0, "Incoming title".into());
+        Library::queue_item_copy(&root, collection, destination, &incoming, &[0]).unwrap();
+        assert_eq!(target.poll_inbox().unwrap(), 0);
+        assert_eq!(target.snapshot(), &original);
+        target.create("Other".into());
+        target.flush().unwrap();
+        assert_eq!(target.poll_inbox().unwrap(), 1);
+        assert_eq!(target.poll_inbox().unwrap(), 0);
+        let copy_id = target.slots[0].saved.ids[1];
+        assert_ne!(copy_id, incoming.ids[0]);
+        original.sources.push(incoming.sources[0].clone());
+        original.ids.push(copy_id);
+        original.custom_titles.insert(1, "Incoming title".into());
+        assert_eq!(target.slots[0].saved, original);
+        let inbox = CollectionPaths::new(&root).collection_dir(collection).join("inbox");
+        let receipt = fs::read_dir(&inbox)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "items-done"))
+            .unwrap();
+        fs::rename(&receipt, receipt.with_extension("items")).unwrap();
+        assert_eq!(target.poll_inbox().unwrap(), 1);
+        assert_eq!(target.slots[0].saved, original);
+        drop(target);
+        let target = Library::open(&root).unwrap();
+        assert_eq!(target.slots[0].saved, original);
+        drop(target);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inbox_live_import_preserves_active_draft() {
+        let root = std::env::temp_dir().join(format!("mavplayer-live-inbox-{}", uuid::Uuid::new_v4()));
+        let mut target = Library::open(&root).unwrap();
+        let id = target.collection_id().unwrap();
+        target.set_autosave(false);
+        target.flush().unwrap();
+        let draft = snapshot("draft.mp4", 12.0);
+        target.capture(draft.clone(), false, false);
+        Library::queue_playlist_copy(&root, id, "Incoming", true, snapshot("incoming.mp4", 0.0)).unwrap();
+        assert_eq!(target.poll_inbox().unwrap(), 1);
+        assert_eq!(target.active, 0);
+        assert_eq!(target.snapshot(), &draft);
+        assert_eq!(target.slots.len(), 2);
+        assert_eq!(target.poll_inbox().unwrap(), 0);
+        target.flush().unwrap();
+        drop(target);
+        let target = Library::open(&root).unwrap();
+        assert_eq!(target.slots.len(), 2);
+        assert!(target.snapshot().sources.is_empty());
+        drop(target);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inbox_copy_while_locked_and_replay_after_commit() {
+        let root = std::env::temp_dir().join(format!("mavplayer-inbox-{}", uuid::Uuid::new_v4()));
+        let source = Library::open(&root).unwrap();
+        let target_id = Library::create_collection(&root, "Destination").unwrap();
+        let target = Library::open_selected(&root, Some(target_id), false).unwrap();
+        let mut original = snapshot("source.mp4", 10.0);
+        original.custom_titles.insert(0, "Custom title".into());
+        Library::queue_playlist_copy(&root, target_id, "Default playlist", true, original.clone()).unwrap();
+        assert_eq!(target.slots.len(), 1);
+        let reader = Library::open_selected(&root, Some(target_id), true).unwrap();
+        assert_eq!(reader.slots.len(), 1);
+        drop(reader);
+        drop(target);
+        let mut target = Library::open_selected(&root, Some(target_id), false).unwrap();
+        assert_eq!(target.slots.len(), 2);
+        assert_eq!(target.active, 0);
+        assert_eq!(target.slots[1].name, "Default playlist 2");
+        let copied_id = target.slots[1].id;
+        assert!(target.switch(1));
+        assert_eq!(target.snapshot().sources, original.sources);
+        assert_eq!(target.snapshot().custom_titles, original.custom_titles);
+        assert_ne!(target.snapshot().ids, original.ids);
+        drop(target);
+        let inbox = CollectionPaths::new(&root).collection_dir(target_id).join("inbox");
+        let request = inbox.join(format!("{copied_id}.json"));
+        let receipt = request.with_extension("done");
+        // Recreate the boundary after collection commit but before receipt.
+        fs::rename(&receipt, &request).unwrap();
+        let target = Library::open_selected(&root, Some(target_id), false).unwrap();
+        assert_eq!(target.slots.len(), 2);
+        assert!(receipt.exists());
+        drop(target);
+        fs::copy(&receipt, &request).unwrap();
+        let target = Library::open_selected(&root, Some(target_id), false).unwrap();
+        assert_eq!(target.slots.len(), 2);
+        assert!(!request.exists());
+        drop(target);
+        drop(source);
         fs::remove_dir_all(root).unwrap();
     }
 

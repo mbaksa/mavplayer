@@ -75,7 +75,7 @@ fn source_line(source: &MediaSource) -> io::Result<String> {
     Ok(line)
 }
 
-fn render_m3u(manifest: &PlaylistManifest) -> io::Result<Vec<u8>> {
+pub(super) fn render_m3u(manifest: &PlaylistManifest) -> io::Result<Vec<u8>> {
     let mut text = String::from("#EXTM3U\n");
     for entry in &manifest.entries {
         let line = source_line(&entry.source)?;

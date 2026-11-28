@@ -121,6 +121,7 @@ pub struct PlayerView {
     pub playlist: Playlist,
     pub(super) playlist_library: PlaylistLibrary,
     playlist_save_at: Instant,
+    inbox_poll_at: Instant,
     pub theme: Theme,
     pub focus: FocusHandle,
     pub(super) playlist_focus: FocusHandle,
@@ -532,6 +533,7 @@ impl PlayerView {
             playlist: Playlist::new(settings.repeat, settings.shuffle),
             playlist_library,
             playlist_save_at: Instant::now(),
+            inbox_poll_at: Instant::now(),
             show_playlist: settings.show_playlist,
             playlist_autohide_open: false,
             fs_playlist: settings.fullscreen_playlist_initially_visible(),
@@ -989,6 +991,19 @@ impl PlayerView {
             self.playlist_save_at = Instant::now();
             if self.playlist_library.autosave() || self.playlist_library.is_temporary() {
                 self.save_playlist_session(false, false);
+            }
+        }
+        // Keep open selectors stable; incoming playlists are appended only
+        // when no menu or dialog is using the current list of slots.
+        if self.inbox_poll_at.elapsed() >= Duration::from_secs(2) && self.menu.is_none() && self.dialog.is_none() {
+            self.inbox_poll_at = Instant::now();
+            match self.playlist_library.poll_inbox() {
+                Ok(0) => {}
+                Ok(count) => {
+                    self.osd(format!("Processed {count} collection inbox request(s)"), cx);
+                    changed = true;
+                }
+                Err(err) => self.osd(format!("Inbox import failed: {err}"), cx),
             }
         }
         if self.scrub.is_none() {
@@ -1771,6 +1786,57 @@ impl PlayerView {
                 self.osd(format!("Moved {count} playlist items"), cx);
             }
             Err(err) => self.osd(format!("Could not confirm playlist move: {err}"), cx),
+        }
+        cx.notify();
+    }
+
+    pub(super) fn queue_items_to_collection(
+        &mut self,
+        collection: crate::playlist::collections::CollectionId,
+        target: crate::playlist::collections::PlaylistId,
+        ids: &[u64],
+        cx: &mut Context<Self>,
+    ) {
+        let selected: std::collections::HashSet<_> = ids.iter().copied().collect();
+        let indices: Vec<_> = self
+            .playlist
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| selected.contains(&item.id).then_some(i))
+            .collect();
+        if indices.len() != selected.len() {
+            self.osd("Playlist selection changed; retry copying", cx);
+            return;
+        }
+        match PlaylistLibrary::queue_item_copy(
+            &crate::settings::config_dir(),
+            collection,
+            target,
+            &self.playlist_snapshot(),
+            &indices,
+        ) {
+            Ok(()) => self.osd(format!("Queued {} items for copying to destination playlist", indices.len()), cx),
+            Err(err) => self.osd(format!("Could not queue item copy: {err}"), cx),
+        }
+        cx.notify();
+    }
+
+    pub(super) fn queue_playlist_to_collection(
+        &mut self,
+        id: crate::playlist::collections::CollectionId,
+        cx: &mut Context<Self>,
+    ) {
+        let result = PlaylistLibrary::queue_playlist_copy(
+            &crate::settings::config_dir(),
+            id,
+            self.playlist_library.name(),
+            self.playlist_library.autosave(),
+            self.playlist_snapshot(),
+        );
+        match result {
+            Ok(()) => self.osd("Playlist copy queued in the destination collection inbox", cx),
+            Err(err) => self.osd(format!("Could not queue playlist copy: {err}"), cx),
         }
         cx.notify();
     }

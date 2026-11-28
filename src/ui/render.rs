@@ -2907,9 +2907,16 @@ impl PlayerView {
                 this.show_dialog(super::dialogs::Dialog::NamePlaylist(false), w, cx)
             }),
             M::Header("TRANSFER".into()),
-            M::action("Copy playlist to collection…", |this, w, cx| this.open_copy_playlist(false, w, cx)),
-            M::action("Move playlist to collection…", |this, w, cx| this.open_copy_playlist(true, w, cx))
-                .enabled(self.playlist_library.can_delete() && self.playlist_library.collection_id().is_some()),
+            M::action("Copy playlist to collection…", |this, w, cx| {
+                this.open_copy_playlist(super::menu::CopyChoice::Playlist, w, cx)
+            }),
+            M::action("Move playlist to collection…", |this, w, cx| {
+                this.open_copy_playlist(super::menu::CopyChoice::MovePlaylist, w, cx)
+            })
+            .enabled(self.playlist_library.can_delete() && self.playlist_library.collection_id().is_some()),
+            M::action("Send playlist to collection inbox…", |this, w, cx| {
+                this.open_copy_playlist(super::menu::CopyChoice::QueuePlaylist, w, cx)
+            }),
             M::Header("SAVE".into()),
             M::action("Save current playlist state", |this, _, cx| this.save_playlist_workspace(cx))
                 .icon(Icon::Save)
@@ -3143,6 +3150,10 @@ impl PlayerView {
             M::action("Move to playlist…", move |this, w, cx| this.open_move_items(moving.clone(), w, cx))
                 .enabled(self.playlist_library.writable && self.playlist_library.slots.len() > 1),
         );
+        let queued = ids.clone();
+        v.push(M::action("Copy to playlist in another collection…", move |this, w, cx| {
+            this.open_copy_playlist(super::menu::CopyChoice::QueueItems(queued.clone()), w, cx)
+        }));
         let can_representative = self.playlist.items.iter().any(|it| {
             ids.contains(&it.id)
                 && matches!(it.source, MediaSource::File(_))

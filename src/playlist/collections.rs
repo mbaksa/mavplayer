@@ -1,6 +1,7 @@
 //! Persistent identities and versioned manifests for local media collections.
 //! Storage, migration and cache management are deliberately separate from this model.
 
+pub(crate) mod inbox;
 pub(crate) mod storage;
 
 use crate::engine::MediaSource;

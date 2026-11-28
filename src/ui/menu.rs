@@ -103,6 +103,13 @@ pub(super) enum CopyChoice {
     MoveItems(Vec<u64>),
     Playlist,
     MovePlaylist,
+    QueuePlaylist,
+    QueueItems(Vec<u64>),
+    QueueItemsTarget(
+        Vec<u64>,
+        crate::playlist::collections::CollectionId,
+        Vec<crate::playlist::collections::PlaylistId>,
+    ),
 }
 
 pub struct OpenMenu {
@@ -545,7 +552,7 @@ impl PlayerView {
         self.open_copy_combo(combo, None, CopyChoice::MoveItems(ids), window, cx);
     }
 
-    pub(super) fn open_copy_playlist(&mut self, moving: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_copy_playlist(&mut self, choice: CopyChoice, window: &mut Window, cx: &mut Context<Self>) {
         let choices = match crate::playlist::session::Library::collection_choices(&crate::settings::config_dir()) {
             Ok(choices) => choices
                 .into_iter()
@@ -564,13 +571,7 @@ impl PlayerView {
             choices.iter().enumerate().map(|(i, (_, name))| (i, name.clone())),
             None,
         );
-        self.open_copy_combo(
-            combo,
-            Some(choices.into_iter().map(|(id, _)| id).collect()),
-            if moving { CopyChoice::MovePlaylist } else { CopyChoice::Playlist },
-            window,
-            cx,
-        );
+        self.open_copy_combo(combo, Some(choices.into_iter().map(|(id, _)| id).collect()), choice, window, cx);
     }
 
     fn open_copy_combo(
@@ -614,6 +615,43 @@ impl PlayerView {
                 CopyChoice::MovePlaylist => {
                     if let Some(Some(id)) = collection {
                         self.move_playlist_to_collection(id, window, cx);
+                    }
+                }
+                CopyChoice::QueuePlaylist => {
+                    if let Some(Some(id)) = collection {
+                        self.queue_playlist_to_collection(id, cx);
+                    }
+                }
+                CopyChoice::QueueItems(ids) => {
+                    if let Some(Some(id)) = collection {
+                        match crate::playlist::session::Library::inbox_playlist_choices(
+                            &crate::settings::config_dir(),
+                            id,
+                        ) {
+                            Ok(choices) => {
+                                let combo = super::search_combo::SearchCombo::new(
+                                    choices.iter().enumerate().map(|(i, (_, name))| (i, name.clone())),
+                                    None,
+                                );
+                                self.open_copy_combo(
+                                    combo,
+                                    None,
+                                    CopyChoice::QueueItemsTarget(
+                                        ids,
+                                        id,
+                                        choices.into_iter().map(|(id, _)| id).collect(),
+                                    ),
+                                    window,
+                                    cx,
+                                );
+                            }
+                            Err(err) => self.osd(format!("Could not list destination playlists: {err}"), cx),
+                        }
+                    }
+                }
+                CopyChoice::QueueItemsTarget(ids, collection, targets) => {
+                    if let Some(&target) = targets.get(index) {
+                        self.queue_items_to_collection(collection, target, &ids, cx);
                     }
                 }
                 CopyChoice::Playlist => {
