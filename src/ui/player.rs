@@ -995,9 +995,26 @@ impl PlayerView {
         }
         // Keep open selectors stable; incoming playlists are appended only
         // when no menu or dialog is using the current list of slots.
-        if self.inbox_poll_at.elapsed() >= Duration::from_secs(2) && self.menu.is_none() && self.dialog.is_none() {
+        if self.inbox_poll_at.elapsed() >= Duration::from_secs(2)
+            && self.menu.is_none()
+            && self.dialog.is_none()
+            && self.pl_drop.is_none()
+        {
             self.inbox_poll_at = Instant::now();
-            match self.playlist_library.poll_inbox() {
+            let mut active_added = Vec::new();
+            let result = self.playlist_library.poll_inbox(&mut active_added);
+            if !active_added.is_empty() {
+                let range = self.playlist.add(active_added.iter().map(|entry| entry.source.clone()).collect());
+                for (index, entry) in range.zip(active_added) {
+                    self.playlist.items[index].persistent_id = entry.id;
+                    self.playlist.items[index].custom_title = entry.custom_title;
+                }
+                let snapshot = self.playlist_snapshot();
+                self.playlist_library.capture(snapshot, false, false);
+                self.probe_playlist(cx);
+                changed = true;
+            }
+            match result {
                 Ok(0) => {}
                 Ok(count) => {
                     self.osd(format!("Processed {count} collection inbox request(s)"), cx);

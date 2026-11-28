@@ -909,7 +909,7 @@ impl Library {
 
     /// Import new playlists without replacing the live workspace or its drafts.
     /// Existing slot indices remain stable. Only the collection owner may write.
-    pub fn poll_inbox(&mut self) -> io::Result<usize> {
+    pub fn poll_inbox(&mut self, active_added: &mut Vec<PlaylistEntry>) -> io::Result<usize> {
         if !self.writable || self.temporary || self.dirty {
             return Ok(0);
         }
@@ -975,20 +975,39 @@ impl Library {
             }
             let count = added.len();
             self.slots.extend(added);
-            let eligible: std::collections::HashSet<_> = self
-                .slots
-                .iter()
-                .enumerate()
-                .filter(|(i, slot)| *i != self.active && !slot.dirty && slot.snapshot() == &slot.saved)
-                .map(|(_, slot)| slot.id)
-                .collect();
+            let active = self.active;
+            let slots = std::cell::RefCell::new(&mut self.slots);
             let imported = super::collections::inbox::import_items(
                 &storage.paths,
                 &storage.collection,
-                |id| eligible.contains(&id),
+                |loaded| {
+                    slots.borrow().iter().any(|slot| {
+                        slot.id == loaded.manifest.id
+                            && !slot.dirty
+                            && slot.stored.as_ref().is_some_and(|stored| stored.same_disk_version(loaded))
+                    })
+                },
                 |loaded| {
                     let manifest = &loaded.manifest;
-                    if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == manifest.id) {
+                    if let Some((index, slot)) =
+                        slots.borrow_mut().iter_mut().enumerate().find(|(_, slot)| slot.id == manifest.id)
+                    {
+                        let previous: std::collections::HashSet<_> = slot.saved.ids.iter().copied().collect();
+                        let appended: Vec<_> =
+                            manifest.entries.iter().filter(|e| !previous.contains(&e.id)).cloned().collect();
+                        if let Some(draft) = &mut slot.draft {
+                            for entry in &appended {
+                                let index = draft.sources.len();
+                                draft.sources.push(entry.source.clone());
+                                draft.ids.push(entry.id);
+                                if let Some(title) = &entry.custom_title {
+                                    draft.custom_titles.insert(index, title.clone());
+                                }
+                            }
+                        }
+                        if index == active {
+                            active_added.extend(appended);
+                        }
                         slot.saved = Snapshot {
                             sources: manifest.entries.iter().map(|e| e.source.clone()).collect(),
                             ids: manifest.entries.iter().map(|e| e.id).collect(),
@@ -1001,7 +1020,6 @@ impl Library {
                             current: manifest.current.and_then(|id| manifest.entries.iter().position(|e| e.id == id)),
                             position: manifest.position,
                         };
-                        slot.draft = None;
                         slot.stored = Some(loaded);
                     }
                 },
@@ -1431,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn inbox_item_copy_defers_active_and_replays_without_duplicates() {
+    fn inbox_item_copy_appends_active_and_replays_without_duplicates() {
         let root = std::env::temp_dir().join(format!("mavplayer-item-inbox-{}", uuid::Uuid::new_v4()));
         let mut target = Library::open(&root).unwrap();
         let collection = target.collection_id().unwrap();
@@ -1442,18 +1460,18 @@ mod tests {
         let mut incoming = snapshot("incoming.mp4", 0.0);
         incoming.custom_titles.insert(0, "Incoming title".into());
         Library::queue_item_copy(&root, collection, destination, &incoming, &[0]).unwrap();
-        assert_eq!(target.poll_inbox().unwrap(), 0);
-        assert_eq!(target.snapshot(), &original);
-        target.create("Other".into());
-        target.flush().unwrap();
-        assert_eq!(target.poll_inbox().unwrap(), 1);
-        assert_eq!(target.poll_inbox().unwrap(), 0);
+        let mut added = Vec::new();
+        assert_eq!(target.poll_inbox(&mut added).unwrap(), 1);
+        assert_eq!(added.len(), 1);
+        assert_eq!(target.snapshot().ids[1], added[0].id);
+        assert_eq!(target.poll_inbox(&mut Vec::new()).unwrap(), 0);
         let copy_id = target.slots[0].saved.ids[1];
         assert_ne!(copy_id, incoming.ids[0]);
         original.sources.push(incoming.sources[0].clone());
         original.ids.push(copy_id);
         original.custom_titles.insert(1, "Incoming title".into());
         assert_eq!(target.slots[0].saved, original);
+        assert_eq!(target.snapshot(), &original);
         let inbox = CollectionPaths::new(&root).collection_dir(collection).join("inbox");
         let receipt = fs::read_dir(&inbox)
             .unwrap()
@@ -1461,11 +1479,46 @@ mod tests {
             .find(|p| p.extension().is_some_and(|ext| ext == "items-done"))
             .unwrap();
         fs::rename(&receipt, receipt.with_extension("items")).unwrap();
-        assert_eq!(target.poll_inbox().unwrap(), 1);
+        let mut replayed = Vec::new();
+        assert_eq!(target.poll_inbox(&mut replayed).unwrap(), 1);
+        assert!(replayed.is_empty());
         assert_eq!(target.slots[0].saved, original);
         drop(target);
         let target = Library::open(&root).unwrap();
         assert_eq!(target.slots[0].saved, original);
+        drop(target);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inbox_item_copy_preserves_unsaved_active_draft() {
+        let root = std::env::temp_dir().join(format!("mavplayer-inbox-draft-{}", uuid::Uuid::new_v4()));
+        let mut target = Library::open(&root).unwrap();
+        let collection = target.collection_id().unwrap();
+        let destination = target.slots[0].id;
+        let saved = snapshot("saved.mp4", 12.0);
+        target.set_autosave(false);
+        target.capture(saved.clone(), true, true);
+        target.flush().unwrap();
+        let mut draft = snapshot("local-unsaved.mp4", 21.0);
+        draft.custom_titles.insert(0, "Local edit".into());
+        target.capture(draft.clone(), false, false);
+        let incoming = snapshot("incoming.mp4", 0.0);
+        Library::queue_item_copy(&root, collection, destination, &incoming, &[0]).unwrap();
+        let mut added = Vec::new();
+        assert_eq!(target.poll_inbox(&mut added).unwrap(), 1);
+        assert_eq!(added.len(), 1);
+        draft.sources.push(added[0].source.clone());
+        draft.ids.push(added[0].id);
+        assert_eq!(target.snapshot(), &draft);
+        let mut expected = saved;
+        expected.sources.push(added[0].source.clone());
+        expected.ids.push(added[0].id);
+        assert_eq!(target.slots[0].saved, expected);
+        target.flush().unwrap();
+        drop(target);
+        let target = Library::open(&root).unwrap();
+        assert_eq!(target.snapshot(), &expected);
         drop(target);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1480,11 +1533,11 @@ mod tests {
         let draft = snapshot("draft.mp4", 12.0);
         target.capture(draft.clone(), false, false);
         Library::queue_playlist_copy(&root, id, "Incoming", true, snapshot("incoming.mp4", 0.0)).unwrap();
-        assert_eq!(target.poll_inbox().unwrap(), 1);
+        assert_eq!(target.poll_inbox(&mut Vec::new()).unwrap(), 1);
         assert_eq!(target.active, 0);
         assert_eq!(target.snapshot(), &draft);
         assert_eq!(target.slots.len(), 2);
-        assert_eq!(target.poll_inbox().unwrap(), 0);
+        assert_eq!(target.poll_inbox(&mut Vec::new()).unwrap(), 0);
         target.flush().unwrap();
         drop(target);
         let target = Library::open(&root).unwrap();

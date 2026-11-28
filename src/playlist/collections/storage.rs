@@ -198,6 +198,12 @@ pub(crate) struct LoadedPlaylist {
     original_m3u: Vec<u8>,
 }
 
+impl LoadedPlaylist {
+    pub(crate) fn same_disk_version(&self, other: &Self) -> bool {
+        self.original_json == other.original_json && self.original_m3u == other.original_m3u
+    }
+}
+
 pub(crate) struct PlaylistStore {
     id: PlaylistId,
     json: PathBuf,

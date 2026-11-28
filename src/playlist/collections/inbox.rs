@@ -132,7 +132,7 @@ pub(crate) fn enqueue_items(
 pub(crate) fn import_items(
     paths: &CollectionPaths,
     collection: &CollectionManifest,
-    mut eligible: impl FnMut(super::PlaylistId) -> bool,
+    mut eligible: impl FnMut(&super::storage::LoadedPlaylist) -> bool,
     mut committed: impl FnMut(super::storage::LoadedPlaylist),
 ) -> io::Result<usize> {
     let inbox = paths.collection_dir(collection.id).join("inbox");
@@ -171,13 +171,13 @@ pub(crate) fn import_items(
         {
             continue;
         }
-        if !collection.playlist_order.contains(&request.target) || !eligible(request.target) {
+        if !collection.playlist_order.contains(&request.target) {
             continue;
         }
         let store = PlaylistStore::new(paths, collection.id, request.target);
         store.recover()?;
         let mut loaded = store.load()?;
-        if loaded.externally_edited {
+        if loaded.externally_edited || !eligible(&loaded) {
             continue;
         }
         let existing: std::collections::HashMap<_, _> = loaded.manifest.entries.iter().map(|e| (e.id, e)).collect();
