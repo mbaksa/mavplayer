@@ -3,6 +3,8 @@
 
 pub(crate) mod inbox;
 pub(crate) mod storage;
+pub(crate) mod transfer;
+pub(crate) mod watch;
 
 use crate::engine::MediaSource;
 use serde::{Deserialize, Serialize};

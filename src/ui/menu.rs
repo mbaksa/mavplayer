@@ -105,6 +105,12 @@ pub(super) enum CopyChoice {
     MovePlaylist,
     QueuePlaylist,
     QueueItems(Vec<u64>),
+    QueueMoveItems(Vec<u64>),
+    QueueMoveItemsTarget(
+        Vec<u64>,
+        crate::playlist::collections::CollectionId,
+        Vec<crate::playlist::collections::PlaylistId>,
+    ),
     QueueItemsTarget(
         Vec<u64>,
         crate::playlist::collections::CollectionId,
@@ -620,6 +626,38 @@ impl PlayerView {
                 CopyChoice::QueuePlaylist => {
                     if let Some(Some(id)) = collection {
                         self.queue_playlist_to_collection(id, cx);
+                    }
+                }
+                CopyChoice::QueueMoveItems(ids) => {
+                    if let Some(Some(id)) = collection {
+                        match crate::playlist::session::Library::inbox_playlist_choices(
+                            &crate::settings::config_dir(),
+                            id,
+                        ) {
+                            Ok(choices) => {
+                                let combo = super::search_combo::SearchCombo::new(
+                                    choices.iter().enumerate().map(|(i, (_, name))| (i, name.clone())),
+                                    None,
+                                );
+                                self.open_copy_combo(
+                                    combo,
+                                    None,
+                                    CopyChoice::QueueMoveItemsTarget(
+                                        ids,
+                                        id,
+                                        choices.into_iter().map(|(id, _)| id).collect(),
+                                    ),
+                                    window,
+                                    cx,
+                                );
+                            }
+                            Err(err) => self.osd(format!("Could not list destination playlists: {err}"), cx),
+                        }
+                    }
+                }
+                CopyChoice::QueueMoveItemsTarget(ids, collection, targets) => {
+                    if let Some(&target) = targets.get(index) {
+                        self.queue_move_items_to_collection(collection, target, &ids, cx);
                     }
                 }
                 CopyChoice::QueueItems(ids) => {

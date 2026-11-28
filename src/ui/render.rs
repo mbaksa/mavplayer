@@ -2898,10 +2898,40 @@ impl PlayerView {
                 }
                 Err(err) => {
                     items.push(M::Header("INBOX".into()));
-                    items.push(M::Header(format!("Cannot inspect inbox: {err}").into()));
+                    log::warn!("Could not inspect inbox: {err}");
+                    items.push(M::Header("Could not read pending copy requests".into()));
                 }
             }
-            items.push(M::action("Refresh inbox…", |this, w, cx| this.open_collection_settings(w, cx)));
+            for (inbound, heading) in [(true, "INCOMING MOVES"), (false, "OUTGOING MOVES")] {
+                match self.playlist_library.move_pending_summary(inbound) {
+                    Ok(requests) => {
+                        items.push(M::Header(format!("{heading} — {} pending", requests.len()).into()));
+                        for (label, status, id, can_cancel) in requests {
+                            items.push(M::Header(label.into()));
+                            items.push(M::Header(status.into()));
+                            if can_cancel {
+                                items.push(M::action(if inbound { "Reject move" } else { "Request cancellation" }, move |this, w, cx| {
+                                    match this.playlist_library.cancel_pending_move(inbound, id) {
+                                        Ok(true) => this.osd(if inbound { "Move rejected. The original items were kept." } else { "Cancellation requested. The destination must confirm it." }, cx),
+                                        Ok(false) => this.osd("Could not cancel this move because it is no longer waiting to be imported.", cx),
+                                        Err(err) => {
+                                            log::warn!("Could not cancel move {id}: {err}");
+                                            this.osd("Could not record the cancellation. The move may still finish; refresh transfers to check its status.", cx);
+                                        }
+                                    }
+                                    this.open_collection_settings(w, cx);
+                                }));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!("Could not inspect {heading}: {err}");
+                        items.push(M::Header(heading.into()));
+                        items.push(M::Header("Could not read pending move requests".into()));
+                    }
+                }
+            }
+            items.push(M::action("Refresh transfers…", |this, w, cx| this.open_collection_settings(w, cx)));
         }
         items
     }
@@ -3172,6 +3202,13 @@ impl PlayerView {
         v.push(M::action("Copy to playlist in another collection…", move |this, w, cx| {
             this.open_copy_playlist(super::menu::CopyChoice::QueueItems(queued.clone()), w, cx)
         }));
+        let moving = ids.clone();
+        v.push(
+            M::action("Move to playlist in another collection…", move |this, w, cx| {
+                this.open_copy_playlist(super::menu::CopyChoice::QueueMoveItems(moving.clone()), w, cx)
+            })
+            .enabled(self.playlist_library.writable && self.playlist_library.collection_id().is_some()),
+        );
         let can_representative = self.playlist.items.iter().any(|it| {
             ids.contains(&it.id)
                 && matches!(it.source, MediaSource::File(_))

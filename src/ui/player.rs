@@ -122,6 +122,7 @@ pub struct PlayerView {
     pub(super) playlist_library: PlaylistLibrary,
     playlist_save_at: Instant,
     inbox_poll_at: Instant,
+    last_transfer_notice: Option<String>,
     pub theme: Theme,
     pub focus: FocusHandle,
     pub(super) playlist_focus: FocusHandle,
@@ -534,6 +535,7 @@ impl PlayerView {
             playlist_library,
             playlist_save_at: Instant::now(),
             inbox_poll_at: Instant::now(),
+            last_transfer_notice: None,
             show_playlist: settings.show_playlist,
             playlist_autohide_open: false,
             fs_playlist: settings.fullscreen_playlist_initially_visible(),
@@ -993,34 +995,91 @@ impl PlayerView {
                 self.save_playlist_session(false, false);
             }
         }
-        // Keep open selectors stable; incoming playlists are appended only
-        // when no menu or dialog is using the current list of slots.
-        if self.inbox_poll_at.elapsed() >= Duration::from_secs(2)
-            && self.menu.is_none()
+        // A filesystem notification schedules transfer work on this existing
+        // tick. Keep selectors and drag operations stable until they close.
+        if self.menu.is_none()
             && self.dialog.is_none()
             && self.pl_drop.is_none()
+            && self.playlist_library.transfer_wakeup(self.inbox_poll_at.elapsed() >= Duration::from_secs(2))
         {
             self.inbox_poll_at = Instant::now();
             let mut active_added = Vec::new();
-            let result = self.playlist_library.poll_inbox(&mut active_added);
+            let copied = self.playlist_library.poll_inbox(&mut active_added);
             if !active_added.is_empty() {
-                let range = self.playlist.add(active_added.iter().map(|entry| entry.source.clone()).collect());
-                for (index, entry) in range.zip(active_added) {
-                    self.playlist.items[index].persistent_id = entry.id;
-                    self.playlist.items[index].custom_title = entry.custom_title;
-                }
-                let snapshot = self.playlist_snapshot();
-                self.playlist_library.capture(snapshot, false, false);
-                self.probe_playlist(cx);
+                self.append_inbox_items(active_added, cx);
                 changed = true;
             }
-            match result {
-                Ok(0) => {}
-                Ok(count) => {
-                    self.osd(format!("Processed {count} collection inbox request(s)"), cx);
-                    changed = true;
+            let mut moves = playlist::session::MoveProgress::default();
+            let result = if copied.is_ok() {
+                let live = self.playlist_snapshot();
+                self.playlist_library.poll_moves(&live, &mut moves)
+            } else {
+                Ok(())
+            };
+            if !moves.active_added.is_empty() {
+                self.append_inbox_items(std::mem::take(&mut moves.active_added), cx);
+                changed = true;
+            }
+            if !moves.active_removed.is_empty() {
+                let removed: std::collections::HashSet<_> = moves.active_removed.iter().copied().collect();
+                let ids: Vec<_> = self
+                    .playlist
+                    .items
+                    .iter()
+                    .filter(|item| removed.contains(&item.persistent_id))
+                    .map(|item| item.id)
+                    .collect();
+                self.remove_playlist_items(&ids, window, cx);
+                let snapshot = self.playlist_snapshot();
+                self.playlist_library.capture(snapshot, false, false);
+                changed = true;
+            }
+            let retry = self.playlist_library.has_pending_copies().unwrap_or(true) || moves.retry;
+            self.playlist_library.retry_transfers(retry);
+            let copied = match copied {
+                Ok(count) => count,
+                Err(err) => {
+                    log::warn!("Collection copy import failed: {err}");
+                    moves.notice = Some("Could not finish importing copies because the saved collection data could not be read, written or verified. Reopen this collection.".into());
+                    0
                 }
-                Err(err) => self.osd(format!("Inbox import failed: {err}"), cx),
+            };
+            if let Err(err) = result {
+                log::warn!("Collection move processing failed: {err}");
+                moves.notice = Some("Could not finish a collection move because the saved data could not be read, written or verified. Reopen this collection before trying again.".into());
+                changed = true;
+            }
+            if copied + moves.received + moves.finished > 0 {
+                changed = true;
+                if moves.notice.is_none() {
+                    let mut messages = Vec::new();
+                    if copied > 0 {
+                        messages.push(format!("Imported {copied} copy request{}", if copied == 1 { "" } else { "s" }));
+                    }
+                    if moves.received > 0 {
+                        messages.push(format!(
+                            "Received {0} move request{1}",
+                            moves.received,
+                            if moves.received == 1 { "" } else { "s" }
+                        ));
+                    }
+                    if moves.finished > 0 {
+                        messages.push(format!(
+                            "Completed {0} move{1}",
+                            moves.finished,
+                            if moves.finished == 1 { "" } else { "s" }
+                        ));
+                    }
+                    self.osd(messages.join(". "), cx);
+                }
+            }
+            if let Some(notice) = moves.notice {
+                if self.last_transfer_notice.as_ref() != Some(&notice) {
+                    self.osd(notice.clone(), cx);
+                    self.last_transfer_notice = Some(notice);
+                }
+            } else {
+                self.last_transfer_notice = None;
             }
         }
         if self.scrub.is_none() {
@@ -1590,6 +1649,17 @@ impl PlayerView {
         PlaylistSnapshot { sources, ids, custom_titles, current, position }
     }
 
+    fn append_inbox_items(&mut self, entries: Vec<playlist::collections::PlaylistEntry>, cx: &mut Context<Self>) {
+        let range = self.playlist.add(entries.iter().map(|entry| entry.source.clone()).collect());
+        for (index, entry) in range.zip(entries) {
+            self.playlist.items[index].persistent_id = entry.id;
+            self.playlist.items[index].custom_title = entry.custom_title;
+        }
+        let snapshot = self.playlist_snapshot();
+        self.playlist_library.capture(snapshot, false, false);
+        self.probe_playlist(cx);
+    }
+
     fn save_playlist_session(&mut self, exact: bool, manual: bool) {
         let snapshot = self.playlist_snapshot();
         self.playlist_library.capture(snapshot, exact, manual);
@@ -1669,7 +1739,10 @@ impl PlayerView {
                 self.playlist_library = next;
                 self.restore_playlist_workspace(window, cx);
             }
-            Err(err) => self.osd(format!("Could not switch collection: {err}"), cx),
+            Err(err) => {
+                log::warn!("Could not switch collection {id}: {err}");
+                self.osd(format!("Could not switch collection — {err}"), cx);
+            }
         }
     }
 
@@ -1839,6 +1912,44 @@ impl PlayerView {
         cx.notify();
     }
 
+    pub(super) fn queue_move_items_to_collection(
+        &mut self,
+        collection: crate::playlist::collections::CollectionId,
+        target: crate::playlist::collections::PlaylistId,
+        ids: &[u64],
+        cx: &mut Context<Self>,
+    ) {
+        let selected: std::collections::HashSet<_> = ids.iter().copied().collect();
+        let indices: Vec<_> = self
+            .playlist
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| selected.contains(&item.id).then_some(i))
+            .collect();
+        if indices.len() != selected.len() || indices.is_empty() {
+            self.osd("The selected items have changed; select them again.", cx);
+            return;
+        }
+        if self.playlist.current.is_some_and(|i| indices.contains(&i)) {
+            self.osd("Cannot move the selected items because one of them is currently open for playback.", cx);
+            return;
+        }
+        let snapshot = self.playlist_snapshot();
+        match self.playlist_library.queue_move(
+            collection,
+            crate::playlist::collections::transfer::MoveTarget::Playlist(target),
+            &snapshot,
+            &indices,
+        ) {
+            Ok(()) => {
+                self.osd("Move requested. The original items will remain until the destination confirms the move.", cx)
+            }
+            Err(err) => self.osd(format!("Could not request the move: {err}"), cx),
+        }
+        cx.notify();
+    }
+
     pub(super) fn queue_playlist_to_collection(
         &mut self,
         id: crate::playlist::collections::CollectionId,
@@ -1887,8 +1998,26 @@ impl PlayerView {
             return;
         }
         let snapshot = self.playlist_snapshot();
-        let result = PlaylistLibrary::open_for_switch(id)
-            .and_then(|mut target| self.playlist_library.move_playlist_to(&mut target, &snapshot));
+        let result = match PlaylistLibrary::open_for_switch(id) {
+            Ok(mut target) => self.playlist_library.move_playlist_to(&mut target, &snapshot),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                match self.playlist_library.queue_move(
+                    id,
+                    crate::playlist::collections::transfer::MoveTarget::Collection,
+                    &snapshot,
+                    &[],
+                ) {
+                    Ok(()) => self.osd(
+                        "Move requested. Switch to another playlist to finish moving this one after it is received.",
+                        cx,
+                    ),
+                    Err(err) => self.osd(format!("Could not request the playlist move: {err}"), cx),
+                }
+                cx.notify();
+                return;
+            }
+            Err(err) => Err(err),
+        };
         match result {
             Ok(name) => {
                 self.stop_after_playlist_save(window, cx);

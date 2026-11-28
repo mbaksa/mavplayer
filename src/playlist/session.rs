@@ -43,6 +43,58 @@ impl Snapshot {
         self.position = self.position.filter(|p| self.current.is_some() && p.is_finite() && *p >= 0.0);
     }
 
+    fn from_manifest(manifest: &PlaylistManifest) -> Self {
+        Self {
+            sources: manifest.entries.iter().map(|entry| entry.source.clone()).collect(),
+            ids: manifest.entries.iter().map(|entry| entry.id).collect(),
+            custom_titles: manifest
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, entry)| entry.custom_title.clone().map(|title| (i, title)))
+                .collect(),
+            current: manifest.current.and_then(|id| manifest.entries.iter().position(|entry| entry.id == id)),
+            position: manifest.position,
+        }
+    }
+
+    fn same_contents(&self, other: &Self) -> bool {
+        self.ids == other.ids && self.sources == other.sources && self.custom_titles == other.custom_titles
+    }
+
+    fn append_entries(&mut self, entries: &[PlaylistEntry]) {
+        for entry in entries {
+            let index = self.sources.len();
+            self.sources.push(entry.source.clone());
+            self.ids.push(entry.id);
+            if let Some(title) = &entry.custom_title {
+                self.custom_titles.insert(index, title.clone());
+            }
+        }
+    }
+
+    fn remove_entries(&mut self, ids: &[PlaylistItemId]) {
+        let removed: std::collections::HashSet<_> = ids.iter().copied().collect();
+        let current = self.current.and_then(|i| self.ids.get(i)).copied();
+        let mut next = Self::default();
+        for (i, (source, id)) in self.sources.iter().zip(&self.ids).enumerate() {
+            if removed.contains(id) {
+                continue;
+            }
+            let index = next.sources.len();
+            next.sources.push(source.clone());
+            next.ids.push(*id);
+            if let Some(title) = self.custom_titles.get(&i) {
+                next.custom_titles.insert(index, title.clone());
+            }
+            if current == Some(*id) {
+                next.current = Some(index);
+                next.position = self.position;
+            }
+        }
+        *self = next;
+    }
+
     fn needs_autosave(&self, saved: &Self) -> bool {
         self.ids != saved.ids
             || self.sources != saved.sources
@@ -86,6 +138,8 @@ impl Slot {
 struct CollectionStorage {
     paths: CollectionPaths,
     collection: CollectionManifest,
+    watch: Option<super::collections::watch::TransferWatch>,
+    retry_transfers: bool,
     _lock: File,
 }
 
@@ -104,6 +158,16 @@ impl CollectionRequest {
     pub fn is_explicit(self) -> bool {
         !matches!(self, Self::Default)
     }
+}
+
+#[derive(Default)]
+pub(crate) struct MoveProgress {
+    pub received: usize,
+    pub finished: usize,
+    pub active_added: Vec<PlaylistEntry>,
+    pub active_removed: Vec<PlaylistItemId>,
+    pub retry: bool,
+    pub notice: Option<String>,
 }
 
 pub(crate) struct Library {
@@ -223,7 +287,17 @@ impl Library {
                 .create(true)
                 .truncate(false)
                 .open(paths.collection_dir(id).join("collection.lock"))?;
-            lock.try_lock().map_err(|err| io::Error::other(format!("Collection {id} lock unavailable: {err}")))?;
+            match lock.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    let name = Self::read_collection(&paths, id)?.name;
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!("Collection \"{name}\" is already open in another window."),
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(err)) => return Err(err),
+            }
             Some(lock)
         };
         drop(index_lock);
@@ -301,7 +375,13 @@ impl Library {
         let collection_label =
             if read_only { format!("Read-only: {}", collection.name) } else { collection.name.clone() };
         Ok(Self {
-            storage: lock.map(|lock| CollectionStorage { paths, collection, _lock: lock }),
+            storage: lock.map(|lock| CollectionStorage {
+                paths,
+                collection,
+                watch: None,
+                retry_transfers: false,
+                _lock: lock,
+            }),
             collection_label,
             temporary,
             keep_session: false,
@@ -336,7 +416,13 @@ impl Library {
             .create(true)
             .truncate(false)
             .open(paths.collection_dir(id).join("collection.lock"))?;
-        lock.try_lock().map_err(|err| io::Error::other(format!("Session {id} lock unavailable: {err}")))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "This session is already open in another window"));
+            }
+            Err(std::fs::TryLockError::Error(err)) => return Err(err),
+        }
         Ok(lock)
     }
 
@@ -790,6 +876,21 @@ impl Library {
         Ok(copies.len())
     }
 
+    fn check_move_source(&self, playlist: PlaylistId, selected: Option<&[PlaylistItemId]>) -> io::Result<()> {
+        let Some(storage) = &self.storage else { return Err(io::Error::other("The source collection is unavailable")) };
+        use super::collections::transfer;
+        if transfer::requests(&storage.paths, storage.collection.id, false)?
+            .iter()
+            .any(|request| request.snapshot.id == playlist)
+        {
+            return Err(io::Error::other("A move from this playlist is already waiting to finish"));
+        }
+        if transfer::unfinished_import(&storage.paths, storage.collection.id, playlist, selected)? {
+            return Err(io::Error::other("These items were received in a previous move that has not finished yet"));
+        }
+        Ok(())
+    }
+
     pub fn move_items(&mut self, target: usize, source: &Snapshot, indices: &[usize]) -> io::Result<usize> {
         if !self.writable || target == self.active || target >= self.slots.len() || indices.is_empty() {
             return Err(io::Error::other("Invalid move destination or selection"));
@@ -802,8 +903,10 @@ impl Library {
             return Err(io::Error::other("Save both playlist edits before moving"));
         }
         if indices.iter().any(|&i| i >= source.ids.len()) || indices.windows(2).any(|w| w[0] >= w[1]) {
-            return Err(io::Error::other("Invalid move selection"));
+            return Err(io::Error::other("The selected items have changed; select them again"));
         }
+        let selected: Vec<_> = indices.iter().map(|&i| source.ids[i]).collect();
+        self.check_move_source(self.slots[self.active].id, Some(&selected))?;
         self.flush()?;
         let storage = self.storage.as_ref().ok_or_else(|| io::Error::other("Missing collection storage"))?;
         let src =
@@ -867,6 +970,19 @@ impl Library {
         {
             return Err(io::Error::other("Save source playlist edits before moving"));
         }
+        self.check_move_source(self.slots[self.active].id, None)?;
+        if let Some(destination) = &target.storage {
+            if super::collections::transfer::pending_source_overlaps(
+                &destination.paths,
+                destination.collection.id,
+                self.slots[self.active].id,
+                &snapshot.ids,
+            )? {
+                return Err(io::Error::other(
+                    "The destination collection is still finishing an earlier move involving this playlist",
+                ));
+            }
+        }
         self.capture(snapshot.clone(), true, true);
         self.flush()?;
         target.flush()?;
@@ -907,10 +1023,529 @@ impl Library {
         Ok(name)
     }
 
+    // Called by the transfer processor only for a saved, inactive source.
+    // Active playback and local drafts must remain untouched until the user
+    // switches playlists or saves their changes.
+    pub(crate) fn finish_inactive_playlist_move(
+        &mut self,
+        request: &super::collections::transfer::MoveRequest,
+    ) -> io::Result<bool> {
+        if !self.writable || self.temporary || self.dirty {
+            return Ok(false);
+        }
+        let Some(storage) = self.storage.as_mut() else { return Ok(false) };
+        if storage.collection.id != request.source {
+            return Ok(false);
+        }
+        let index = self.slots.iter().position(|slot| slot.id == request.snapshot.id);
+        if let Some(index) = index {
+            let slot = &self.slots[index];
+            if index == self.active
+                || self.slots.len() <= 1
+                || slot.dirty
+                || slot.snapshot() != &slot.saved
+                || !slot.stored.as_ref().is_some_and(|stored| stored.manifest == request.snapshot)
+            {
+                return Ok(false);
+            }
+        }
+        match request.cleanup_source_playlist(&storage.paths, &mut storage.collection) {
+            Ok(true) => {
+                if let Some(index) = index {
+                    if storage.collection.playlist_order.contains(&request.snapshot.id) {
+                        return Err(io::Error::other("Completed move still belongs to source collection"));
+                    }
+                    self.slots.remove(index);
+                    if index < self.active {
+                        self.active -= 1;
+                    }
+                }
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(err) => {
+                // The membership update may have reached disk before an I/O
+                // error. Do not let a stale workspace overwrite it.
+                self.writable = false;
+                Err(err)
+            }
+        }
+    }
+
+    /// A native watcher gates the existing UI tick; only unresolved requests
+    /// (or a platform without a native watcher) use the timer fallback.
+    pub(crate) fn transfer_wakeup(&mut self, fallback_due: bool) -> bool {
+        if !self.writable || self.temporary {
+            return false;
+        }
+        let Some(storage) = self.storage.as_mut() else { return false };
+        if storage.watch.is_none() {
+            storage.watch = Some(super::collections::watch::TransferWatch::new(
+                &storage.paths.collection_dir(storage.collection.id),
+            ));
+        }
+        storage.watch.as_mut().unwrap().ready(fallback_due) || (storage.retry_transfers && fallback_due)
+    }
+
+    pub(crate) fn retry_transfers(&mut self, retry: bool) {
+        if let Some(storage) = self.storage.as_mut() {
+            storage.retry_transfers = retry;
+        }
+    }
+
+    pub(crate) fn has_pending_copies(&self) -> io::Result<bool> {
+        let Some(storage) = &self.storage else { return Ok(false) };
+        let inbox = storage.paths.collection_dir(storage.collection.id).join("inbox");
+        let entries = match fs::read_dir(inbox) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if entry.path().extension().is_some_and(|ext| ext == "json" || ext == "items")
+                && entry.file_type()?.is_file()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Process both sides of immutable move requests. Only a saved source with
+    /// matching content and a durable destination receipt can be removed.
+    /// Runtime changes are returned even if a later request encounters an error.
+    pub(crate) fn poll_moves(&mut self, live: &Snapshot, progress: &mut MoveProgress) -> io::Result<()> {
+        use super::collections::transfer::{self, MoveTarget};
+        if !self.writable || self.temporary {
+            return Ok(());
+        }
+        let Some(storage) = self.storage.as_ref() else { return Ok(()) };
+        let incoming = transfer::requests(&storage.paths, storage.collection.id, true)?;
+        let outgoing = transfer::requests(&storage.paths, storage.collection.id, false)?;
+        if incoming.is_empty() && outgoing.is_empty() {
+            return Ok(());
+        }
+        if self.dirty {
+            progress.retry = true;
+            return Ok(());
+        }
+        let disk = Self::read_collection(&storage.paths, storage.collection.id)?;
+        if disk != storage.collection || !disk.playlist_order.iter().copied().eq(self.slots.iter().map(|slot| slot.id))
+        {
+            self.writable = false;
+            return Err(io::Error::other("Collection changed on disk; reopen it before processing transfers"));
+        }
+        let mut live = live.clone();
+        for request in incoming {
+            let storage = self.storage.as_mut().unwrap();
+            if request.rejected(&storage.paths)?
+                || (request.cancellation_requested(&storage.paths)?
+                    && !request.import_started(&storage.paths)?
+                    && !request.has_receipt(&storage.paths)?)
+            {
+                match request.reject(&storage.paths) {
+                    Ok(true) => {
+                        progress.notice = Some(format!(
+                            "Move from \"{}\" cancelled. The original items were kept.",
+                            request.snapshot.name
+                        ));
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        log::warn!("Could not confirm cancellation {}: {err}", request.id);
+                        progress.retry = true;
+                    }
+                }
+                continue;
+            }
+            // A committed receipt may precede the wake-up (e.g. after a crash).
+            // Do not re-import or require the original playlist to remain intact.
+            if request.has_receipt(&storage.paths)? {
+                if let Err(err) = request.notify_source(&storage.paths) {
+                    log::warn!("Could not deliver move receipt {}: {err}", request.id);
+                    progress.retry = true;
+                    progress.notice = Some(format!(
+                        "Received \"{}\", but could not notify the source collection yet.",
+                        request.snapshot.name
+                    ));
+                }
+                continue;
+            }
+            if request.destination_waits_for_previous_move(&storage.paths)? {
+                progress.notice = Some(format!(
+                    "Waiting to receive \"{}\" until an earlier move in this collection has finished.",
+                    request.snapshot.name
+                ));
+                progress.retry = true;
+                continue;
+            }
+            let id = match request.target {
+                MoveTarget::Collection => request.snapshot.id,
+                MoveTarget::Playlist(id) => id,
+            };
+            let started = request.import_started(&storage.paths)?;
+            let slot_index = self.slots.iter().position(|slot| slot.id == id);
+            if request.target == MoveTarget::Collection
+                && self.slots.iter().any(|slot| slot.id != id && slot.name.eq_ignore_ascii_case(&request.snapshot.name))
+            {
+                progress.notice = Some(format!(
+                    "Could not receive playlist \"{}\" because a playlist with that name already exists here.",
+                    request.snapshot.name
+                ));
+                progress.retry = true;
+                continue;
+            }
+            if matches!(request.target, MoveTarget::Playlist(_)) && slot_index.is_none() {
+                progress.notice = Some(format!(
+                    "Could not receive items from \"{}\" because the destination playlist no longer exists.",
+                    request.snapshot.name
+                ));
+                continue;
+            }
+            if !started
+                && ((request.target == MoveTarget::Collection
+                    && (slot_index.is_some()
+                        || storage.paths.playlist_manifest(storage.collection.id, id).try_exists()?
+                        || storage.paths.playlist_m3u8(storage.collection.id, id).try_exists()?))
+                    || (matches!(request.target, MoveTarget::Playlist(_))
+                        && slot_index.is_some_and(|index| {
+                            request.selected.iter().any(|id| self.slots[index].saved.ids.contains(id))
+                        })))
+            {
+                progress.notice = Some(format!(
+                    "Could not receive \"{}\" because this collection already contains the playlist or items being moved.",
+                    request.snapshot.name
+                ));
+                continue;
+            }
+            if let Some(index) = slot_index {
+                let slot = &self.slots[index];
+                if slot.dirty {
+                    progress.retry = true;
+                    continue;
+                }
+                let loaded = PlaylistStore::new(&storage.paths, storage.collection.id, id).load();
+                if !loaded.as_ref().is_ok_and(|loaded| {
+                    !loaded.externally_edited
+                        && slot.stored.as_ref().is_some_and(|stored| stored.same_disk_version(loaded))
+                }) {
+                    progress.notice = Some(format!(
+                        "Could not receive items in \"{}\" because the playlist has changed on disk. Reopen the collection.",
+                        slot.name
+                    ));
+                    continue;
+                }
+                if matches!(request.target, MoveTarget::Playlist(_)) {
+                    let draft = if index == self.active { &live } else { slot.snapshot() };
+                    if request.selected.iter().any(|id| draft.ids.contains(id) && !slot.saved.ids.contains(id)) {
+                        progress.notice = Some(format!(
+                            "Could not receive items in \"{}\" because an incoming item is already in its unsaved changes.",
+                            slot.name
+                        ));
+                        continue;
+                    }
+                }
+            }
+            let loaded = match request.import_destination(&storage.paths, &mut storage.collection) {
+                Ok(Some(loaded)) => loaded,
+                Ok(None) => continue,
+                Err(err) => {
+                    // A write may have reached disk before a later error. Do
+                    // not allow a stale workspace to overwrite recovered data.
+                    self.writable = false;
+                    return Err(err);
+                }
+            };
+            if let Some(index) = slot_index {
+                let slot = &mut self.slots[index];
+                let previous: std::collections::HashSet<_> = slot.saved.ids.iter().copied().collect();
+                let appended: Vec<_> =
+                    loaded.manifest.entries.iter().filter(|entry| !previous.contains(&entry.id)).cloned().collect();
+                if index == self.active {
+                    live.append_entries(&appended);
+                    slot.draft = Some(live.clone());
+                    progress.active_added.extend(appended);
+                } else if let Some(draft) = &mut slot.draft {
+                    draft.append_entries(&appended);
+                }
+                slot.saved = Snapshot::from_manifest(&loaded.manifest);
+                slot.stored = Some(loaded);
+            } else {
+                let manifest = &loaded.manifest;
+                self.slots.push(Slot {
+                    name: manifest.name.clone(),
+                    autosave: manifest.autosave,
+                    saved: Snapshot::from_manifest(manifest),
+                    id: manifest.id,
+                    stored: Some(loaded),
+                    dirty: false,
+                    draft: None,
+                });
+            }
+            progress.received += 1;
+            if let Err(err) = request.notify_source(&storage.paths) {
+                log::warn!("Could not deliver move receipt {}: {err}", request.id);
+                progress.retry = true;
+                progress.notice = Some(format!(
+                    "Received \"{}\", but could not notify the source collection yet.",
+                    request.snapshot.name
+                ));
+            }
+        }
+        for request in outgoing {
+            let storage = self.storage.as_ref().unwrap();
+            if request.rejected(&storage.paths)? {
+                continue;
+            }
+            if !request.has_receipt(&storage.paths)? {
+                // Publication is idempotent and can resume after a crash. A
+                // successful publication waits for the destination's wake-up,
+                // not for another scan of the remote receipt every two seconds.
+                if let Err(err) = request.ensure_published(&storage.paths) {
+                    log::warn!("Could not send move request {}: {err}", request.id);
+                    progress.notice = Some(format!(
+                        "Could not send the move request for \"{}\". The original playlist is still here.",
+                        request.snapshot.name
+                    ));
+                    progress.retry = true;
+                }
+                continue;
+            }
+            let index = self.slots.iter().position(|slot| slot.id == request.snapshot.id);
+            if let Some(index) = index {
+                let slot = &self.slots[index];
+                let draft = if index == self.active { &live } else { slot.snapshot() };
+                if slot.dirty || !draft.same_contents(&slot.saved) {
+                    progress.notice = Some(format!(
+                        "Could not finish moving \"{}\" because it has unsaved changes. The original playlist was kept.",
+                        slot.name
+                    ));
+                    progress.retry = true;
+                    continue;
+                }
+                let expected_after = if matches!(request.target, MoveTarget::Playlist(_)) {
+                    Some(request.expected_source_after_items()?)
+                } else {
+                    None
+                };
+                if !slot.stored.as_ref().is_some_and(|stored| {
+                    stored.manifest == request.snapshot || expected_after.as_ref() == Some(&stored.manifest)
+                }) {
+                    progress.notice = Some(format!(
+                        "Could not finish moving \"{}\" because the source playlist changed after the request. The original playlist was kept.",
+                        slot.name
+                    ));
+                    continue;
+                }
+                let loaded = PlaylistStore::new(&storage.paths, storage.collection.id, slot.id).load();
+                if !loaded.as_ref().is_ok_and(|loaded| {
+                    !loaded.externally_edited
+                        && slot.stored.as_ref().is_some_and(|stored| stored.same_disk_version(loaded))
+                }) {
+                    progress.notice = Some(format!(
+                        "Could not finish moving \"{}\" because the source playlist changed on disk. The original playlist was kept.",
+                        slot.name
+                    ));
+                    continue;
+                }
+            }
+            match request.target {
+                MoveTarget::Collection => {
+                    if index == Some(self.active) || (index.is_some() && self.slots.len() <= 1) {
+                        progress.notice = Some(format!(
+                            "Playlist \"{}\" was received. Switch to another playlist to finish moving it.",
+                            request.snapshot.name
+                        ));
+                        progress.retry = true;
+                        continue;
+                    }
+                    if let Some(index) = index {
+                        if self.slots[index].snapshot() != &self.slots[index].saved {
+                            progress.notice = Some(format!(
+                                "Could not finish moving \"{}\" because its playback state has unsaved changes.",
+                                request.snapshot.name
+                            ));
+                            progress.retry = true;
+                            continue;
+                        }
+                    }
+                    if self.finish_inactive_playlist_move(&request)? {
+                        progress.finished += 1;
+                    } else {
+                        progress.retry = true;
+                    }
+                }
+                MoveTarget::Playlist(_) => {
+                    let Some(index) = index else {
+                        progress.notice = Some(format!(
+                            "Could not finish moving items because the source playlist \"{}\" no longer exists.",
+                            request.snapshot.name
+                        ));
+                        continue;
+                    };
+                    let draft = if index == self.active { &live } else { self.slots[index].snapshot() };
+                    if index == self.active
+                        && draft.current.and_then(|i| draft.ids.get(i)).is_some_and(|id| request.selected.contains(id))
+                    {
+                        progress.notice = Some(format!(
+                            "Could not finish moving items from \"{}\" because one is currently open for playback. Open another item first.",
+                            request.snapshot.name
+                        ));
+                        progress.retry = true;
+                        continue;
+                    }
+                    let result = request.cleanup_source_items(&storage.paths).and_then(|done| {
+                        if !done {
+                            return Ok(None);
+                        }
+                        PlaylistStore::new(&storage.paths, storage.collection.id, request.snapshot.id).load().map(Some)
+                    });
+                    let loaded = match result {
+                        Ok(Some(loaded)) => loaded,
+                        Ok(None) => continue,
+                        Err(err) => {
+                            self.writable = false;
+                            return Err(err);
+                        }
+                    };
+                    let slot = &mut self.slots[index];
+                    let removed: Vec<_> =
+                        slot.saved.ids.iter().copied().filter(|id| request.selected.contains(id)).collect();
+                    if index == self.active {
+                        live.remove_entries(&request.selected);
+                        slot.draft = Some(live.clone());
+                        progress.active_removed.extend(removed);
+                    } else if let Some(draft) = &mut slot.draft {
+                        draft.remove_entries(&request.selected);
+                    }
+                    slot.saved = Snapshot::from_manifest(&loaded.manifest);
+                    slot.stored = Some(loaded);
+                    progress.finished += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Inspect pending moves without importing, acknowledging or removing anything.
+    pub fn move_pending_summary(&self, inbound: bool) -> io::Result<Vec<(String, String, uuid::Uuid, bool)>> {
+        use super::collections::transfer::{self, MoveTarget};
+        let Some(storage) = self.storage.as_ref().filter(|_| !self.temporary) else { return Ok(Vec::new()) };
+        let paths = &storage.paths;
+        let mut rows = Vec::new();
+        for request in transfer::requests(paths, storage.collection.id, inbound)? {
+            let other = if inbound { request.source } else { request.destination };
+            let other_name =
+                Self::read_collection(paths, other).map(|c| c.name).unwrap_or_else(|_| "Unavailable collection".into());
+            let direction = if inbound { "from" } else { "to" };
+            let label = match request.target {
+                MoveTarget::Collection => {
+                    format!("Move playlist \"{}\" {direction} {other_name}", request.snapshot.name)
+                }
+                MoveTarget::Playlist(_) => format!(
+                    "Move {} item(s) {direction} {other_name} (source: {})",
+                    request.selected.len(),
+                    request.snapshot.name
+                ),
+            };
+            let receipt = match request.has_receipt(paths) {
+                Ok(receipt) => receipt,
+                Err(err) => {
+                    log::warn!("Could not inspect move confirmation {}: {err}", request.id);
+                    rows.push((
+                        label,
+                        "Could not verify that the destination saved the move. The original items will be kept.".into(),
+                        request.id,
+                        false,
+                    ));
+                    continue;
+                }
+            };
+            let started = request.import_started(paths)?;
+            let cancelling = request.cancellation_requested(paths)?;
+            let rejected = request.rejected(paths)?;
+            let can_cancel = self.writable && !receipt && !started && !rejected && (inbound || !cancelling);
+            let status = if rejected {
+                "Move rejected; waiting to notify the source collection"
+            } else if cancelling && !receipt && !started {
+                "Cancellation requested; waiting for the destination to confirm"
+            } else if !self.writable {
+                "Waiting for this collection to be opened for editing"
+            } else if self.dirty {
+                "Waiting for collection changes to be saved"
+            } else if inbound {
+                if receipt {
+                    "Items saved; waiting to notify the source collection"
+                } else if request.target == MoveTarget::Collection
+                    && self.slots.iter().any(|slot| {
+                        slot.id != request.snapshot.id && slot.name.eq_ignore_ascii_case(&request.snapshot.name)
+                    })
+                {
+                    "A playlist with this name already exists here"
+                } else if let MoveTarget::Playlist(id) = request.target {
+                    match self.slots.iter().find(|slot| slot.id == id) {
+                        None => "The destination playlist no longer exists",
+                        Some(slot) if slot.dirty => "Waiting for destination playlist changes to be saved",
+                        Some(_) => "Waiting for automatic processing",
+                    }
+                } else {
+                    "Waiting for automatic processing"
+                }
+            } else if !receipt {
+                if !paths.collection_manifest(request.destination).is_file() {
+                    "The destination collection is unavailable; the original items are kept"
+                } else {
+                    "Waiting for the destination to save the move"
+                }
+            } else if let Some(index) = self.slots.iter().position(|slot| slot.id == request.snapshot.id) {
+                let slot = &self.slots[index];
+                if slot.dirty || !slot.snapshot().same_contents(&slot.saved) {
+                    "The destination saved the move, but the original playlist has unsaved changes"
+                } else if !slot.stored.as_ref().is_some_and(|stored| {
+                    stored.manifest == request.snapshot
+                        || request.expected_source_after_items().is_ok_and(|after| stored.manifest == after)
+                }) {
+                    "The original playlist changed after the move was requested; it has been kept"
+                } else if index == self.active && request.target == MoveTarget::Collection {
+                    "The destination saved the playlist; switch to another playlist to finish moving it"
+                } else if index == self.active
+                    && slot
+                        .snapshot()
+                        .current
+                        .and_then(|i| slot.snapshot().ids.get(i))
+                        .is_some_and(|id| request.selected.contains(id))
+                {
+                    "One of the items is open for playback; open another item to finish moving it"
+                } else {
+                    "The destination saved the move; waiting to remove the original items"
+                }
+            } else {
+                "The destination saved the move; waiting to verify source removal"
+            };
+            rows.push((label, status.into(), request.id, can_cancel));
+        }
+        Ok(rows)
+    }
+
+    pub fn cancel_pending_move(&mut self, inbound: bool, id: uuid::Uuid) -> io::Result<bool> {
+        if !self.writable || self.temporary {
+            return Ok(false);
+        }
+        let Some(storage) = self.storage.as_mut() else { return Ok(false) };
+        let Some(request) = super::collections::transfer::requests(&storage.paths, storage.collection.id, inbound)?
+            .into_iter()
+            .find(|request| request.id == id)
+        else {
+            return Ok(false);
+        };
+        if inbound { request.reject(&storage.paths) } else { request.request_cancel(&storage.paths) }
+    }
+
     pub fn inbox_pending_summary(&self) -> io::Result<Vec<(String, String)>> {
         let Some(storage) = self.storage.as_ref().filter(|_| !self.temporary) else { return Ok(Vec::new()) };
         let ready = if !self.writable {
-            "Waiting for writable collection owner"
+            "Waiting for this collection to be opened for editing"
         } else if self.dirty {
             "Waiting for collection changes to be saved"
         } else {
@@ -921,7 +1556,7 @@ impl Library {
             storage.collection.id,
             |target| {
                 let Some(slot) = self.slots.iter().find(|slot| slot.id == target) else {
-                    return (target.to_string(), "Destination playlist not in current collection snapshot".into());
+                    return (target.to_string(), "The destination playlist is no longer in this collection".into());
                 };
                 let status = if !self.writable || self.dirty {
                     ready.into()
@@ -936,7 +1571,10 @@ impl Library {
                             ready.into()
                         }
                         Ok(_) => "Destination playlist changed on disk".into(),
-                        Err(err) => format!("Destination unavailable: {err}"),
+                        Err(err) => {
+                            log::warn!("Could not read destination playlist {target}: {err}");
+                            "Could not read the saved destination playlist".into()
+                        }
                     }
                 };
                 (slot.name.clone(), status)
@@ -1091,6 +1729,68 @@ impl Library {
                 Ok((id, manifest.name))
             })
             .collect()
+    }
+
+    /// Stage a cross-instance move without changing either playlist. The source
+    /// owner must later finish it only after a matching durable receipt.
+    pub(crate) fn queue_move(
+        &mut self,
+        destination: CollectionId,
+        target: super::collections::transfer::MoveTarget,
+        snapshot: &Snapshot,
+        indices: &[usize],
+    ) -> io::Result<()> {
+        use super::collections::transfer::{MoveRequest, MoveTarget};
+        if !self.writable || self.temporary {
+            return Err(io::Error::other("The source collection must be open for editing"));
+        }
+        if matches!(target, MoveTarget::Collection) && self.slots.len() < 2 {
+            return Err(io::Error::other("Cannot move the last playlist in a collection"));
+        }
+        let saved = &self.slots[self.active].saved;
+        if snapshot.sources != saved.sources
+            || snapshot.ids != saved.ids
+            || snapshot.custom_titles != saved.custom_titles
+        {
+            return Err(io::Error::other("Save the source playlist before moving"));
+        }
+        if matches!(target, MoveTarget::Playlist(_))
+            && (indices.is_empty()
+                || indices.iter().any(|&i| i >= snapshot.ids.len())
+                || indices.windows(2).any(|w| w[0] >= w[1]))
+        {
+            return Err(io::Error::other("The selected items have changed; select them again"));
+        }
+        let storage = self.storage.as_ref().ok_or_else(|| io::Error::other("The source collection is unavailable"))?;
+        if destination == storage.collection.id {
+            return Err(io::Error::other("Choose another collection"));
+        }
+        let dest = Self::read_collection(&storage.paths, destination)?;
+        if let MoveTarget::Playlist(id) = target {
+            if !dest.playlist_order.contains(&id) {
+                return Err(io::Error::other("The destination playlist no longer exists"));
+            }
+        }
+        let selected: Vec<_> = if matches!(target, MoveTarget::Collection) {
+            Vec::new()
+        } else {
+            indices.iter().map(|&i| snapshot.ids[i]).collect()
+        };
+        self.check_move_source(
+            self.slots[self.active].id,
+            if matches!(target, MoveTarget::Collection) { None } else { Some(&selected) },
+        )?;
+        self.capture(snapshot.clone(), true, true);
+        self.flush()?;
+        let storage = self.storage.as_ref().unwrap();
+        let loaded = self.slots[self.active]
+            .stored
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Save the source playlist before moving"))?;
+        let request = MoveRequest::new(storage.collection.id, destination, target, loaded.manifest.clone(), selected)?;
+        request.stage(&storage.paths, loaded)?;
+        // If publication fails, the durable source intent remains available for retry.
+        request.publish(&storage.paths)
     }
 
     pub fn queue_item_copy(
@@ -1599,6 +2299,208 @@ mod tests {
         assert_eq!(target.slots.len(), 2);
         assert!(target.snapshot().sources.is_empty());
         drop(target);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn move_protocol_queue_preserves_source_and_rejects_duplicate() {
+        use super::super::collections::transfer::{MoveRequest, MoveTarget};
+        let root = std::env::temp_dir().join(format!("mavplayer-move-queue-{}", uuid::Uuid::new_v4()));
+        let mut source = Library::open(&root).unwrap();
+        let source_id = source.collection_id().unwrap();
+        let destination = Library::create_collection(&root, "Destination").unwrap();
+        let target = Library::open_selected(&root, Some(destination), false).unwrap();
+        let original = snapshot("source.mp4", 10.0);
+        source.capture(original.clone(), true, true);
+        source.flush().unwrap();
+        let choice = MoveTarget::Playlist(target.slots[0].id);
+        source.queue_move(destination, choice, &original, &[0]).unwrap();
+        assert_eq!(source.snapshot(), &original);
+        assert!(source.queue_move(destination, choice, &original, &[0]).is_err());
+        let paths = CollectionPaths::new(&root);
+        let outbox = paths.collection_dir(source_id).join("outbox");
+        let path = fs::read_dir(outbox)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "move"))
+            .unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let request: MoveRequest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(request.selected, original.ids);
+        assert_eq!(
+            fs::read(paths.collection_dir(destination).join("inbox").join(path.file_name().unwrap())).unwrap(),
+            bytes
+        );
+        assert!(target.snapshot().sources.is_empty());
+        let outgoing = source.move_pending_summary(false).unwrap();
+        assert_eq!(outgoing.len(), 1);
+        assert!(outgoing[0].0.contains("Destination"));
+        assert!(outgoing[0].1.contains("Waiting for the destination"));
+        assert_eq!(target.move_pending_summary(true).unwrap().len(), 1);
+        assert_eq!(source.move_pending_summary(false).unwrap(), outgoing);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(source.snapshot(), &original);
+        assert!(target.snapshot().sources.is_empty());
+        drop(target);
+        drop(source);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn move_protocol_live_item_transfer_preserves_drafts_and_current_item() {
+        use super::super::collections::transfer::MoveTarget;
+        let root = std::env::temp_dir().join(format!("mavplayer-live-move-{}", uuid::Uuid::new_v4()));
+        let mut source = Library::open(&root).unwrap();
+        let source_id = source.collection_id().unwrap();
+        let destination = Library::create_collection(&root, "Destination").unwrap();
+        let mut target = Library::open_selected(&root, Some(destination), false).unwrap();
+        let mut original = snapshot("playing.mp4", 10.0);
+        let moving = snapshot("moving.mp4", 0.0);
+        original.sources.push(moving.sources[0].clone());
+        original.ids.push(moving.ids[0]);
+        original.custom_titles.insert(1, "Moved title".into());
+        source.capture(original.clone(), true, true);
+        source.flush().unwrap();
+        let saved = snapshot("destination.mp4", 20.0);
+        target.set_autosave(false);
+        target.capture(saved.clone(), true, true);
+        target.flush().unwrap();
+        let mut draft = snapshot("unsaved.mp4", 30.0);
+        target.capture(draft.clone(), false, false);
+        source.queue_move(destination, MoveTarget::Playlist(target.slots[0].id), &original, &[1]).unwrap();
+        let mut before = MoveProgress::default();
+        source.poll_moves(&original, &mut before).unwrap();
+        assert_eq!(before.finished, 0);
+        assert_eq!(source.snapshot(), &original);
+        let mut received = MoveProgress::default();
+        target.poll_moves(&draft, &mut received).unwrap();
+        assert_eq!(received.received, 1);
+        assert_eq!(received.active_added.len(), 1);
+        assert_eq!(received.active_added[0].id, moving.ids[0]);
+        assert_eq!(received.active_added[0].custom_title.as_deref(), Some("Moved title"));
+        draft.append_entries(&received.active_added);
+        assert_eq!(target.snapshot(), &draft);
+        assert_eq!(target.slots[0].saved.ids, vec![saved.ids[0], moving.ids[0]]);
+        // A newly received identity cannot be moved again until the previous
+        // source has finished, even when the recipient is already saved.
+        assert!(target.check_move_source(target.slots[0].id, Some(&moving.ids)).is_err());
+        let paths = CollectionPaths::new(&root);
+        let outbox = paths.collection_dir(source_id).join("outbox");
+        let request_path = fs::read_dir(&outbox)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "move"))
+            .unwrap();
+        assert!(request_path.with_extension("move-ack").is_file());
+        assert!(!request_path.with_extension("source-done").exists());
+        let mut done = MoveProgress::default();
+        source.poll_moves(&original, &mut done).unwrap();
+        assert_eq!(done.finished, 1);
+        assert_eq!(done.active_removed, moving.ids);
+        assert_eq!(source.snapshot().ids, vec![original.ids[0]]);
+        assert_eq!(source.snapshot().current, Some(0));
+        assert_eq!(source.snapshot().position, Some(10.0));
+        assert!(request_path.with_extension("source-done").is_file());
+        assert!(target.check_move_source(target.slots[0].id, Some(&moving.ids)).is_ok());
+        let mut replay = MoveProgress::default();
+        let live = source.snapshot().clone();
+        source.poll_moves(&live, &mut replay).unwrap();
+        assert_eq!(replay.finished, 0);
+        target.poll_moves(&draft, &mut replay).unwrap();
+        assert_eq!(replay.received, 0);
+        assert_eq!(target.snapshot(), &draft);
+        drop(target);
+        drop(source);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn move_protocol_live_playlist_roundtrip_waits_for_source_switch() {
+        use super::super::collections::transfer::MoveTarget;
+        let root = std::env::temp_dir().join(format!("mavplayer-live-playlist-move-{}", uuid::Uuid::new_v4()));
+        let mut source = Library::open(&root).unwrap();
+        let source_id = source.collection_id().unwrap();
+        let destination = Library::create_collection(&root, "Destination").unwrap();
+        let mut target = Library::open_selected(&root, Some(destination), false).unwrap();
+        source.create("Movies".into());
+        let original = snapshot("movie.mp4", 5.0);
+        source.capture(original.clone(), true, true);
+        source.flush().unwrap();
+        let id = source.slots[source.active].id;
+        source.queue_move(destination, MoveTarget::Collection, &original, &[]).unwrap();
+        let mut received = MoveProgress::default();
+        let live = target.snapshot().clone();
+        target.poll_moves(&live, &mut received).unwrap();
+        assert_eq!(received.received, 1);
+        assert_eq!(target.slots[1].id, id);
+        assert_eq!(target.slots[1].saved, original);
+        assert!(target.check_move_source(id, None).is_err());
+        let mut waiting = MoveProgress::default();
+        source.poll_moves(&original, &mut waiting).unwrap();
+        assert_eq!(waiting.finished, 0);
+        assert!(waiting.retry);
+        assert!(source.switch(0));
+        source.flush().unwrap();
+        let mut done = MoveProgress::default();
+        let live = source.snapshot().clone();
+        source.poll_moves(&live, &mut done).unwrap();
+        assert_eq!(done.finished, 1);
+        assert_eq!(source.slots.len(), 1);
+        let paths = CollectionPaths::new(&root);
+        assert!(!paths.playlist_manifest(source_id, id).exists());
+        assert!(!paths.playlist_m3u8(source_id, id).exists());
+        assert!(target.switch(1));
+        target.flush().unwrap();
+        target.queue_move(source_id, MoveTarget::Collection, &original, &[]).unwrap();
+        let mut returned = MoveProgress::default();
+        let live = source.snapshot().clone();
+        source.poll_moves(&live, &mut returned).unwrap();
+        assert_eq!(returned.received, 1);
+        assert_eq!(source.slots[1].id, id);
+        assert_eq!(source.slots[1].saved, original);
+        assert!(target.switch(0));
+        target.flush().unwrap();
+        let mut final_cleanup = MoveProgress::default();
+        let live = target.snapshot().clone();
+        target.poll_moves(&live, &mut final_cleanup).unwrap();
+        assert_eq!(final_cleanup.finished, 1);
+        assert_eq!(target.slots.len(), 1);
+        assert!(!paths.playlist_manifest(destination, id).exists());
+        assert!(paths.playlist_manifest(source_id, id).is_file());
+        drop(target);
+        drop(source);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn move_protocol_live_changed_source_is_not_removed() {
+        use super::super::collections::transfer::MoveTarget;
+        let root = std::env::temp_dir().join(format!("mavplayer-live-move-conflict-{}", uuid::Uuid::new_v4()));
+        let mut source = Library::open(&root).unwrap();
+        let destination = Library::create_collection(&root, "Destination").unwrap();
+        let mut target = Library::open_selected(&root, Some(destination), false).unwrap();
+        let mut original = snapshot("movie.mp4", 5.0);
+        original.current = None;
+        original.position = None;
+        source.capture(original.clone(), true, true);
+        source.flush().unwrap();
+        source.queue_move(destination, MoveTarget::Playlist(target.slots[0].id), &original, &[0]).unwrap();
+        let mut changed = original.clone();
+        changed.custom_titles.insert(0, "New title".into());
+        source.capture(changed.clone(), true, true);
+        source.flush().unwrap();
+        let mut received = MoveProgress::default();
+        let live = target.snapshot().clone();
+        target.poll_moves(&live, &mut received).unwrap();
+        assert_eq!(received.received, 1);
+        let mut done = MoveProgress::default();
+        source.poll_moves(&changed, &mut done).unwrap();
+        assert_eq!(done.finished, 0);
+        assert!(done.notice.as_deref().is_some_and(|notice| notice.contains("source playlist changed")));
+        assert_eq!(source.snapshot(), &changed);
+        assert!(source.writable);
+        drop(target);
+        drop(source);
         fs::remove_dir_all(root).unwrap();
     }
 
