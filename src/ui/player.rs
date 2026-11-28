@@ -20,8 +20,8 @@ use crate::playlist::{
 use crate::settings::{RepeatMode, ResumeStore, Settings};
 use futures::StreamExt;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, ImageId, PathPromptOptions, Pixels, Point,
-    RenderImage, Subscription, Window, px, size,
+    App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, ImageId, MouseButton, MouseMoveEvent,
+    PathPromptOptions, Pixels, Point, RenderImage, Subscription, Window, px, size,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -234,6 +234,10 @@ pub struct PlayerView {
     pub dropping: bool,
     /// Insertion point (0..=len) shown while something is dragged over the playlist.
     pub pl_drop: Option<usize>,
+    pub(super) playlist_pan: Option<(MouseButton, Point<Pixels>, Instant, f32, bool)>,
+    pub(super) playlist_pan_suppress_click: bool,
+    pub(super) playlist_inertia: u64,
+    pub(super) playlist_dragging: bool,
     pub pl_scroll: gpui::UniformListScrollHandle,
     /// The volume percentage is being edited as text.
     pub editing_volume: bool,
@@ -418,7 +422,25 @@ impl PlayerView {
         cx.spawn_in(window, async move |this, cx| {
             while preview_rx.next().await.is_some() {
                 while preview_rx.try_recv().is_ok() {}
-                if this.update_in(cx, |v, _, cx| v.refresh_playlist_hover(cx)).is_err() && this.upgrade().is_none() {
+                if this
+                    .update_in(cx, |v, _, cx| {
+                        v.refresh_playlist_hover(cx);
+                        let visible = v.playlist_shown()
+                            && (v.settings.playlist_thumbnails.inline()
+                                || v.menu.as_ref().is_some_and(|m| m.playlist_item.is_some()));
+                        let mut changed = v.playlist_previews.update_inline(visible);
+                        changed |= v.cache_badges.update(
+                            v.playlist_shown(),
+                            v.playlist_library.active_playlist_id(),
+                            v.playlist_previews.pack.clone(),
+                        );
+                        if changed {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                    && this.upgrade().is_none()
+                {
                     break;
                 }
             }
@@ -469,6 +491,16 @@ impl PlayerView {
                 return;
             }
             let Some(me) = me.upgrade() else { return };
+            if ev.keystroke.key == "escape" && me.read(cx).playlist_dragging && cx.has_active_drag() {
+                cx.stop_active_drag(window);
+                cx.stop_propagation();
+                me.update(cx, |v, cx| {
+                    v.playlist_dragging = false;
+                    v.pl_drop = None;
+                    cx.notify();
+                });
+                return;
+            }
             if me.read(cx).capturing_key.is_none() {
                 return;
             }
@@ -581,8 +613,8 @@ impl PlayerView {
             timeline_edge_drag: false,
             seek_hover: None,
             thumbnails: Default::default(),
-            playlist_previews: super::playlist_thumbnails::PlaylistPreviews::with_wake(preview_tx),
-            cache_badges: Default::default(),
+            playlist_previews: super::playlist_thumbnails::PlaylistPreviews::with_wake(preview_tx.clone()),
+            cache_badges: super::cache_badges::CacheBadges::with_wake(preview_tx),
             scrub: None,
             playlist_selection: Default::default(),
             playlist_hovered: None,
@@ -611,6 +643,10 @@ impl PlayerView {
             audio_devices: Vec::new(),
             dropping: false,
             pl_drop: None,
+            playlist_pan: None,
+            playlist_pan_suppress_click: false,
+            playlist_inertia: 0,
+            playlist_dragging: false,
             pl_scroll: gpui::UniformListScrollHandle::new(),
             editing_volume: false,
             volume_blur: None,
@@ -918,7 +954,11 @@ impl PlayerView {
         let mut changed = self.update_thumbnails(window.is_fullscreen());
         let current = self.player.state();
         let playlist_shown = self.playlist_shown();
-        changed |= self.cache_badges.update(playlist_shown);
+        changed |= self.cache_badges.update(
+            playlist_shown,
+            self.playlist_library.active_playlist_id(),
+            self.playlist_previews.pack.clone(),
+        );
         let panel_item = self.menu.as_ref().and_then(|m| m.playlist_item);
         // An occluding popup can prevent delivery of the row's mouse-exit event.
         if panel_item.is_some()
@@ -971,6 +1011,26 @@ impl PlayerView {
                 self.update_thumbnails(window.is_fullscreen());
             }
             changed = true;
+        }
+        if let Some((key, duration, regenerated)) = self.playlist_previews.take_pack_refresh() {
+            let rows = self
+                .playlist
+                .items
+                .iter_mut()
+                .filter_map(|it| {
+                    if !matches!(&it.source, MediaSource::File(path) if path == &key.path) {
+                        return None;
+                    }
+                    if it.duration.is_none() && duration.is_finite() && duration > 0.0 {
+                        it.duration = Some(duration);
+                    }
+                    if it.video_stream.is_none() {
+                        it.video_stream = Some(key.stream);
+                    }
+                    super::playlist_thumbnails::RepresentativeRow::new(it, &self.settings)
+                })
+                .collect();
+            self.playlist_previews.refresh_pack_rows(&key.path, rows, regenerated);
         }
         // `video_bounds` is updated during GPUI layout, after subtitle elements
         // have been built. A fullscreen/resize frame may therefore use the
@@ -1196,6 +1256,14 @@ impl PlayerView {
         if let Some((path, generated)) = self.thumbnails.take_completed_path() {
             if generated {
                 self.playlist_previews.invalidate(&path);
+                let rows = self
+                    .playlist
+                    .items
+                    .iter()
+                    .filter(|it| matches!(&it.source, MediaSource::File(p) if p == &path))
+                    .filter_map(|it| super::playlist_thumbnails::RepresentativeRow::new(it, &self.settings))
+                    .collect();
+                self.playlist_previews.refresh_pack_rows(&path, rows, true);
                 self.cache_badges.invalidate();
             }
             let st = self.player.state();
@@ -1358,7 +1426,100 @@ impl PlayerView {
         cx.notify();
     }
 
+    fn playlist_page_step(&self) -> isize {
+        let height = f32::from(self.pl_scroll.0.borrow().base_handle.bounds().size.height);
+        (height / self.playlist_row_height()).floor().max(1.0) as isize
+    }
+
+    pub(super) fn playlist_pan_by(&self, delta: f32) -> bool {
+        let handle = self.pl_scroll.0.borrow().base_handle.clone();
+        let old = handle.offset();
+        let y = (old.y + px(delta)).clamp(-handle.max_offset().height, px(0.));
+        handle.set_offset(gpui::point(old.x, y));
+        y != old.y
+    }
+
+    pub(super) fn stop_playlist_pan(&mut self) {
+        self.playlist_pan = None;
+        self.playlist_inertia = self.playlist_inertia.wrapping_add(1);
+    }
+
+    pub(super) fn begin_playlist_pan(&mut self, button: MouseButton, position: Point<Pixels>) {
+        self.stop_playlist_pan();
+        self.playlist_pan_suppress_click = false;
+        self.playlist_pan = Some((button, position, Instant::now(), 0.0, button == MouseButton::Middle));
+    }
+
+    pub(super) fn update_playlist_pan(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
+        let Some((button, last_pos, last, velocity, started)) = self.playlist_pan else { return false };
+        if ev.pressed_button != Some(button) {
+            self.stop_playlist_pan();
+            return false;
+        }
+        let delta = f32::from(ev.position.y - last_pos.y);
+        if !started && delta.abs() < 5.0 {
+            return true;
+        }
+        let now = Instant::now();
+        let dt = now.duration_since(last).as_secs_f32().max(0.001);
+        let speed = (delta / dt).clamp(-16000.0, 16000.0);
+        let velocity = if !started || dt > 0.1 { speed } else { velocity * 0.35 + speed * 0.65 };
+        self.playlist_pan = Some((button, ev.position, now, velocity, true));
+        self.playlist_pan_suppress_click |= button == MouseButton::Left;
+        self.playlist_pan_by(delta);
+        self.playlist_previews.hover = None;
+        self.playlist_previews.pointer = None;
+        cx.notify();
+        true
+    }
+
+    pub(super) fn finish_playlist_pan(&mut self, button: MouseButton, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.playlist_pan.is_some_and(|(b, ..)| b == button) {
+            return;
+        }
+        let Some((_, _, last, mut velocity, started)) = self.playlist_pan.take() else { return };
+        if !started {
+            return;
+        }
+        if last.elapsed() > Duration::from_millis(100) {
+            return;
+        }
+        let generation = self.playlist_inertia;
+        cx.spawn_in(window, async move |this, cx| {
+            let mut last = Instant::now();
+            loop {
+                cx.background_executor().timer(Duration::from_millis(16)).await;
+                let dt = last.elapsed().as_secs_f32().min(0.05);
+                last = Instant::now();
+                velocity *= (-3.0 * dt).exp();
+                if velocity.abs() < 15.0 {
+                    break;
+                }
+                match this.update_in(cx, |v, window, cx| {
+                    if v.playlist_inertia != generation
+                        || !v.playlist_shown()
+                        || !window.is_window_active()
+                        || v.menu.is_some()
+                        || v.dialog.is_some()
+                    {
+                        return false;
+                    }
+                    let moved = v.playlist_pan_by(velocity * dt);
+                    if moved {
+                        cx.notify();
+                    }
+                    moved
+                }) {
+                    Ok(true) => {}
+                    _ => break,
+                }
+            }
+        })
+        .detach();
+    }
+
     fn playlist_key_move(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
+        self.stop_playlist_pan();
         let visible = self.visible_playlist_indices(cx);
         let count = visible.len();
         if count == 0 {
@@ -1449,6 +1610,9 @@ impl PlayerView {
     }
 
     pub(super) fn move_playlist_items(&mut self, ids: &[u64], up: bool, cx: &mut Context<Self>) {
+        if self.settings.playlist_order_locked {
+            return;
+        }
         self.playlist.move_selected(ids, up);
         self.playlist_previews.hover = None;
         self.update_next();
@@ -1456,6 +1620,9 @@ impl PlayerView {
     }
 
     pub(super) fn drop_playlist_items(&mut self, ids: &[u64], at: usize, cx: &mut Context<Self>) {
+        if self.settings.playlist_order_locked {
+            return;
+        }
         self.playlist.drop_selected(ids, at);
         self.playlist_previews.hover = None;
         self.update_next();
@@ -1508,6 +1675,7 @@ impl PlayerView {
 
     pub fn retire_textures(&mut self, window: &mut Window) {
         self.last_render = Instant::now();
+        self.retired.extend(self.cache_badges.take_retired_images().into_iter().map(|id| (id, RETIRE_AFTER)));
         self.retired.extend(self.thumbnails.waveform.take_retired_images().into_iter().map(|id| (id, RETIRE_AFTER)));
         self.retired.extend(self.thumbnails.take_retired_barcode_images().into_iter().map(|id| (id, RETIRE_AFTER)));
         if self.video_hidden && !self.hidden_to_tray {
@@ -2399,6 +2567,7 @@ impl PlayerView {
                         .map(|it| it.id);
                     for (id, r) in batch {
                         if let (Some(it), Some(r)) = (v.playlist.items.iter_mut().find(|i| i.id == id), r) {
+                            let old_streams = (it.video_stream, it.audio_stream);
                             // The live engine is authoritative for the loaded item.
                             // Other items may replace provisional cached values.
                             if loaded_id != Some(id) {
@@ -2415,6 +2584,12 @@ impl PlayerView {
                                     });
                             } else {
                                 it.has_subtitles |= r.has_subtitles;
+                            }
+                            if old_streams != (it.video_stream, it.audio_stream)
+                                && it.video_stream.is_none()
+                                && let Some(entry) = super::cache_badges::Entry::new(it, &v.settings)
+                            {
+                                v.cache_badges.queue_background_entry(v.playlist_library.active_playlist_id(), entry);
                             }
                             if r.source_validated
                                 && let MediaSource::File(path) = &it.source
@@ -2439,7 +2614,14 @@ impl PlayerView {
                                     && v.settings.playlist_thumbnails.inline()
                                 {
                                     // Only the inline playlist modes show this picture.
-                                    v.playlist_previews.generate_representative(path.clone(), Some(stream));
+                                    if let (Some(playlist), Some(row)) = (
+                                        v.playlist_library.active_playlist_id(),
+                                        super::playlist_thumbnails::RepresentativeRow::new(it, &v.settings),
+                                    ) {
+                                        v.playlist_previews.generate_auto_representative(playlist, row);
+                                    } else {
+                                        v.playlist_previews.generate_representative(path.clone(), Some(stream));
+                                    }
                                 }
                             }
                         }
@@ -3655,6 +3837,8 @@ impl PlayerView {
             PlaylistFocusPlayer => |this, w, _cx| w.focus(&this.focus),
             PlaylistUp => |this, _w, cx| this.playlist_key_move(-1, false, cx),
             PlaylistDown => |this, _w, cx| this.playlist_key_move(1, false, cx),
+            PlaylistPageUp => |this, _w, cx| this.playlist_key_move(-this.playlist_page_step(), false, cx),
+            PlaylistPageDown => |this, _w, cx| this.playlist_key_move(this.playlist_page_step(), false, cx),
             PlaylistExtendUp => |this, _w, cx| this.playlist_key_move(-1, true, cx),
             PlaylistExtendDown => |this, _w, cx| this.playlist_key_move(1, true, cx),
             PlaylistExtendHome => |this, _w, cx| this.playlist_key_move(isize::MIN, true, cx),

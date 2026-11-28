@@ -3,6 +3,7 @@
 
 pub(crate) mod inbox;
 pub(crate) mod storage;
+pub(crate) mod thumbnail_cache;
 pub(crate) mod transfer;
 pub(crate) mod watch;
 

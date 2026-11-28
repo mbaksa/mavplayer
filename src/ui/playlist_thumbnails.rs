@@ -4,10 +4,15 @@ use crate::engine::{
     MediaSource, PlaybackState, Status, TrackId,
     thumbnails::{
         GenerationProgress, Thumbnail, ThumbnailSpec,
-        cache::{GenerationControl, load_cached, load_or_generate, stream_cached},
+        cache::{
+            GenerationControl, decode_representative, load_cached, load_or_generate, representative_jpeg, stream_cached,
+        },
     },
 };
-use crate::playlist::PlaylistItem;
+use crate::playlist::{
+    PlaylistItem,
+    collections::{PlaylistId, PlaylistItemId, thumbnail_cache},
+};
 use crate::settings::{PlaylistThumbnails, Settings};
 use gpui::{Bounds, ImageId, Pixels, Point};
 use std::{
@@ -19,6 +24,23 @@ use std::{
         mpsc::{Receiver, TryRecvError},
     },
 };
+
+const INLINE_BATCH: usize = 12;
+pub(super) const PREFETCH_ROWS: usize = 4;
+
+#[derive(Clone)]
+pub(super) struct RepresentativeRow {
+    key: Key,
+    target: f64,
+    item: PlaylistItemId,
+}
+impl RepresentativeRow {
+    pub fn new(item: &PlaylistItem, settings: &Settings) -> Option<Self> {
+        let key = Key::new(item, settings)?;
+        let target = key.representative_time(settings, item.duration?);
+        Some(Self { key, target, item: item.persistent_id })
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Key {
@@ -63,8 +85,8 @@ pub(super) struct Hover {
 }
 enum JobOutput {
     Media(Key, Vec<Thumbnail>, Option<f64>),
-    Existing(Key, f64, Thumbnail),
-    Representative(Key, f64, Thumbnail),
+    Existing(Key, f64, Thumbnail, f64),
+    Representative(Key, f64, Thumbnail, f64),
     Skipped,
 }
 type JobResult = anyhow::Result<JobOutput>;
@@ -116,6 +138,91 @@ fn to_bgra(mut thumb: Thumbnail) -> Thumbnail {
     thumb
 }
 
+fn packed_representative(
+    mut pack: Option<&mut thumbnail_cache::Pack>,
+    key: &Key,
+    target: f64,
+    rows: &[&RepresentativeRow],
+    display: bool,
+) -> Option<Thumbnail> {
+    let selection = thumbnail_cache::Selection { path: key.path.clone(), stream: key.stream, count: key.count, target };
+    let started = std::time::Instant::now();
+    if let Some(p) = pack.as_deref_mut() {
+        for row in rows {
+            if !display && p.contains(row.item, &selection) {
+                return None;
+            }
+            if let Ok(Some((time, jpeg))) = p.read(row.item, &selection) {
+                if !display {
+                    return None;
+                }
+                if let Ok(image) = decode_representative(jpeg, key.spec(), time) {
+                    log::trace!("playlist JPEG hit: {:?}, {:?}", key.path, started.elapsed());
+                    return Some(to_bgra(image));
+                }
+            }
+        }
+    }
+    log::trace!("playlist JPEG miss: {:?}", key.path);
+    let (time, jpeg) = representative_jpeg(&key.path, key.spec(), &key.directory, target)
+        .or_else(|_| representative_jpeg(&key.path, ThumbnailSpec { count: 1, ..key.spec() }, &key.directory, target))
+        .ok()?;
+    let image = if display { Some(to_bgra(decode_representative(jpeg.clone(), key.spec(), time).ok()?)) } else { None };
+    if let Some(p) = pack {
+        for row in rows {
+            if let Err(err) = p.append(row.item, selection.clone(), time, &jpeg) {
+                log::debug!("could not append playlist thumbnail: {err}");
+            }
+        }
+    }
+    image
+}
+
+/// Reuse the compressed frame if possible. A selected preview can also come
+/// from a partially generated filmstrip that has not been published yet.
+fn persist_selection(
+    pack: &mut thumbnail_cache::Pack,
+    row: &RepresentativeRow,
+    sample: Option<&Thumbnail>,
+) -> anyhow::Result<()> {
+    let key = &row.key;
+    let selection =
+        thumbnail_cache::Selection { path: key.path.clone(), stream: key.stream, count: key.count, target: row.target };
+    let matches_time = |time: f64| (time - row.target).abs() <= 0.000001;
+    if let Ok(Some((time, _))) = pack.read(row.item, &selection) {
+        if sample.is_none() || matches_time(time) {
+            return Ok(());
+        }
+    }
+    let cached = representative_jpeg(&key.path, key.spec(), &key.directory, row.target).or_else(|_| {
+        representative_jpeg(&key.path, ThumbnailSpec { count: 1, ..key.spec() }, &key.directory, row.target)
+    });
+    let (time, jpeg) = match (cached, sample) {
+        (Ok(frame), None) => frame,
+        (Ok(frame), Some(_)) if matches_time(frame.0) => frame,
+        (_, Some(sample)) if matches_time(sample.time) => {
+            // Preview pixels are BGRA; JPEG expects RGB. Only re-encode when
+            // the exact selected compressed frame is not available on disk.
+            let mut pixels = sample.image.clone();
+            for pixel in pixels.pixels_mut() {
+                pixel.0.swap(0, 2);
+            }
+            let mut image = image::DynamicImage::ImageRgba8(pixels);
+            let spec = key.spec();
+            if image.width() > spec.width || image.height() > spec.height {
+                image = image.thumbnail(spec.width, spec.height);
+            }
+            let mut jpeg = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 85).encode_image(&image.into_rgb8())?;
+            (sample.time, jpeg)
+        }
+        (Err(err), None) => return Err(err),
+        _ => anyhow::bail!("selected thumbnail time changed"),
+    };
+    pack.append(row.item, selection, time, &jpeg)?;
+    Ok(())
+}
+
 struct ActiveGeneration {
     progress: Arc<GenerationProgress>,
     filename: String,
@@ -151,7 +258,15 @@ pub(super) struct PlaylistPreviews {
     hover_worker: Option<HoverJob>,
     hover_wake: Option<futures::channel::mpsc::UnboundedSender<()>>,
     pending: VecDeque<(Key, f64)>,
+    playlist: Option<PlaylistId>,
+    pub(super) pack: Arc<parking_lot::Mutex<Option<(PathBuf, PlaylistId, thumbnail_cache::Pack)>>>,
+    background_rows: VecDeque<RepresentativeRow>,
+    selection_writes: VecDeque<(PlaylistId, RepresentativeRow, Option<Arc<Thumbnail>>)>,
+    invalidated_pack_paths: Vec<PathBuf>,
+    visible_rows: Vec<RepresentativeRow>,
+    prefetch_rows: Vec<RepresentativeRow>,
     manual: VecDeque<(PathBuf, Option<usize>, bool)>,
+    auto_rows: std::collections::HashMap<(PathBuf, usize), (PlaylistId, RepresentativeRow)>,
     batch_total: usize,
     missing_only: Vec<(PathBuf, Option<usize>, bool)>,
     activity: Arc<QueueActivity>,
@@ -162,6 +277,7 @@ pub(super) struct PlaylistPreviews {
     retired: Vec<ImageId>,
     maintenance_pending: bool,
     completed: Option<(Key, f64)>,
+    pack_refresh: Option<(Key, f64, bool)>,
     message: Option<String>,
 }
 impl PlaylistPreviews {
@@ -171,8 +287,151 @@ impl PlaylistPreviews {
     pub fn mode(settings: &Settings) -> PlaylistThumbnails {
         settings.playlist_thumbnails
     }
-    pub fn retain_visible(&mut self, visible: &[Key]) {
-        self.pending.retain(|(key, _)| visible.contains(key));
+    pub fn retain_visible(
+        &mut self,
+        playlist: Option<PlaylistId>,
+        visible: Vec<RepresentativeRow>,
+        prefetch: Vec<RepresentativeRow>,
+    ) {
+        if self.playlist != playlist {
+            if let Some(worker) = &self.inline_worker {
+                worker.cancel.store(true, Ordering::Relaxed);
+            }
+            self.pending.clear();
+            self.background_rows.clear();
+            self.invalidated_pack_paths.clear();
+            self.pack = Arc::default();
+            self.playlist = playlist;
+        }
+        self.pending.retain(|(key, _)| visible.iter().any(|row| &row.key == key));
+        self.visible_rows = visible;
+        self.prefetch_rows = prefetch;
+    }
+
+    pub fn needs_pack_rows(&self, playlist: Option<PlaylistId>) -> bool {
+        playlist.is_some() && self.playlist != playlist
+    }
+
+    pub fn set_pack_rows(&mut self, rows: Vec<RepresentativeRow>) {
+        self.background_rows = rows.into();
+    }
+
+    pub fn refresh_pack_rows(&mut self, path: &std::path::Path, rows: Vec<RepresentativeRow>, regenerated: bool) {
+        if self.playlist.is_none() {
+            return;
+        }
+        if regenerated && !self.invalidated_pack_paths.iter().any(|p| p == path) {
+            self.invalidated_pack_paths.push(path.to_path_buf());
+        }
+        self.background_rows.retain(|row| row.key.path != path);
+        for row in rows.into_iter().rev() {
+            self.background_rows.push_front(row);
+        }
+    }
+
+    /// Persist explicit selections independently of the decoded-image LRU and viewport.
+    pub fn queue_selection_write(
+        &mut self,
+        playlist: PlaylistId,
+        rows: Vec<RepresentativeRow>,
+        sample: Option<Arc<Thumbnail>>,
+    ) {
+        for row in rows {
+            self.selection_writes.retain(|(id, old, _)| *id != playlist || old.item != row.item);
+            if self.playlist == Some(playlist) {
+                for old in self.background_rows.iter_mut().chain(&mut self.visible_rows).chain(&mut self.prefetch_rows)
+                {
+                    if old.item == row.item {
+                        *old = row.clone();
+                    }
+                }
+            }
+            self.selection_writes.push_back((playlist, row, sample.clone()));
+        }
+        if let Some(wake) = &self.hover_wake {
+            let _ = wake.unbounded_send(());
+        }
+    }
+
+    fn start_selection_write(&mut self) {
+        let Some((playlist, first, sample)) = self.selection_writes.pop_front() else {
+            return;
+        };
+        let directory = first.key.directory.clone();
+        let mut rows = vec![(first, sample)];
+        while rows.len() < INLINE_BATCH
+            && self
+                .selection_writes
+                .front()
+                .is_some_and(|(id, row, _)| *id == playlist && row.key.directory == directory)
+        {
+            let (_, row, sample) = self.selection_writes.pop_front().unwrap();
+            rows.push((row, sample));
+        }
+        let retry = rows.clone();
+        let pack_slot = self.pack.clone();
+        let active = self.playlist == Some(playlist);
+        let mut invalidations = Vec::new();
+        if active {
+            self.invalidated_pack_paths.retain(|path| {
+                if rows.iter().any(|(row, _)| &row.key.path == path) {
+                    invalidations.push(path.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        let retry_invalidations = invalidations.clone();
+        let wake = self.hover_wake.clone();
+        let (tx, result) = std::sync::mpsc::channel();
+        match std::thread::Builder::new().name("playlist-selection-write".into()).spawn(move || {
+            let mut slot = pack_slot.lock();
+            let matching = slot.as_ref().is_some_and(|(dir, id, _)| *dir == directory && *id == playlist);
+            let mut temporary = None;
+            if !matching {
+                match thumbnail_cache::Pack::open(&directory, playlist) {
+                    Ok(pack) if active => *slot = Some((directory.clone(), playlist, pack)),
+                    Ok(pack) => temporary = Some(pack),
+                    Err(err) => log::debug!("could not open playlist for thumbnail selection: {err}"),
+                }
+            }
+            let pack = if matching || active {
+                slot.as_mut().filter(|(dir, id, _)| *dir == directory && *id == playlist).map(|(_, _, pack)| pack)
+            } else {
+                temporary.as_mut()
+            };
+            if let Some(pack) = pack {
+                for path in invalidations {
+                    if let Err(err) = pack.invalidate_path(&path) {
+                        log::debug!("could not invalidate playlist thumbnails: {err}");
+                    }
+                }
+                for (row, sample) in rows {
+                    if let Err(err) = persist_selection(pack, &row, sample.as_deref()) {
+                        log::debug!("could not save selected playlist thumbnail: {err}");
+                    }
+                }
+            }
+            drop(temporary);
+            drop(slot);
+            drop(tx);
+            if let Some(wake) = &wake {
+                let _ = wake.unbounded_send(());
+            }
+        }) {
+            Ok(_) => {
+                self.inline_worker =
+                    Some(InlineJob { requests: Vec::new(), cancel: Arc::new(AtomicBool::new(false)), result })
+            }
+            Err(err) => {
+                for (row, sample) in retry.into_iter().rev() {
+                    self.selection_writes.push_front((playlist, row, sample));
+                }
+                self.invalidated_pack_paths.extend(retry_invalidations);
+                log::debug!("could not start playlist thumbnail selection write: {err}");
+            }
+        }
     }
 
     pub fn inline_pair(&mut self, key: &Key, target: f64, default: f64) -> Option<Preview> {
@@ -201,9 +460,15 @@ impl PlaylistPreviews {
         if !known_missing
             && self.pending.len() < 192
             && !self.pending.iter().any(|(k, t)| k == key && *t == target)
-            && !self.inline_worker.as_ref().is_some_and(|w| w.requests.iter().any(|(k, t)| k == key && *t == target))
+            && !self.inline_worker.as_ref().is_some_and(|w| {
+                !w.cancel.load(Ordering::Relaxed) && w.requests.iter().any(|(k, t)| k == key && *t == target)
+            })
         {
+            let was_empty = self.pending.is_empty();
             self.pending.push_back((key.clone(), target));
+            if was_empty && let Some(wake) = &self.hover_wake {
+                let _ = wake.unbounded_send(());
+            }
         }
         None
     }
@@ -272,6 +537,11 @@ impl PlaylistPreviews {
     pub fn generate_representative(&mut self, path: PathBuf, stream: Option<usize>) {
         self.enqueue(path, stream, true, true);
     }
+    pub fn generate_auto_representative(&mut self, playlist: PlaylistId, row: RepresentativeRow) {
+        let key = (row.key.path.clone(), row.key.stream);
+        self.auto_rows.insert(key.clone(), (playlist, row));
+        self.generate_representative(key.0, Some(key.1));
+    }
     fn enqueue(&mut self, path: PathBuf, stream: Option<usize>, single: bool, missing: bool) {
         let request = (path, stream, single);
         let same = |p: &PathBuf, s: Option<usize>, one: bool| {
@@ -323,6 +593,7 @@ impl PlaylistPreviews {
     }
     pub fn invalidate(&mut self, path: &std::path::Path) {
         self.pending.retain(|(k, _)| k.path.as_path() != path);
+        self.prefetch_rows.retain(|row| row.key.path.as_path() != path);
         if self.inline_worker.as_ref().is_some_and(|w| w.requests.iter().any(|(k, _)| k.path.as_path() == path)) {
             self.inline_worker = None;
         }
@@ -423,11 +694,12 @@ impl PlaylistPreviews {
     }
     /// Read the visible representatives as a batch, separately from the
     /// potentially slow FFmpeg generation and full scrub-preview jobs.
-    fn update_inline(&mut self, visible: bool) -> bool {
+    pub(super) fn update_inline(&mut self, visible: bool) -> bool {
         if !visible {
-            self.inline_worker = None;
+            // Let the current bounded batch finish; do not start more hidden work.
             self.pending.clear();
-            return false;
+            self.visible_rows.clear();
+            self.prefetch_rows.clear();
         }
         let mut changed = false;
         if let Some(mut job) = self.inline_worker.take() {
@@ -436,8 +708,10 @@ impl PlaylistPreviews {
                 match job.result.try_recv() {
                     Ok((key, target, image)) => {
                         job.requests.retain(|(k, t)| k != &key || *t != target);
-                        self.remember(key, target, image.map(Preview::from_bgra));
-                        changed = true;
+                        if !job.cancel.load(Ordering::Relaxed) {
+                            self.remember(key, target, image.map(Preview::from_bgra));
+                            changed = true;
+                        }
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
@@ -450,32 +724,89 @@ impl PlaylistPreviews {
                 self.inline_worker = Some(job);
             }
         }
-        if self.inline_worker.is_none() && !self.pending.is_empty() {
-            let requests: Vec<_> = self.pending.drain(..).collect();
+        if self.inline_worker.is_none() && !self.selection_writes.is_empty() {
+            self.start_selection_write();
+        }
+        if !visible {
+            return changed;
+        }
+        // Promote visible rows ahead of any queued prefetch.
+        let visible = self.visible_rows.clone();
+        for row in &visible {
+            let _ = self.inline(&row.key, row.target);
+        }
+        self.pending
+            .make_contiguous()
+            .sort_by_key(|(key, target)| !visible.iter().any(|row| row.key == *key && row.target == *target));
+        if self.inline_worker.is_none() && self.pending.is_empty() {
+            for row in self.prefetch_rows.clone() {
+                let _ = self.inline(&row.key, row.target);
+            }
+        }
+        if self.inline_worker.is_none() && (!self.pending.is_empty() || !self.background_rows.is_empty()) {
+            let count = self.pending.len().min(INLINE_BATCH);
+            let requests: Vec<_> = self.pending.drain(..count).collect();
+            let playlist = self.playlist;
+            let rows: Vec<_> = self.visible_rows.iter().chain(&self.prefetch_rows).cloned().collect();
             let batch = requests.clone();
+            let background: Vec<_> = if batch.is_empty() {
+                let count = self.background_rows.len().min(INLINE_BATCH);
+                self.background_rows.drain(..count).collect()
+            } else {
+                Vec::new()
+            };
+            let pack_slot = self.pack.clone();
+            let invalidations = std::mem::take(&mut self.invalidated_pack_paths);
             let cancel = Arc::new(AtomicBool::new(false));
             let stop = cancel.clone();
             let (tx, result) = std::sync::mpsc::channel();
+            let wake = self.hover_wake.clone();
             match std::thread::Builder::new().name("playlist-representatives".into()).spawn(move || {
+                let directory = batch
+                    .first()
+                    .map(|(key, _)| &key.directory)
+                    .or_else(|| background.first().map(|row| &row.key.directory))
+                    .unwrap()
+                    .clone();
+                let mut slot = pack_slot.lock();
+                if let Some(id) = playlist {
+                    if !slot.as_ref().is_some_and(|(dir, old, _)| dir == &directory && *old == id) {
+                        *slot = thumbnail_cache::Pack::open(&directory, id).ok().map(|pack| (directory, id, pack));
+                    }
+                } else {
+                    *slot = None;
+                }
+                let mut pack = slot.as_mut().map(|(_, _, pack)| pack);
+                if let Some(p) = pack.as_deref_mut() {
+                    for path in invalidations {
+                        if let Err(err) = p.invalidate_path(&path) {
+                            log::debug!("could not invalidate playlist thumbnails: {err}");
+                        }
+                    }
+                }
                 for (key, target) in batch {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    let image = load_cached(&key.path, key.spec(), &key.directory, Some(target))
-                        .or_else(|_| {
-                            load_cached(
-                                &key.path,
-                                ThumbnailSpec { count: 1, ..key.spec() },
-                                &key.directory,
-                                Some(target),
-                            )
-                        })
-                        .ok()
-                        .and_then(|mut images| images.pop())
-                        .map(to_bgra);
+                    let matching: Vec<_> = rows.iter().filter(|row| row.key == key && row.target == target).collect();
+                    let image = packed_representative(pack.as_deref_mut(), &key, target, &matching, true);
                     if tx.send((key, target, image)).is_err() {
                         break;
                     }
+                    if let Some(wake) = &wake {
+                        let _ = wake.unbounded_send(());
+                    }
+                }
+                for row in background {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = packed_representative(pack.as_deref_mut(), &row.key, row.target, &[&row], false);
+                }
+                drop(slot);
+                drop(tx);
+                if let Some(wake) = &wake {
+                    let _ = wake.unbounded_send(());
                 }
             }) {
                 Ok(_) => self.inline_worker = Some(InlineJob { requests, cancel, result }),
@@ -646,6 +977,14 @@ impl PlaylistPreviews {
                 changed = true;
             }
         }
+        if !mode.inline() && self.playlist.is_some() {
+            self.visible_rows.clear();
+            self.prefetch_rows.clear();
+            self.playlist = None;
+            self.background_rows.clear();
+            self.invalidated_pack_paths.clear();
+            self.pack = Arc::default();
+        }
         changed |= self.update_inline(visible && (mode.inline() || panel_item.is_some()));
         changed |= self.update_hover(settings, visible, panel_item, timeline);
         if let Some(worker) = &self.worker {
@@ -669,15 +1008,18 @@ impl PlaylistPreviews {
                         Ok(JobOutput::Media(key, images, Some(duration))) => {
                             self.invalidate(&path);
                             self.completed = Some((key.clone(), duration));
+                            self.pack_refresh = Some((key.clone(), duration, true));
                             if mode != PlaylistThumbnails::None && self.hover.as_ref().is_none_or(|h| h.key == key) {
                                 self.replace_full(key, images.into_iter().map(Preview::from_bgra).collect());
                             }
                         }
-                        Ok(JobOutput::Representative(key, target, image)) => {
+                        Ok(JobOutput::Representative(key, target, image, duration)) => {
+                            self.pack_refresh = Some((key.clone(), duration, true));
                             self.invalidate(&path);
                             self.remember(key, target, Some(Preview::from_bgra(image)));
                         }
-                        Ok(JobOutput::Existing(key, target, image)) => {
+                        Ok(JobOutput::Existing(key, target, image, duration)) => {
+                            self.pack_refresh = Some((key.clone(), duration, false));
                             // A cache may have been created by another instance since
                             // the last lookup. Discard only negative entries for it.
                             self.entries.retain(|(k, _, p)| k != &key || p.is_some());
@@ -737,6 +1079,12 @@ impl PlaylistPreviews {
                 .position(|(p, st, one)| p == path && st == stream && one == single)
                 .map(|i| self.missing_only.remove(i))
                 .is_some();
+            let auto = if *single && missing_only {
+                stream.and_then(|stream| self.auto_rows.remove(&(path.clone(), stream)))
+            } else {
+                None
+            };
+            let pack_slot = self.pack.clone();
             let cfg = settings.engine_config();
             let cancel = Arc::new(AtomicBool::new(false));
             let stop = cancel.clone();
@@ -749,6 +1097,24 @@ impl PlaylistPreviews {
                     anyhow::ensure!(!stop.load(Ordering::Relaxed), "thumbnail generation cancelled");
                     match work {
                         JobKind::Generate(path, selected_stream, single) => {
+                            if let Some((id, row)) = auto {
+                                let selection = thumbnail_cache::Selection {
+                                    path: row.key.path.clone(),
+                                    stream: row.key.stream,
+                                    count: row.key.count,
+                                    target: row.target,
+                                };
+                                let slot = pack_slot.lock();
+                                if slot.as_ref().is_some_and(|(dir, old, _)| dir == &row.key.directory && *old == id) {
+                                    if slot.as_ref().is_some_and(|(_, _, pack)| pack.contains(row.item, &selection)) {
+                                        return Ok(JobOutput::Skipped);
+                                    }
+                                } else if let Ok(pack) = thumbnail_cache::Pack::open(&row.key.directory, id) {
+                                    if pack.contains(row.item, &selection) {
+                                        return Ok(JobOutput::Skipped);
+                                    }
+                                }
+                            }
                             let probe = crate::engine::probe::probe(&MediaSource::File(path.clone()), &cfg)
                                 .ok_or_else(|| anyhow::anyhow!("could not probe media"))?;
                             let Some(stream) = selected_stream.or(probe.video_stream) else {
@@ -768,7 +1134,7 @@ impl PlaylistPreviews {
                                 && let Ok(mut images) = load_cached(&key.path, key.spec(), &key.directory, Some(target))
                                 && let Some(image) = images.pop()
                             {
-                                return Ok(JobOutput::Existing(key, target, to_bgra(image)));
+                                return Ok(JobOutput::Existing(key, target, to_bgra(image), probe.duration));
                             }
                             let progress = report.as_ref().expect("manual generation progress");
                             if single {
@@ -777,7 +1143,7 @@ impl PlaylistPreviews {
                                     && let Ok(mut images) = load_cached(&key.path, spec, &key.directory, Some(target))
                                     && let Some(image) = images.pop()
                                 {
-                                    return Ok(JobOutput::Existing(key, target, to_bgra(image)));
+                                    return Ok(JobOutput::Existing(key, target, to_bgra(image), probe.duration));
                                 }
                                 let mut images = load_or_generate(
                                     &key.path,
@@ -789,7 +1155,7 @@ impl PlaylistPreviews {
                                 )?;
                                 let image =
                                     images.pop().ok_or_else(|| anyhow::anyhow!("no representative thumbnail"))?;
-                                return Ok(JobOutput::Representative(key, target, to_bgra(image)));
+                                return Ok(JobOutput::Representative(key, target, to_bgra(image), probe.duration));
                             }
                             progress.set_total(key.count);
                             let images = load_or_generate(
@@ -826,14 +1192,26 @@ impl PlaylistPreviews {
     pub fn take_completed(&mut self) -> Option<(Key, f64)> {
         self.completed.take()
     }
+    pub fn take_pack_refresh(&mut self) -> Option<(Key, f64, bool)> {
+        self.pack_refresh.take()
+    }
     pub fn clear(&mut self) {
+        self.pack_refresh = None;
         self.worker = None;
         self.cancel_hover();
         self.inline_worker = None;
         self.manual.clear();
+        self.auto_rows.clear();
         self.missing_only.clear();
         self.batch_total = 0;
         self.pending.clear();
+        self.visible_rows.clear();
+        self.prefetch_rows.clear();
+        self.playlist = None;
+        self.background_rows.clear();
+        self.selection_writes.clear();
+        self.invalidated_pack_paths.clear();
+        self.pack = Arc::default();
         self.hover = None;
         self.drop_full();
         let recent = std::mem::take(&mut self.recent);
@@ -856,6 +1234,84 @@ impl PlaylistPreviews {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_selection_persists_preview_without_media_cache() -> anyhow::Result<()> {
+        let root = std::env::temp_dir().join(format!("mav-selection-{}", uuid::Uuid::new_v4()));
+        let result = (|| -> anyhow::Result<()> {
+            let playlist = PlaylistId::new();
+            let row = RepresentativeRow {
+                key: Key { path: root.join("offline.mp4"), stream: 0, count: 20, directory: root.clone() },
+                target: 35.,
+                item: PlaylistItemId::new(),
+            };
+            let mut pack = thumbnail_cache::Pack::open(&root, playlist)?;
+            let sample =
+                Thumbnail { time: 35., image: image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 255, 255])) };
+            persist_selection(&mut pack, &row, Some(&sample))?;
+            drop(pack);
+            let mut pack = thumbnail_cache::Pack::open(&root, playlist)?;
+            let selection =
+                thumbnail_cache::Selection { path: row.key.path.clone(), stream: 0, count: 20, target: 35. };
+            let (time, jpeg) = pack.read(row.item, &selection)?.expect("selected frame");
+            assert_eq!(time, 35.);
+            let decoded = decode_representative(jpeg, row.key.spec(), time)?;
+            assert!(decoded.image.get_pixel(0, 0).0[0] > 240);
+            assert!(decoded.image.get_pixel(0, 0).0[2] < 15);
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(root);
+        result
+    }
+
+    #[test]
+    fn explicit_selection_queue_coalesces_and_survives_playlist_switch() {
+        let mut previews = PlaylistPreviews::default();
+        let playlist = PlaylistId::new();
+        let mut row = RepresentativeRow {
+            key: Key { path: "movie.mp4".into(), stream: 0, count: 20, directory: "cache".into() },
+            target: 5.,
+            item: PlaylistItemId::new(),
+        };
+        previews.retain_visible(Some(playlist), vec![row.clone()], Vec::new());
+        previews.set_pack_rows(vec![row.clone()]);
+        previews.queue_selection_write(playlist, vec![row.clone()], None);
+        row.target = 35.;
+        previews.queue_selection_write(playlist, vec![row.clone()], None);
+        assert_eq!(previews.selection_writes.len(), 1);
+        assert_eq!(previews.visible_rows[0].target, 35.);
+        assert_eq!(previews.background_rows[0].target, 35.);
+        previews.retain_visible(Some(PlaylistId::new()), Vec::new(), Vec::new());
+        assert_eq!(previews.selection_writes[0].0, playlist);
+        assert_eq!(previews.selection_writes[0].1.target, 35.);
+    }
+
+    #[test]
+    fn viewport_change_prunes_old_requests_and_switch_cancels_worker() {
+        let mut previews = PlaylistPreviews::default();
+        let playlist = PlaylistId::new();
+        let row = |path: &str| RepresentativeRow {
+            key: Key { path: path.into(), stream: 0, count: 20, directory: "cache".into() },
+            target: 5.,
+            item: PlaylistItemId::new(),
+        };
+        let a = row("a.mp4");
+        let b = row("b.mp4");
+        previews.retain_visible(Some(playlist), vec![a.clone(), b.clone()], Vec::new());
+        assert!(previews.inline(&a.key, a.target).is_none());
+        assert!(previews.inline(&b.key, b.target).is_none());
+        previews.retain_visible(Some(playlist), vec![b.clone()], vec![a.clone()]);
+        assert_eq!(previews.pending.len(), 1);
+        assert!(previews.pending[0].0 == b.key);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_tx, result) = std::sync::mpsc::channel();
+        previews.inline_worker =
+            Some(InlineJob { requests: vec![(b.key.clone(), b.target)], cancel: cancel.clone(), result });
+        previews.retain_visible(Some(PlaylistId::new()), vec![a], Vec::new());
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(previews.pending.is_empty());
+        assert!(previews.inline_worker.is_some());
+    }
 
     #[test]
     fn playlist_thumbnail_mode_is_independent_of_timeline() {

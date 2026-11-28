@@ -419,7 +419,10 @@ impl Library {
         match lock.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, "This session is already open in another window"));
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "This session is already open in another window",
+                ));
             }
             Err(std::fs::TryLockError::Error(err)) => return Err(err),
         }
@@ -561,6 +564,10 @@ impl Library {
 
     pub fn collection_label(&self) -> &str {
         &self.collection_label
+    }
+
+    pub(crate) fn active_playlist_id(&self) -> Option<PlaylistId> {
+        self.slots.get(self.active).map(|slot| slot.id)
     }
 
     pub fn collection_id(&self) -> Option<CollectionId> {

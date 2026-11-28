@@ -71,6 +71,8 @@ pub enum Icon {
     Speed,
     AppGeneric,
     Eject,
+    Lock,
+    Unlock,
 }
 
 impl Icon {
@@ -133,6 +135,8 @@ impl Icon {
             Speed => "speedometer",
             AppGeneric => "multimedia-player",
             Eject => "media-eject",
+            Lock => "object-locked",
+            Unlock => "object-unlocked",
         }
     }
 
@@ -253,6 +257,8 @@ const ALL: &[Icon] = &[
     Icon::Speed,
     Icon::AppGeneric,
     Icon::Eject,
+    Icon::Lock,
+    Icon::Unlock,
 ];
 
 #[cfg(target_os = "linux")]
@@ -430,6 +436,12 @@ impl AssetSource for Assets {
             if let Some((_, data)) = BUNDLED_ICONS.iter().find(|(n, _)| *n == name) {
                 return Ok(Some(Cow::Borrowed(*data)));
             }
+            if name == "object-locked" {
+                return Ok(Some(Cow::Borrowed(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg>"#)));
+            }
+            if name == "object-unlocked" {
+                return Ok(Some(Cow::Borrowed(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8-1M12 14v3"/></svg>"#)));
+            }
             // Older bundled icon sets do not necessarily include document-export.
             if name == "document-export" {
                 return Ok(Some(Cow::Borrowed(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 3H5v18h14v-7M13 3v6h6M13 3l6 6M11 13h11m-4-4 4 4-4 4"/></svg>"#)));
@@ -448,9 +460,11 @@ impl AssetSource for Assets {
             .map(|(n, _)| SharedString::from(format!("icons/{n}.svg")))
             .filter(|p| p.starts_with(path))
             .collect();
-        let export = "icons/document-export.svg";
-        if export.starts_with(path) && !BUNDLED_ICONS.iter().any(|(n, _)| *n == "document-export") {
-            paths.push(export.into());
+        for name in ["document-export", "object-locked", "object-unlocked"] {
+            let asset = format!("icons/{name}.svg");
+            if asset.starts_with(path) && !BUNDLED_ICONS.iter().any(|(n, _)| *n == name) {
+                paths.push(asset.into());
+            }
         }
         Ok(paths)
     }

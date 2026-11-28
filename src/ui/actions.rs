@@ -69,6 +69,8 @@ actions!(
         PlaylistFocusPlayer,
         PlaylistUp,
         PlaylistDown,
+        PlaylistPageUp,
+        PlaylistPageDown,
         PlaylistExtendUp,
         PlaylistExtendDown,
         PlaylistExtendHome,

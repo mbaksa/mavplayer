@@ -107,7 +107,7 @@ impl Preview {
     }
 
     /// A copy of the picture (BGRA, as extracted) for analysis.
-    fn sample(&self) -> Option<Thumbnail> {
+    pub(super) fn sample(&self) -> Option<Thumbnail> {
         let bytes = self.image.as_bytes(0)?.to_vec();
         Some(Thumbnail { time: self.time, image: image::RgbaImage::from_raw(self.width, self.height, bytes)? })
     }

@@ -149,14 +149,18 @@ pub fn cached(path: &Path, spec: ThumbnailSpec, directory: &Path) -> bool {
 }
 
 fn decode_jpeg(jpeg: Vec<u8>, key: &Key, time: f64) -> anyhow::Result<Thumbnail> {
+    decode_jpeg_dimensions(jpeg, key.width, key.height, time)
+}
+
+fn decode_jpeg_dimensions(jpeg: Vec<u8>, width: u32, height: u32, time: f64) -> anyhow::Result<Thumbnail> {
     let mut reader = image::ImageReader::with_format(Cursor::new(jpeg), ImageFormat::Jpeg);
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(key.width);
-    limits.max_image_height = Some(key.height);
+    limits.max_image_width = Some(width);
+    limits.max_image_height = Some(height);
     limits.max_alloc = Some(16 * 1024 * 1024);
     reader.limits(limits);
     let image = reader.decode()?.into_rgba8();
-    anyhow::ensure!(image.width() <= key.width && image.height() <= key.height, "invalid cached dimensions");
+    anyhow::ensure!(image.width() <= width && image.height() <= height, "invalid cached dimensions");
     Ok(Thumbnail { time, image })
 }
 
@@ -205,6 +209,28 @@ fn read_index(r: &mut BufReader<fs::File>, key: &Key) -> anyhow::Result<Vec<Inde
         index.push(IndexEntry { time, offset, size });
     }
     Ok(index)
+}
+
+/// Read the original compressed representative without recompression.
+pub(crate) fn representative_jpeg(
+    path: &Path,
+    spec: ThumbnailSpec,
+    directory: &Path,
+    target: f64,
+) -> anyhow::Result<(f64, Vec<u8>)> {
+    spec.validate()?;
+    anyhow::ensure!(target.is_finite() && target >= 0.0, "invalid representative time");
+    let key = Key::new(path, spec)?;
+    let mut reader = BufReader::new(fs::File::open(key.file(directory)?)?);
+    let index = read_index(&mut reader, &key)?;
+    let selected = index[nearest_index(&index, target)];
+    let jpeg = jpeg_at(&mut reader, selected)?;
+    anyhow::ensure!(Key::new(path, spec)? == key, "source changed during cache read");
+    Ok((selected.time, jpeg))
+}
+
+pub(crate) fn decode_representative(jpeg: Vec<u8>, spec: ThumbnailSpec, time: f64) -> anyhow::Result<Thumbnail> {
+    decode_jpeg_dimensions(jpeg, spec.width, spec.height, time)
 }
 
 fn jpeg_at(r: &mut BufReader<fs::File>, entry: IndexEntry) -> anyhow::Result<Vec<u8>> {
@@ -436,11 +462,16 @@ mod tests {
             let representative = load_cached(&source, spec, &root, Some(8.))?;
             assert_eq!(representative.len(), 1);
             assert_eq!(representative[0].time, 10.);
+            let (time, jpeg) = representative_jpeg(&source, spec, &root, 8.)?;
+            assert_eq!(time, 10.);
+            assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
+            assert_eq!(decode_representative(jpeg, spec, time)?.time, 10.);
             assert_eq!(load_cached(&source, spec, &root, Some(0.))?[0].time, 0.);
             assert_eq!(load_cached(&source, spec, &root, Some(19.))?[0].time, 20.);
             assert_eq!(load_cached(&source, spec, &root, None)?.len(), 3);
             fs::write(&source, b"new contents of a different size")?;
             assert!(!cached(&source, spec, &root));
+            assert!(representative_jpeg(&source, spec, &root, 8.).is_err());
             assert!(load_cached(&source, spec, &root, None).is_err());
             Ok(())
         })();
